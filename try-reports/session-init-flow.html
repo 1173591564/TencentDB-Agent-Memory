@@ -1,0 +1,783 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Init 机制 · TencentDB Agent Memory</title>
+<style>
+  :root {
+    --bg: #0a0c13; --bg-2: #0e1119;
+    --panel: #12151f; --panel-2: #181c29; --panel-3: #1e2333;
+    --border: #242a3d; --border-soft: #1b2031;
+    --text: #e8ebf4; --muted: #97a0b8; --muted-2: #6b7490;
+    --accent: #7c9eff; --accent-2: #b794f6; --accent-dim: rgba(124,158,255,.14);
+    --agent: #f6ad55; --proxy: #7c9eff; --core: #4fd1c5; --llm: #8aa1b8;
+    --warn: #fc8181; --ok: #68d391; --code-bg: #0c0f18;
+    --label-bg: rgba(14,17,25,.9);
+    --strong-text: #ffffff;
+    --pre-text: #c8d0e6;
+    --glow-1: rgba(124,158,255,.12);
+    --glow-2: rgba(79,209,197,.09);
+    --grad: linear-gradient(135deg, #7c9eff 0%, #b794f6 100%);
+    --scrollbar: #2a3045;
+    --toc-bg: rgba(13,16,25,.84);
+    --h1-grad: linear-gradient(120deg, #ffffff 20%, #b9c6f4 55%, #9fd8cf 100%);
+    --shadow-card: 0 16px 48px rgba(0,0,0,.28);
+    --shadow-box: 0 4px 14px rgba(0,0,0,.22);
+    --arr-line: #8a93ab; --arr-glow: rgba(138,147,171,.35);
+    --vline: #39405a;
+    --head-text: #aac3f6; --head-core: #8fd8cc;
+    --lb-text: #b3bccf;
+    --code-text: #9db4f0;
+    --chip-text: #eec58a;
+    --seqkeys-line: #4a7fd6; --seqkeys-text: #a9c1e8; --seqkeys-strong: #c6d8f5;
+  }
+  [data-theme="light"] {
+    --bg: #f5f6fa; --bg-2: #eef0f6;
+    --panel: #ffffff; --panel-2: #f2f4fa; --panel-3: #e6e9f2;
+    --border: #d9dde8; --border-soft: #e8ebf3;
+    --text: #1a1f2e; --muted: #5a6378; --muted-2: #8b94aa;
+    --accent: #4264f6; --accent-2: #8b5cf6; --accent-dim: rgba(66,100,246,.10);
+    --agent: #dd6b20; --proxy: #4264f6; --core: #0d9488; --llm: #64748b;
+    --warn: #dc2626; --ok: #059669; --code-bg: #f3f5fa;
+    --label-bg: rgba(255,255,255,.94);
+    --strong-text: #1a1f2e;
+    --pre-text: #2a3050;
+    --glow-1: rgba(66,100,246,.07);
+    --glow-2: rgba(13,148,136,.04);
+    --grad: linear-gradient(135deg, #4264f6 0%, #8b5cf6 100%);
+    --scrollbar: #cdd3e2;
+    --toc-bg: rgba(255,255,255,.85);
+    --h1-grad: linear-gradient(120deg, #1a1f2e 20%, #4264f6 55%, #0d9488 100%);
+    --shadow-card: 0 16px 48px rgba(30,40,80,.08);
+    --shadow-box: 0 4px 14px rgba(30,40,80,.06);
+    --arr-line: #6b7490; --arr-glow: rgba(107,116,144,.18);
+    --vline: #c8cdda;
+    --head-text: #2a4ea8; --head-core: #0d7a6e;
+    --lb-text: #4a5468;
+    --code-text: #3d52d6;
+    --chip-text: #b45309;
+    --seqkeys-line: #4a7fd6; --seqkeys-text: #3a5a9a; --seqkeys-strong: #1a1f2e;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.7; font-size: 15px; }
+  body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(900px 420px at 85% -10%, var(--glow-1), transparent 60%),
+      radial-gradient(700px 380px at -10% 25%, var(--glow-2), transparent 60%),
+      radial-gradient(800px 500px at 60% 110%, rgba(183,148,246,.07), transparent 60%); }
+  ::selection { background: rgba(124,158,255,.35); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 56px 32px 100px; }
+
+  /* ── Header ── */
+  header { margin: 0 0 24px; padding: 44px 44px 36px; position: relative;
+    background: linear-gradient(180deg, rgba(124,158,255,.06), rgba(124,158,255,0) 85%), var(--panel);
+    border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }
+  header::after { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--grad); }
+  header .eyebrow { color: var(--accent-2); font-size: 12px; letter-spacing: 3px; text-transform: uppercase;
+    font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+  header .eyebrow::before { content: ""; width: 26px; height: 2px; background: var(--grad); border-radius: 2px; }
+  header h1 { margin: 0 0 10px; font-size: 38px; font-weight: 800; letter-spacing: -1px; line-height: 1.15;
+    background: var(--h1-grad);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  header .sub { color: var(--muted); font-size: 15px; max-width: 800px; }
+  header .meta { margin-top: 20px; display: flex; gap: 10px; flex-wrap: wrap; }
+  header .meta span { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted);
+    background: var(--panel-2); border: 1px solid var(--border); padding: 5px 12px; border-radius: 999px; }
+  header .meta .dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* ── TOC ── */
+  nav.toc { position: sticky; top: 12px; z-index: 50; display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 10px 14px; margin: 0 0 48px;
+    background: var(--toc-bg); backdrop-filter: blur(14px);
+    border: 1px solid var(--border); border-radius: 14px; }
+  nav.toc a { color: var(--muted); text-decoration: none; font-size: 12.5px; padding: 4px 12px;
+    border-radius: 999px; border: 1px solid transparent; transition: all .15s ease; white-space: nowrap; }
+  nav.toc a:hover { color: var(--text); background: var(--panel-3); border-color: var(--border); }
+  nav.toc a .n { color: var(--accent); font-weight: 700; margin-right: 5px; font-family: "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ── Section ── */
+  section { margin: 60px 0; }
+  section > h2 { display: flex; align-items: center; gap: 14px; font-size: 23px; font-weight: 700;
+    margin: 0 0 8px; letter-spacing: -.3px; }
+  section > h2 .sec { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+    min-width: 38px; height: 38px; border-radius: 12px; background: var(--accent-dim);
+    border: 1px solid rgba(124,158,255,.35); color: var(--accent);
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 15px; font-weight: 700; }
+  section > .lead { color: var(--muted); margin: 2px 0 24px 52px; font-size: 13.5px; }
+  h3 { font-size: 16px; font-weight: 700; margin: 30px 0 12px; color: var(--text);
+    display: flex; align-items: center; gap: 10px; }
+  h3::before { content: ""; width: 8px; height: 8px; border-radius: 3px; background: var(--grad); flex-shrink: 0; }
+  p { margin: 10px 0; }
+  strong { color: var(--strong-text, #fff); font-weight: 600; }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; background: var(--code-bg);
+    padding: 1.5px 7px; border-radius: 5px; font-size: 12.5px; color: var(--code-text); border: 1px solid var(--border); }
+  ul, ol { margin: 12px 0; padding-left: 26px; }
+  li { margin: 7px 0; }
+  li::marker { color: var(--accent); }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px;
+    overflow-x: auto; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; color: var(--pre-text, #c8d0e6);
+    line-height: 1.65; box-shadow: inset 0 2px 8px rgba(0,0,0,.3); margin: 16px 0; }
+
+  /* ── Callout ── */
+  .callout { background: linear-gradient(90deg, rgba(124,158,255,.07), transparent 70%), var(--panel-2);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 10px;
+    padding: 14px 18px; margin: 18px 0; }
+  .callout.warn { border-left-color: var(--warn); background: linear-gradient(90deg, rgba(252,129,129,.06), transparent 70%), var(--panel-2); }
+  .callout.ok { border-left-color: var(--ok); background: linear-gradient(90deg, rgba(104,211,145,.06), transparent 70%), var(--panel-2); }
+  .callout .tag { font-size: 11px; font-weight: 800; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--accent); margin-right: 8px; }
+  .callout .tag::before { content: "▸ "; }
+  .callout.warn .tag { color: var(--warn); }
+  .callout.ok .tag { color: var(--ok); }
+
+  /* ── 时序卡片 ── */
+  .seq-card { background: linear-gradient(180deg, rgba(124,158,255,.05), transparent 45%), var(--panel);
+    border: 1px solid var(--border); border-radius: 16px; padding: 34px 22px 24px; margin: 24px 0 28px;
+    box-shadow: var(--shadow-card); }
+  .seq-card .seq-title { display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+    font-size: 13px; color: var(--muted); letter-spacing: 1px; }
+  .seq-card .seq-title::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--grad); }
+  .seq-title .legend { display: inline-flex; align-items: center; gap: 16px; margin-left: auto;
+    font-size: 11px; letter-spacing: .3px; color: var(--muted-2); }
+  .seq-title .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .seq-title .legend i { display: inline-block; }
+  .legend .l-req { width: 20px; height: 2.5px; border-radius: 2px; background: var(--proxy); }
+  .legend .l-res { width: 20px; height: 0; border-top: 2.5px dashed var(--llm); }
+  .legend .l-ia { width: 9px; height: 9px; border-radius: 3px; background: var(--agent); opacity: .9; }
+  .legend .l-ip { width: 9px; height: 9px; border-radius: 3px; background: var(--proxy); opacity: .9; }
+
+  .seq-head { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .head-box { background: linear-gradient(180deg, rgba(124,158,255,.16), rgba(124,158,255,.06));
+    border: 1px solid rgba(124,158,255,.38); border-radius: 12px; padding: 12px 10px; text-align: center;
+    color: var(--head-text); font-size: 15px; font-weight: 700; line-height: 1.3;
+    box-shadow: var(--shadow-box); }
+  .head-box::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    margin-right: 7px; background: currentColor; vertical-align: 1px; opacity: .85; }
+  .head-box p { margin: 3px 0 0; font-size: 11px; font-weight: 400; color: var(--muted); }
+  .head-box.ha { border-top: 3px solid var(--agent); color: var(--agent); }
+  .head-box.hp { border-top: 3px solid var(--proxy); }
+  .head-box.hl { border-top: 3px solid var(--llm); color: var(--llm); }
+  .head-box.core { background: linear-gradient(180deg, rgba(79,209,197,.16), rgba(79,209,197,.06));
+    border-color: rgba(79,209,197,.38); color: var(--head-core); border-top: 3px solid var(--core); }
+  .head-box.core p { color: var(--muted); }
+
+  .seq-body { position: relative; margin-top: 2px; height: 1070px; }
+
+  /* 阶段分区 */
+  .phase { position: absolute; left: 4px; right: 4px; z-index: 0; border-radius: 10px; }
+  .phase.tint { background: color-mix(in srgb, var(--accent) 3.5%, transparent); }
+  .phase .plabel { position: absolute; right: 12px; top: 6px; font-size: 9.5px; letter-spacing: 1.5px;
+    color: var(--muted-2); font-weight: 700; }
+
+  /* 循环框（⑤–⑧ 表单多轮） */
+  .loop-frame { position: absolute; left: calc(12.5% - 52px); width: calc(25% + 104px); z-index: 0;
+    border: 1.5px dashed color-mix(in srgb, var(--warn) 55%, transparent); border-radius: 12px;
+    background: color-mix(in srgb, var(--warn) 3%, transparent); }
+  .loop-frame .loop-badge { position: absolute; top: -11px; left: 16px; font-size: 10px; font-weight: 800;
+    letter-spacing: 1.2px; color: var(--warn); background: var(--label-bg); border: 1px solid
+    color-mix(in srgb, var(--warn) 45%, transparent); padding: 2px 11px; border-radius: 999px; }
+
+  /* 生命线（按角色着色） */
+  .seq-body .vline { position: absolute; top: 4px; bottom: 0; width: 0; z-index: 0; }
+  .vline.a { left: 12.5%; border-left: 1px dashed color-mix(in srgb, var(--agent) 32%, transparent); }
+  .vline.p { left: 37.5%; border-left: 1px dashed color-mix(in srgb, var(--proxy) 32%, transparent); }
+  .vline.l { left: 62.5%; border-left: 1px dashed color-mix(in srgb, var(--llm) 32%, transparent); }
+  .vline.c { left: 87.5%; border-left: 1px dashed color-mix(in srgb, var(--core) 32%, transparent); }
+
+  /* 激活条 */
+  .act { position: absolute; width: 10px; border-radius: 5px; z-index: 1; border: 1px solid; }
+  .act.a { left: calc(12.5% - 5px); background: color-mix(in srgb, var(--agent) 13%, transparent);
+    border-color: color-mix(in srgb, var(--agent) 36%, transparent); }
+  .act.p { left: calc(37.5% - 5px); background: color-mix(in srgb, var(--proxy) 13%, transparent);
+    border-color: color-mix(in srgb, var(--proxy) 36%, transparent); }
+  .act.l { left: calc(62.5% - 5px); background: color-mix(in srgb, var(--llm) 13%, transparent);
+    border-color: color-mix(in srgb, var(--llm) 36%, transparent); }
+  .act.c { left: calc(87.5% - 5px); background: color-mix(in srgb, var(--core) 13%, transparent);
+    border-color: color-mix(in srgb, var(--core) 36%, transparent); }
+
+  /* 消息箭头：按发起方着色；back = 响应（虚线） */
+  .arr { position: absolute; height: 2.5px; background: var(--line-c, var(--arr-line)); z-index: 2;
+    box-shadow: 0 0 8px color-mix(in srgb, var(--line-c, var(--arr-line)) 30%, transparent); }
+  .arr.fa { --line-c: var(--agent); }
+  .arr.fp { --line-c: var(--proxy); }
+  .arr.fl { --line-c: var(--llm); }
+  .arr.back { background: repeating-linear-gradient(90deg, var(--line-c, var(--arr-line)) 0 9px, transparent 9px 16px); }
+  .arr::before { content: ""; position: absolute; left: -3.5px; top: 50%; transform: translateY(-50%);
+    width: 8px; height: 8px; border-radius: 50%; background: var(--line-c, var(--arr-line));
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--line-c, var(--arr-line)) 18%, transparent); }
+  .arr.back::before { left: auto; right: -3.5px; }
+  .arr .arrowhead { position: absolute; top: -4.5px; right: -1px;
+    border: 6px solid transparent; border-left-color: var(--line-c, var(--arr-line)); }
+  .arr.back .arrowhead { right: auto; left: -1px;
+    border-left-color: transparent; border-right-color: var(--line-c, var(--arr-line)); }
+
+  /* 消息标签（药丸化） */
+  .lb { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+    white-space: nowrap; font-size: 12.5px; color: var(--lb-text); line-height: 1.4; text-align: center;
+    background: var(--label-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 3px 11px 4px; box-shadow: 0 3px 10px rgba(0,0,0,.16); }
+  .lb .cn { display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border-radius: 50%; background: var(--grad);
+    color: #0b0d15; font-size: 10.5px; font-weight: 800; margin-right: 5px;
+    vertical-align: -3px; box-shadow: 0 2px 6px rgba(0,0,0,.25); }
+  .arr.fa .cn { background: var(--agent); }
+  .arr.fp .cn { background: var(--proxy); }
+  .arr.fl .cn { background: var(--llm); }
+  .lb .sub { display: block; font-size: 10px; color: var(--muted-2); margin-top: 2px;
+    white-space: nowrap; line-height: 1.3; }
+
+  /* 内部动作块：琥珀 = agent/用户侧，靛蓝 = proxy 内部 */
+  .chip { position: absolute; display: flex; align-items: center; gap: 5px; z-index: 3;
+    background: linear-gradient(180deg, rgba(246,173,85,.16), rgba(246,173,85,.07));
+    border: 1px solid rgba(246,173,85,.4); border-radius: 9px;
+    padding: 6px 12px; font-size: 12px; color: var(--chip-text); white-space: nowrap;
+    box-shadow: 0 4px 12px rgba(0,0,0,.25); }
+  .chip .cn { background: rgba(246,173,85,.85); color: #14100a; }
+  .chip::after { content: ""; position: absolute; right: -7px; top: 50%; margin-top: -5px;
+    border: 5px solid transparent; border-left-color: rgba(246,173,85,.4); }
+  .chip.l-arrow::after { right: auto; left: -7px;
+    border-left-color: transparent; border-right-color: rgba(246,173,85,.4); }
+  .chip.px { background: linear-gradient(180deg, color-mix(in srgb, var(--proxy) 16%, transparent),
+      color-mix(in srgb, var(--proxy) 7%, transparent));
+    border-color: color-mix(in srgb, var(--proxy) 40%, transparent); color: var(--proxy); }
+  .chip.px .cn { background: var(--proxy); color: #0b0d15; }
+  .chip.px::after { border-left-color: color-mix(in srgb, var(--proxy) 40%, transparent); }
+  .chip.px.l-arrow::after { border-left-color: transparent;
+    border-right-color: color-mix(in srgb, var(--proxy) 40%, transparent); }
+
+  .seq-note { font-size: 12.5px; color: var(--muted); margin: 18px 4px 12px; }
+  .seq-keys { background: linear-gradient(90deg, rgba(74,127,214,.13), transparent 70%), var(--panel-2);
+    border: 1px solid rgba(74,127,214,.35); border-left: 4px solid var(--seqkeys-line);
+    border-radius: 10px; padding: 14px 18px; font-size: 13.5px; color: var(--seqkeys-text); line-height: 1.8; }
+  .seq-keys strong { color: var(--seqkeys-strong); }
+
+  /* ── 状态机 ── */
+  .states { display: flex; flex-direction: column; margin: 24px 0; max-width: 680px; }
+  .state-row { display: flex; align-items: center; gap: 14px; }
+  .state { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 13px 18px; position: relative; transition: border-color .15s ease; }
+  .state:hover { border-color: rgba(124,158,255,.4); }
+  .state::before { content: ""; position: absolute; left: -1px; top: 14px; bottom: 14px; width: 3px;
+    background: var(--accent); border-radius: 3px; opacity: .85; }
+  .state.terminal { border-color: rgba(104,211,145,.45); background: linear-gradient(90deg, rgba(104,211,145,.07), transparent 70%), var(--panel); }
+  .state.terminal::before { background: var(--ok); }
+  .state.bypass { border-color: var(--warn); background: rgba(252,129,129,.06); }
+  .state .name { font-weight: 700; color: var(--accent); font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13.5px; letter-spacing: .2px; }
+  .state.terminal .name { color: var(--ok); }
+  .state.bypass .name { color: var(--warn); }
+  .state .desc { color: var(--muted); font-size: 12.5px; margin-top: 5px; }
+  .arrow-down { display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: var(--muted-2); font-size: 20px; padding: 0 12px; gap: 3px; flex-shrink: 0; }
+  .arrow-down .label { font-size: 11px; color: var(--muted); background: var(--panel-2);
+    padding: 2px 9px; border-radius: 6px; border: 1px solid var(--border); white-space: nowrap; }
+
+  /* ── 卡片 ── */
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 18px 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px;
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+  .card:hover { transform: translateY(-3px); border-color: rgba(124,158,255,.4);
+    box-shadow: 0 12px 32px rgba(0,0,0,.32); }
+  .card .ttl { font-weight: 700; margin-bottom: 8px; color: var(--text); font-size: 15px;
+    display: flex; align-items: center; gap: 8px; }
+  .card .ttl::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--grad); flex-shrink: 0; }
+  .card .body { font-size: 13px; color: var(--muted); }
+
+  /* ── 表格 ── */
+  table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 18px 0;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    font-size: 13.5px; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  tr:first-child th { background: var(--panel-2); color: var(--accent); font-weight: 700; font-size: 11.5px;
+    letter-spacing: .8px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: rgba(124,158,255,.04); }
+  tr:last-child td { border-bottom: none; }
+  td code { font-size: 12px; }
+
+  /* ── 三元组卡片 ── */
+  .triple { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 18px 0; }
+  .triple .tcard { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px;
+    border-top: 3px solid var(--accent); transition: transform .18s ease, box-shadow .18s ease; }
+  .triple .tcard:hover { transform: translateY(-3px); box-shadow: 0 12px 32px rgba(0,0,0,.3); }
+  .triple .tcard.agent-card { border-top-color: var(--agent); }
+  .triple .tcard.task-card { border-top-color: var(--accent-2); }
+  .triple .tcard .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+  .triple .tcard .field { font-family: "SF Mono", Menlo, Consolas, monospace; font-weight: 700; color: var(--text); font-size: 15px; }
+  .triple .tcard .badge { font-size: 10px; padding: 2px 9px; border-radius: 999px; background: var(--panel-2);
+    color: var(--muted); border: 1px solid var(--border); letter-spacing: .5px; }
+  .triple .tcard .badge.req { color: var(--warn); border-color: rgba(252,129,129,.5); }
+  .triple .tcard .badge.opt { color: var(--ok); border-color: rgba(104,211,145,.5); }
+  .triple .tcard ul { margin: 8px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+  .triple .tcard li { margin: 5px 0; }
+
+  /* ── 文件索引 ── */
+  .files { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; }
+  .file { display: flex; gap: 14px; padding: 11px 16px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; font-size: 13px; align-items: baseline;
+    transition: border-color .15s ease, background .15s ease; }
+  .file:hover { border-color: rgba(124,158,255,.4); background: var(--panel-2); }
+  .file .path { font-family: "SF Mono", Menlo, Consolas, monospace; color: var(--code-text); flex-shrink: 0;
+    min-width: 340px; font-size: 12.5px; }
+  .file .role { color: var(--muted); }
+
+  /* ── Footer ── */
+  footer { margin-top: 80px; padding: 28px 0 0; border-top: 1px solid var(--border); color: var(--muted-2);
+    font-size: 12.5px; display: flex; justify-content: center; gap: 32px; flex-wrap: wrap; }
+
+  /* ── 主题切换 ── */
+  .theme-toggle { position: fixed; bottom: 22px; right: 22px; z-index: 100;
+    width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; line-height: 1; transition: transform .2s ease, border-color .2s ease;
+    box-shadow: var(--shadow-box); padding: 0; }
+  .theme-toggle:hover { transform: translateY(-2px); border-color: var(--accent); }
+  .theme-toggle:active { transform: translateY(0); }
+
+  @media (max-width: 820px) {
+    .wrap { padding: 28px 16px 60px; }
+    header { padding: 32px 22px 26px; }
+    header h1 { font-size: 28px; }
+    section > .lead { margin-left: 0; }
+    .seq-card { overflow-x: auto; padding: 24px 14px 18px; }
+    .triple { grid-template-columns: 1fr; }
+    .state-row { flex-direction: column; align-items: stretch; gap: 4px; }
+    .arrow-down { transform: rotate(90deg); padding: 6px 0; }
+    .file { flex-direction: column; gap: 4px; }
+    .file .path { min-width: 0; word-break: break-all; }
+  }
+</style>
+<script>
+  (function(){ var t = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', t); })();
+</script>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="切换深/浅色主题" aria-label="切换主题"></button>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">TencentDB Agent Memory · 设计讨论</div>
+  <h1>Session Init 机制</h1>
+  <div class="sub">MemoryProxy 在请求入口的身份引导层 — coding agent 第一次对话时如何确定 (team, agent, task) 三元组</div>
+  <div class="meta">
+    <span><span class="dot" style="background:var(--agent)"></span>Coding Agent</span>
+    <span><span class="dot" style="background:var(--proxy)"></span>MemoryProxy</span>
+    <span><span class="dot" style="background:var(--llm)"></span>上游模型</span>
+    <span><span class="dot" style="background:var(--core)"></span>MemoryCore</span>
+    <span>独立文档 · 与 opik-trace-report.html 无关联</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <a href="#positioning"><span class="n">01</span>整体定位</a>
+  <a href="#swimlane"><span class="n">02</span>三方时序图</a>
+  <a href="#triggers"><span class="n">03</span>触发与过滤</a>
+  <a href="#state-machine"><span class="n">04</span>核心状态机</a>
+  <a href="#fast-paths"><span class="n">05</span>快速通道</a>
+  <a href="#registration"><span class="n">06</span>completeRegistration</a>
+  <a href="#prewarm"><span class="n">07</span>连锁反应</a>
+  <a href="#triples"><span class="n">08</span>三元组用途</a>
+  <a href="#user-vs-auto"><span class="n">09</span>用户定义 vs 自动</a>
+  <a href="#evidence"><span class="n">10</span>实测验证</a>
+  <a href="#files"><span class="n">11</span>文件索引</a>
+</nav>
+
+
+<section id="positioning">
+  <h2><span class="sec">1</span>整体定位</h2>
+  <p class="lead">Session Init 发生在哪里、解决什么问题</p>
+  <p>Session Init 发生在 <strong>MemoryProxy</strong>，不在 coding agent 里，也不在 MemoryCore 里。它解决的问题是：当一个 AI 客户端（Claude Code / CodeBuddy / opencode / Codex / WorkBuddy / DSH）第一次发起对话时，proxy 还不知道这个会话归属于哪个 <strong>team / agent / task</strong> —— 而没有这三元组，后面的记忆注入（L1 召回、L2/L3 注入）、知识库注入、L0 写入全都无法做租户隔离。所以 session init 的任务就是<strong>在对话真正转发给上游模型之前，把 (team_id, agent_id, task_id, user_id) 这套身份确定下来并持久化</strong>。</p>
+  <div class="callout">
+    <span class="tag">关键</span>
+    coding agent 是<strong>多租户共享的通用客户端</strong> —— 同一个 claude code 二进制可能今天连这个 proxy、明天连那个 proxy，agent 自己不该持有"我属于哪个 team/agent/task"的状态。这份身份是 <strong>proxy + kernel 的租户视角</strong>，必须由 proxy 在请求入口拦截建立，然后注入到 prompt 里喂给 agent。agent 只看到结果（<code>&lt;session_context&gt;</code> 块、<code>&lt;tdai_profile_memory&gt;</code> 块等），不知道这些是哪来的。
+  </div>
+</section>
+
+<section id="swimlane">
+  <h2><span class="sec">2</span>三方分工时序图</h2>
+  <p class="lead">从 coding agent 发起到上游模型响应的完整链路</p>
+  <div class="seq-card">
+    <div class="seq-title">SEQUENCE · 三方协作 · 16 节点 · 时间自上而下
+      <span class="legend">
+        <span><i class="l-req"></i>请求</span>
+        <span><i class="l-res"></i>响应</span>
+        <span><i class="l-ia"></i>agent/用户动作</span>
+        <span><i class="l-ip"></i>proxy 内部</span>
+      </span>
+    </div>
+    <div class="seq-head">
+      <div class="head-box ha">Coding Agent<p>agent · 用户</p></div>
+      <div class="head-box hp">MemoryProxy<p>注入 · 转发</p></div>
+      <div class="head-box hl">上游模型<p>LLM</p></div>
+      <div class="head-box core">MemoryCore<p>元数据后端 · 记忆存储</p></div>
+    </div>
+    <div class="seq-body">
+      <div class="phase tint" style="top:0; height:256px;"><span class="plabel">A · 身份识别</span></div>
+      <div class="phase" style="top:256px; height:292px;"><span class="plabel">B · 表单循环</span></div>
+      <div class="phase tint" style="top:548px; height:222px;"><span class="plabel">C · 完成注册</span></div>
+      <div class="phase" style="top:770px; height:185px;"><span class="plabel">D · 预热注入</span></div>
+      <div class="phase tint" style="top:955px; height:115px;"><span class="plabel">E · 转发上游</span></div>
+
+      <div class="loop-frame" style="top:256px; height:288px;">
+        <span class="loop-badge">LOOP ×N · 实测 3 轮 · 未选完回到 ⑤</span>
+      </div>
+
+      <div class="vline a"></div><div class="vline p"></div><div class="vline l"></div><div class="vline c"></div>
+
+      <div class="act a" style="top:46px; height:400px;"></div>
+      <div class="act a" style="top:1014px; height:42px;"></div>
+      <div class="act p" style="top:46px; height:990px;"></div>
+      <div class="act l" style="top:976px; height:58px;"></div>
+      <div class="act c" style="top:96px; height:40px;"></div>
+      <div class="act c" style="top:236px; height:50px;"></div>
+      <div class="act c" style="top:576px; height:58px;"></div>
+      <div class="act c" style="top:648px; height:44px;"></div>
+      <div class="act c" style="top:782px; height:58px;"></div>
+      <div class="act c" style="top:854px; height:52px;"></div>
+
+      <div class="arr fa" style="left:12.5%; width:25%; top:52px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">1</span>发请求 · Bearer user_key<span class="sub">可选三元组 header → 快速通道；无则进表单</span></span>
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:50%; top:96px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">2</span>verifyUserKey → user_id</span>
+      </div>
+
+      <div class="chip px" style="right:calc(62.5% + 12px); top:146px;">
+        <span class="cn">3</span>handleSessionInit · 状态机启动
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:50%; top:236px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">4</span>拉 teams / agents / tasks</span>
+      </div>
+
+      <div class="arr fp back" style="left:12.5%; width:25%; top:308px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">5</span>拦截 · 回 form（不转发上游）</span>
+      </div>
+
+      <div class="chip l-arrow" style="left:calc(12.5% + 16px); top:362px;">
+        <span class="cn">6</span>用户答题 · 选 team/agent/task
+      </div>
+
+      <div class="arr fa" style="left:12.5%; width:25%; top:436px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">7</span>带答案重发 · extractor 匹配</span>
+      </div>
+
+      <div class="chip px" style="right:calc(62.5% + 12px); top:498px;">
+        <span class="cn">8</span>状态机循环 · 未选完 → 回到 5
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:50%; top:576px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">9</span>getAgent / getTask 详情（prompt + goal）</span>
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:50%; top:648px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">10</span>appendParticipationLog</span>
+      </div>
+
+      <div class="chip px" style="right:calc(62.5% + 12px); top:708px;">
+        <span class="cn">11</span>completeRegistration · buildSessionInfo 落盘
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:50%; top:782px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">12</span>fetchAssetCapabilities</span>
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:50%; top:854px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">13</span>prewarm · 记忆/知识召回 → HookCacheRepo</span>
+      </div>
+
+      <div class="chip px" style="right:calc(62.5% + 12px); top:916px;">
+        <span class="cn">14</span>注入 session_context（system 末尾）
+      </div>
+
+      <div class="arr fp" style="left:37.5%; width:25%; top:980px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">15</span>转发 · 注入后 messages</span>
+      </div>
+
+      <div class="arr fl back" style="left:37.5%; width:25%; top:1022px;">
+        <span class="arrowhead"></span>
+        <span class="lb"><span class="cn">16</span>响应回流 → 转发给 agent</span>
+      </div>
+    </div>
+    <div class="seq-note">这条链路共 16 个逻辑节点；⑤–⑧ 包在 <strong>LOOP 框</strong>里——状态机每推进一个 stage 就返回一次 form，agent 把用户选项发回、proxy 解析后继续推进，三元组全部选定后才进入 ⑪ completeRegistration。彩色语义：<strong>琥珀 = agent/用户侧</strong>（①⑥⑦），<strong>靛蓝 = proxy 发起</strong>（②④⑤⑨⑩⑫⑬⑮），<strong>石板灰 = 上游模型</strong>（⑯）；竖向色条 = 激活期（谁在干活）。<strong>实测</strong>（2026-08-23，dsh + Opik 全链追踪）：⑤⑦ 表单循环实际走了 <strong>3 轮</strong>（asset_confirm → agent_select → task_select），每轮 form 是 proxy 伪造的 SSE tool_call（毫秒级）；⑪ 完成后注入 system 由 <strong>6197 → 16911 字符</strong>（+10714），见第 10 节实测证据。</div>
+    <div class="seq-keys">
+      <strong>读图要点：</strong>步骤 ⑤～⑧ 是<strong>多轮循环</strong>——状态机每推进一个 stage 就返回一次 form，agent 把用户选项发回、proxy 解析后继续推进；三元组全部选定后才进入 ⑪ completeRegistration。<strong>只有完成注册后，请求才真正转发给上游模型（步骤 ⑮）</strong>——在此之前所有请求都被 proxy 拦截并返回 form，不离开 proxy。
+    </div>
+  </div>
+</section>
+
+<section id="triggers">
+  <h2><span class="sec">3</span>触发时机与前置过滤</h2>
+  <p class="lead">哪些请求会进 session init，哪些会跳过</p>
+  <p>入口在 <code>anthropicHandler.ts:706</code> / <code>handler.ts:763</code> / <code>codexHandler.ts</code> / <code>workbuddyHandler.ts</code>，每个请求进来先做分流：</p>
+  <table>
+    <tr><th>请求类型</th><th>处理</th><th>位置</th></tr>
+    <tr><td><strong>SIDEQUERY / auxiliary</strong>（title 生成、header 检测等）</td><td>完全跳过 session-init，直通上游</td><td><code>anthropicHandler.ts:702</code></td></tr>
+    <tr><td><strong>DSH headless 且无 preset 身份</strong></td><td>bypass，不弹 form（无 UI 场景强弹没意义）</td><td><code>handler.ts:710-725</code></td></tr>
+    <tr><td><strong>有 conversationId 的主对话</strong></td><td>进入 <code>handleSessionInit</code> 状态机</td><td><code>anthropicHandler.ts:706</code></td></tr>
+    <tr><td><strong>客户端没带 conversationId</strong></td><td><code>autoConversationId</code> 按 <code>per-key</code> / <code>per-key-msg</code> 策略自动分配</td><td><code>handler.ts:740-752</code></td></tr>
+  </table>
+</section>
+
+<section id="state-machine">
+  <h2><span class="sec">4</span>核心状态机</h2>
+  <p class="lead">状态定义在 <code>session/types.ts:26-35</code>，主循环在 <code>session/codebuddy/init.ts</code>（CB/WB/Codex/DSH 共用）和 <code>session/claude-code/init.ts</code>（CC 专用）</p>
+  <div class="states">
+    <div class="state-row"><div class="state"><div class="name">uninitialized</div><div class="desc">第一次进来。拉内核 teams[]，缓存到 state.cachedTeams</div></div></div>
+    <div class="state-row"><div class="arrow-down"><span class="label">拉 teams</span>↓</div><div class="state"><div class="name">pending_asset_confirm</div><div class="desc">弹 form 问"是否关联团队资产？"<br>选"否" → bypass</div></div></div>
+    <div class="state-row"><div class="arrow-down"><span class="label">选"是"</span>↓</div><div class="state"><div class="name">pending_team_select</div><div class="desc">弹 form 列出 teams 让用户选<br>（teams==1 时跳过本态）</div></div></div>
+    <div class="state-row"><div class="arrow-down"><span class="label">选 team</span>↓</div><div class="state"><div class="name">pending_agent_select</div><div class="desc">列出该 team 下 agents（CC/codex/WB 拆 stage 分页；CB 老路径用 pending_agent_task 一发同时问）</div></div></div>
+    <div class="state-row"><div class="arrow-down"><span class="label">选 agent</span>↓</div><div class="state"><div class="name">pending_task_select</div><div class="desc">列出该 team 下 tasks（同上分页）<br>tasks==1 自动选；tasks==0 bypass</div></div></div>
+    <div class="state-row"><div class="arrow-down"><span class="label">选 task</span>↓</div><div class="state terminal"><div class="name">initialized</div><div class="desc">completeRegistration 落盘<br>→ 触发 prewarm + 注入 session_context</div></div></div>
+  </div>
+  <h3>关键设计点</h3>
+  <ul>
+    <li><strong>递进 auto-select</strong>：<code>init.ts:920-981</code>，team=1 + agent=1 + task=1 时全自动跳过所有 form，直接完成注册——单租户单 agent 场景用户零感知</li>
+    <li><strong>分页</strong>：Claude Code 的 AskUserQuestion 限 2-4 选项，codex 的 request_user_input 限 3 选项；候选超限时每页展示 N 个 + "更多→"选项，用户点"更多"则 <code>agentPageIndex++</code> / <code>codexPageIndex.agentPage++</code> 重发同 stage form</li>
+    <li><strong>maxRetries 兜底</strong>：每个 pending 阶段连续未识别 <code>config.maxRetries</code> 次后强制 bypass，避免卡死</li>
+    <li><strong>SKIP 词 bypass</strong>：用户在任意选择阶段输入"跳过/不关联/skip"主动 bypass</li>
+    <li><strong>多客户端适配</strong>：<code>session/index.ts:100-203</code> 是路由 wrapper，按 <code>agentSource</code> 分派到 CB 状态机或 CC 状态机；WorkBuddy / DSH 复用 CB 状态机但外层重渲染 form</li>
+  </ul>
+</section>
+
+<section id="fast-paths">
+  <h2><span class="sec">5</span>三条快速通道（不走 form）</h2>
+  <p class="lead">并非所有 session 都要走完整 form 流程</p>
+  <div class="grid-3">
+    <div class="card"><div class="ttl">① Header 预选</div><div class="body">客户端通过 <code>x-tdai-team-id</code> / <code>x-tdai-agent-id</code> / <code>x-tdai-task-id</code> 请求头直接传身份，<code>parsePresetIdentity</code> 解析后 <code>resolvePresetIdentity</code> 与内核 teams 匹配——命中则跳过所有 form 直接 <code>completeRegistration</code>；mismatch 时按 <code>headerAutoSelect.onMismatch</code> 决定 bypass 还是回退 form<br><br><code>init.ts:794-863</code></div></div>
+    <div class="card"><div class="ttl">② L2b Session Recovery</div><div class="body">proxy 重启 / store 丢失但上游还能恢复的场景，先尝试从 L2b 绑定恢复 sessionInfo，命中则跳过状态机<br><br><code>anthropicHandler.ts:714-779</code></div></div>
+    <div class="card"><div class="ttl">③ debugForceIdentity</div><div class="body">E2E 测试用，配置里写死三元组直接完成注册，跳过 listTeams / 表单渲染<br><br><code>init.ts:690-734</code></div></div>
+  </div>
+  <div class="callout warn">
+    <span class="tag">安全</span>
+    <code>preset.ts:9-12</code> 强调：header 值必须命中用户能看见的 <code>teams[]</code> 才被信任，否则 <code>hadMismatch</code> 走 fallback form 或 bypass，<strong>绝不盲信</strong> header 里的值。
+  </div>
+</section>
+
+<section id="registration">
+  <h2><span class="sec">6</span>completeRegistration 做了什么</h2>
+  <p class="lead">状态机的终点站 <code>init.ts:357-488</code></p>
+  <ol>
+    <li><strong>校验 task 缺失策略</strong>（<code>taskMissingPolicy</code>）：<code>reject</code> → bypass；<code>default</code> → 用 <code>defaultTaskId</code> 占位；<code>skip</code> → 无 task 注册，仅 agent 级注入</li>
+    <li><strong>buildRegistrationData</strong>：从 cachedTeams 里反查 agent 所属 team_id，组装 <code>SessionRegistrationData</code></li>
+    <li><strong>拉详情</strong>：并发 <code>metadataClient.getAgent()</code> + <code>getTask()</code>，拿到 agent 的 prompt/persona 和 task 的 goal/description——这俩就是后面要注入 system prompt 的内容</li>
+    <li><strong>buildSessionInfo</strong>（<code>registrar.ts:20</code>）：<strong>本地构建</strong> SessionInfo（不再调 TMC 的 POST /sessions），写入 SessionStore（L1 内存 + L2 Redis/SQLite）</li>
+    <li><strong>appendParticipationLog</strong>：fire-and-forget 记一条参与日志到内核</li>
+    <li><strong>applyArtifactsAndContext</strong>：调 <code>injectSessionContextWithToggles</code> 把 <code>&lt;session_context&gt;</code> 块（Agent id/name/prompt + Task id/name/goal）塞到 system message 末尾</li>
+  </ol>
+</section>
+
+<section id="prewarm">
+  <h2><span class="sec">7</span>注册完成后的连锁反应</h2>
+  <p class="lead">回到 <code>anthropicHandler.ts:814-864</code>，<code>justRegistered=true</code> 时</p>
+  <ol>
+    <li><strong>fetchAssetCapabilities</strong>：拉该 user 在内核里的资产能力旗标（<code>chat_memory</code> / <code>llm_wiki</code> / <code>code_graph</code> 各自 on/off），后续 injector 按旗标决定是否 emit</li>
+    <li><strong>prewarmFromConfig</strong>（<code>injection/prewarm.ts</code>）：<strong>同步 await</strong>，对所有 <code>cacheStrategy = "session_init" | "hybrid"</code> 的 injector 并行跑 <code>hook.prewarm()</code>，把结果写进 <code>HookCacheRepo</code>（COS）。默认 20s 超时，单 hook 失败静默 skip。这一步的意义是：首轮对话的 injection pipeline 能直接命中缓存，不会出现"第一轮注入 0 块"的空窗</li>
+    <li>之后每轮请求，injection pipeline 从缓存读 prewarm 结果 + miss 时走 <code>execute()</code> 兜底</li>
+  </ol>
+  <div class="callout">
+    <span class="tag">每轮行为</span>
+    session 一旦 <code>initialized</code>，后续请求进 <code>handleSessionInit</code> 直接命中 Case 3：从 store 读出 <code>sessionInfo</code> / <code>agentDetail</code> / <code>taskDetail</code>，每轮重新注入 <code>&lt;session_context&gt;</code>（客户端每次发的是干净 messages，proxy 必须每轮重新塞）。<code>bypassed=true</code> 的 session 只 strip 不 inject。
+  </div>
+</section>
+
+<section id="triples">
+  <h2><span class="sec">8</span>三元组各字段的用途</h2>
+  <p class="lead">Session Init 三元组（team / agent / task）—— 全部用户定义；team + agent 必需，task 可选</p>
+  <div class="triple">
+    <div class="tcard agent-card">
+      <div class="head"><span class="field">agent_id</span><span class="badge req">强制</span></div>
+      <ul>
+        <li><strong>记忆 owner</strong>：L0/L1/Profile 的强制隔离键（<code>isolation.ts:20</code>），缺 teamId 或 agentId 直接抛错</li>
+        <li><strong>L3 persona 注入</strong>：<code>agent.prompt</code> 整段塞进 <code>&lt;session_context&gt;</code></li>
+        <li><strong>L2/L3 profile 聚合键</strong>：profile 是 team+agent 级聚合</li>
+        <li><strong>跨 agent 借入锚点</strong>：<code>resolveFixedAssetCtxs</code> 用 agentId 查 agent-fixed-asset 绑定，找借入的 chat_memory</li>
+        <li><strong>知识库 per-agent 绑定</strong>：<code>listAgentKnowledgeIds(agentId, userKey)</code></li>
+      </ul>
+    </div>
+    <div class="tcard">
+      <div class="head"><span class="field">team_id</span><span class="badge req">强制</span></div>
+      <ul>
+        <li><strong>归属/可见性边界</strong>：知识库 wiki/codegraph 按 team 列全量</li>
+        <li><strong>借入记忆的 team 一致性校验</strong>：只接受同 team 的借入 agent</li>
+        <li><strong>L2/L3 Profile 归属键</strong>：<code>(teamId, agentId)</code> 定位 profile</li>
+        <li><strong>clearMemoryContent</strong>：要求 teamId + agentId 都非空</li>
+        <li><strong>参与日志四元组之一</strong></li>
+      </ul>
+    </div>
+    <div class="tcard task-card">
+      <div class="head"><span class="field">task_id</span><span class="badge opt">可选</span></div>
+      <ul>
+        <li><strong>任务上下文注入</strong>：Task goal/description 注入 system 的 <code>[Task]</code> 段</li>
+        <li><strong>L0/L1 可选业务过滤维度</strong>：<code>IsolationFilter.taskId</code> 存在时 WHERE 加 <code>task_id = ?</code></li>
+        <li><strong>taskMissingPolicy</strong>：没选 task 时 reject/default/skip 三策略</li>
+        <li><strong>参与日志记录</strong>：仅在有 task_id 时才记</li>
+        <li><strong>不用于 L1 提取触发</strong>：L1 提取是 session-based，task 不能替代 session</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>两个三元组的区分</h3>
+  <p>项目里有两个不同的"三元组"，都叫三元组但成员不同：</p>
+  <table>
+    <tr><th>三元组</th><th>成员</th><th>场景</th><th>出处</th></tr>
+    <tr><td><strong>Session Init 三元组</strong></td><td><code>team / agent / task</code></td><td>session 注册时让用户选的身份</td><td><code>INSTALL_CN.md:102</code></td></tr>
+    <tr><td><strong>Isolation 三元组</strong></td><td><code>team / agent / user</code></td><td>v3 API L0-L3 接口强制校验的隔离维度</td><td><code>v2-router.ts:121</code></td></tr>
+  </table>
+  <p>两者重叠在 team + agent 上：team_id / agent_id 共用；Session Init 三元组多 task_id（用户选），Isolation 三元组多 user_id（鉴权自动解析）。</p>
+</section>
+
+<section id="user-vs-auto">
+  <h2><span class="sec">9</span>哪些用户定义，哪些自动注入</h2>
+  <p class="lead">身份字段的来源分工</p>
+  <table>
+    <tr><th>字段</th><th>来源</th><th>机制</th></tr>
+    <tr><td><code>team_id</code></td><td><strong>用户定义</strong></td><td><code>x-tdai-team-id</code> header 预选，或 form 里从 listTeams 选</td></tr>
+    <tr><td><code>agent_id</code></td><td><strong>用户定义</strong></td><td><code>x-tdai-agent-id</code> header 预选，或 form 里从 listAgents 选</td></tr>
+    <tr><td><code>task_id</code></td><td><strong>用户定义（可选）</strong></td><td><code>x-tdai-task-id</code> header 预选，或 form 里选；缺省走 <code>taskMissingPolicy</code></td></tr>
+    <tr><td><code>user_id</code></td><td><strong>自动（鉴权解析）</strong></td><td><code>Authorization: Bearer &lt;user_key&gt;</code> → <code>verifyUserKey()</code> → 内核 <code>/v3/meta/auth/verify</code> 返回 user_id</td></tr>
+    <tr><td><code>session_id</code></td><td><strong>客户端带或 proxy 分配</strong></td><td><code>autoConversationId</code> 开启时 proxy 按 <code>per-key</code> / <code>per-key-msg</code> 策略自动生成；客户端带 conversationId 时用客户端的</td></tr>
+  </table>
+  <div class="callout ok">
+    <span class="tag">透明</span>
+    数据面向 memory-core 发请求时，proxy 的 <code>tdai/client.ts:280-285</code> 把这套身份自动塞进 <code>x-tdai-*</code> header，对客户端透明——客户端只要在 session init 时选一次，之后每轮都不用再带。
+  </div>
+</section>
+
+<section id="evidence">
+  <h2><span class="sec">10</span>实测验证：dsh 真实跑通全链路</h2>
+  <p class="lead">2026-08-23 用 deepseek-harness 客户端（真实 dsh web 应用）跑通 session init 表单路径，Opik 全链追踪 + 内核数据三方交叉验证</p>
+
+  <h3>10.1 实验环境</h3>
+  <table>
+    <tr><th>节点</th><th>实例</th><th>配置要点</th></tr>
+    <tr><td><strong>dsh 客户端</strong>（真实 deepseek-harness）</td><td>Web UI :3080，驱动脚本走官方 RPC（session.create / session.prompt / events.mux / respond）</td><td><code>baseURL=http://127.0.0.1:8096/dsh/default</code>，只带 <code>Authorization: Bearer &lt;user_key&gt;</code>，<strong>无三元组 header</strong> → 必走表单路径</td></tr>
+    <tr><td><strong>MemoryProxy</strong></td><td>docker tdai-proxy :8096</td><td>sessionInit + headerAutoSelect + tdai.memory（writeL0 / recallL1 / injectL2L3 全开），Opik 上报 → :5173</td></tr>
+    <tr><td><strong>MemoryCore</strong></td><td>docker tdai-memory-core :8420</td><td>sqlite 后端，extraction.enableDedup=true</td></tr>
+    <tr><td><strong>Opik</strong></td><td>frontend :5173</td><td>proxy 原生上报，project = user_id <code>usr-d03quwpa51</code></td></tr>
+  </table>
+
+  <h3>10.2 表单三轮实测时间线（proxy 日志逐行）</h3>
+  <p>实验前在 team 下补建第 2 个 agent（<code>agt-icyfau04jg</code>）与第 2 个 task（<code>task-icyf84pzjb</code>）。1 team + 2 agents + 2 tasks → asset_confirm → agent_select（跳过 team_select）→ task_select 三轮：</p>
+  <table>
+    <tr><th>#</th><th>proxy 日志（节选）</th><th>说明</th></tr>
+    <tr><td>①</td><td><code>agentSource=dsh kind=main dshHeadless=false ... injectedSkipped=false</code></td><td>主对话进入 session-init（dsh 带 ask_user_question 工具，非 headless）</td></tr>
+    <tr><td>②</td><td><code>→ pending_asset_confirm (teams=1)</code></td><td>第 1 轮表单：是否关联团队资产</td></tr>
+    <tr><td>③</td><td><code>only-team=team-d03qdb2oty → pending_agent_select</code></td><td>答"是"后跳过 team_select（仅 1 team），直达 agent_select</td></tr>
+    <tr><td>④</td><td><code>agent=agt-icyfau04jg → pending_task_select (tasks=2)</code></td><td>第 2 轮表单：选 agent（2 选 1）</td></tr>
+    <tr><td>⑤</td><td><code>→ initialized agent=agt-icyfau04jg task=task-icyf84pzjb team=team-d03qdb2oty user=usr-d03quwpa51</code></td><td>第 3 轮表单：选 task（2 选 1）→ completeRegistration</td></tr>
+    <tr><td>⑥</td><td><code>processed: 11 msgs, ctx=Y/Y final=[system,user×4,assistant,tool×3...]</code></td><td>session_context 注入 system（Agent+Task 段都在）</td></tr>
+    <tr><td>⑦</td><td><code>justRegistered=true hasSessionInfo=true hasAgentDetail=true</code></td><td>触发 fetchAssetCapabilities + prewarmFromConfig</td></tr>
+    <tr><td>⑧</td><td><code>agent=dsh → auxiliary (skip session-init/mem/injection/L0/skill)</code></td><td>旁证：title 生成等辅助请求被分流跳过（对应第 3 节）</td></tr>
+  </table>
+  <div class="callout ok"><span class="tag">表单载体</span>dsh 的 form 是 <code>ask_user_question</code> tool_call（proxy 伪造 SSE，id 前缀 <code>call_dsh_session_init_</code>），与 claude-code 的 AskUserQuestion、codebuddy 的 ask_followup_question 同构不同名——每轮都是 proxy 直接回 SSE，<strong>不经过上游 LLM</strong>。</div>
+
+  <h3>10.3 注入前后 diff</h3>
+  <table>
+    <tr><th>侧</th><th>system 长度</th><th>来源</th></tr>
+    <tr><td>dsh 客户端侧（注入前）</td><td><strong>6197 字符</strong></td><td>dsh session history 的 request/header 事件</td></tr>
+    <tr><td>proxy 侧（注入后，发给 DeepSeek）</td><td><strong>16911 字符</strong>（+10714）</td><td>Opik llm span 的 input.messages[0]</td></tr>
+  </table>
+  <p>注入块实测（截取自 Opik span input）：</p>
+  <pre>&lt;session_context&gt;
+[Agent]
+id: agt-icyfau04jg
+name: mem-e2e-验证agent
+description: session init 全链路验证用
+
+[Task]
+id: task-icyf84pzjb
+name: session-init 全链路验证任务
+description: dsh 表单交互 + 记忆沉淀验证
+&lt;/session_context&gt;
+&lt;skill_tools&gt; ... &lt;tdai_memory_tools&gt; ... &lt;memory-tools-guide&gt; ...</pre>
+  <h3>10.4 Opik 全链追踪全景</h3>
+  <ul>
+    <li><strong>19 个 trace / 19 个 llm span</strong>（2026-08-23 12:30-12:43，两轮实验），每个 trace = 1 轮上游 LLM 请求</li>
+    <li>第 1 轮（表单轮）LLM 调用链：最后一步 7309ms，<code>prompt=21342 / hit=21248</code> —— <strong>KV cache 命中率 99.6%</strong>，直观印证"多轮重发历史 + 注入块"的缓存收益</li>
+    <li>第 2 轮（已初始化会话，无表单）工具循环 6 个 span，全部命中缓存（miss 仅几十 token）</li>
+    <li>两轮总计：prompt 350,940 / completion 6,209，cache hit 率 88.2%</li>
+  </ul>
+
+  <h3>10.5 记忆侧闭环（L0 → L1 → dedup）</h3>
+  <table>
+    <tr><th>层</th><th>实测结果</th></tr>
+    <tr><td><strong>L0</strong></td><td><code>conversations/2026-08-23.jsonl</code> 22 行（dsh 对话 + 工具调用全程）</td></tr>
+    <tr><td><strong>L1</strong></td><td>3 条记忆落库（2×instruction + 1×episodic），例：<code>"用户要求 AI 以后写测试优先使用 pytest，并且项目文档统一使用中文"</code></td></tr>
+    <tr><td><strong>Dedup</strong></td><td>真实运行：<code>Using vector recall mode (topK=5)</code> → LLM 裁决 <code>store</code> → 指标 <code>l1_dedup_store_count=1, latency=0ms</code>（本次无重复记忆，全部 store；印证上文讨论的召回→LLM 裁决机制）</td></tr>
+    <tr><td><strong>参与日志</strong></td><td><code>participation-log</code> 落 1 条：<code>user=usr-d03quwpa51 agent=agt-icyfau04jg task=task-icyf84pzjb src=context_proxy:codebuddy</code>（completeRegistration 内 fire-and-forget）</td></tr>
+  </table>
+
+  <h3>10.6 与 opencode 报告（图一）的对照</h3>
+  <table>
+    <tr><th></th><th>opencode（2026-08-21）</th><th>dsh（本次 2026-08-23）</th></tr>
+    <tr><td>客户端身份</td><td>opencode + OTel</td><td>deepseek-harness web 应用</td></tr>
+    <tr><td>三元组来源</td><td><strong>header 预选快速通道</strong>（opencode.jsonc 里配了 x-team-id/x-agent-id/x-task-id）</td><td><strong>表单交互路径</strong>（只带 user_key，无 header）</td></tr>
+    <tr><td>session init 表现</td><td>0 轮表单，直接登记 → 注入 → 转发</td><td>3 轮表单（asset_confirm / agent_select / task_select）</td></tr>
+    <tr><td>注入 diff</td><td>system 9653 → 16747（+7094）</td><td>system 6197 → 16911（+10714）</td></tr>
+    <tr><td>共同点</td><td colspan="2">注入块结构一致（session_context + skill_tools + tdai_memory_tools + memory-tools-guide）；KV cache 高命中；L0→L1→dedup 记忆闭环</td></tr>
+  </table>
+</section>
+
+<section id="files">
+  <h2><span class="sec">11</span>关键文件索引</h2>
+  <p class="lead">Session Init 涉及的核心源码</p>
+  <div class="files">
+    <div class="file"><span class="path">MemoryProxy/src/session/index.ts</span><span class="role">路由 wrapper，按 agentSource 分派到 CB/CC 状态机</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/types.ts</span><span class="role">状态机状态定义、SessionInfo/SessionInitState 类型</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/codebuddy/init.ts</span><span class="role">CB 状态机主循环（CB/WB/Codex/DSH 共用）</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/claude-code/init.ts</span><span class="role">Claude Code 专用状态机</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/registrar.ts</span><span class="role">buildSessionInfo 本地构建（不再调 TMC）</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/preset.ts</span><span class="role">Header 预选解析与校验</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/context-injector.ts</span><span class="role">session_context 块注入 system message</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/session/store.ts</span><span class="role">SessionStore（L1 内存 + L2 Redis/SQLite）</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/injection/prewarm.ts</span><span class="role">prewarmFromConfig 缓存预热</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/injection/index.ts</span><span class="role">injector 注册与 pipeline 组装</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/auth.ts</span><span class="role">verifyUserKey（apiKey → user_id）</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/anthropicHandler.ts:706</span><span class="role">Claude Code 入口拦截点</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/handler.ts:763</span><span class="role">OpenAI 协议入口拦截点</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/meta/client.ts</span><span class="role">MetadataClient（调内核 /v3/meta/*）</span></div>
+    <div class="file"><span class="path">MemoryCore/src/gateway/v3-meta-router.ts</span><span class="role">内核 /v3/meta/* 路由（55 接口）</span></div>
+  </div>
+</section>
+
+<footer>
+  <span>Session Init 机制讨论 · 独立文档</span>
+  <span>与 opik-trace-report.html 无关联 · 配色靛蓝系以示区分</span>
+</footer>
+
+</div>
+<script>
+  (function(){
+    var btn = document.getElementById('themeToggle');
+    function render(){ btn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '🌙' : '☀️'; }
+    render();
+    btn.addEventListener('click', function(){
+      var next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      render();
+    });
+  })();
+</script>
+</body>
+</html>

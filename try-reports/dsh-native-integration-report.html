@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dsh 原生插件接入实验报告 · TencentDB Agent Memory</title>
+<style>
+  :root {
+    --bg: #0a0c13; --bg-2: #0e1119;
+    --panel: #12151f; --panel-2: #181c29; --panel-3: #1e2333;
+    --border: #242a3d; --border-soft: #1b2031;
+    --text: #e8ebf4; --muted: #97a0b8; --muted-2: #6b7490;
+    --accent: #7c9eff; --accent-2: #b794f6; --accent-dim: rgba(124,158,255,.14);
+    --agent: #f6ad55; --proxy: #7c9eff; --core: #4fd1c5; --llm: #8aa1b8;
+    --warn: #fc8181; --ok: #68d391; --code-bg: #0c0f18;
+    --glow-1: rgba(124,158,255,.12);
+    --glow-2: rgba(79,209,197,.09);
+    --grad: linear-gradient(135deg, #7c9eff 0%, #b794f6 100%);
+    --scrollbar: #2a3045;
+    --toc-bg: rgba(13,16,25,.84);
+    --h1-grad: linear-gradient(120deg, #ffffff 20%, #b9c6f4 55%, #9fd8cf 100%);
+    --shadow-card: 0 16px 48px rgba(0,0,0,.28);
+    --shadow-box: 0 4px 14px rgba(0,0,0,.22);
+    --label-bg: rgba(14,17,25,.9);
+    --code-text: #9db4f0;
+    --seqkeys-line: #4a7fd6; --seqkeys-text: #a9c1e8; --seqkeys-strong: #c6d8f5;
+  }
+  [data-theme="light"] {
+    --bg: #f5f6fa; --bg-2: #eef0f6;
+    --panel: #ffffff; --panel-2: #f2f4fa; --panel-3: #e6e9f2;
+    --border: #d9dde8; --border-soft: #e8ebf3;
+    --text: #1a1f2e; --muted: #5a6378; --muted-2: #8b94aa;
+    --accent: #4264f6; --accent-2: #8b5cf6; --accent-dim: rgba(66,100,246,.10);
+    --agent: #dd6b20; --proxy: #4264f6; --core: #0d9488; --llm: #64748b;
+    --warn: #dc2626; --ok: #059669; --code-bg: #f3f5fa;
+    --glow-1: rgba(66,100,246,.07);
+    --glow-2: rgba(13,148,136,.04);
+    --grad: linear-gradient(135deg, #4264f6 0%, #8b5cf6 100%);
+    --scrollbar: #cdd3e2;
+    --toc-bg: rgba(255,255,255,.85);
+    --h1-grad: linear-gradient(120deg, #1a1f2e 20%, #4264f6 55%, #0d9488 100%);
+    --shadow-card: 0 16px 48px rgba(30,40,80,.08);
+    --shadow-box: 0 4px 14px rgba(30,40,80,.06);
+    --label-bg: rgba(255,255,255,.94);
+    --code-text: #3d52d6;
+    --seqkeys-line: #4a7fd6; --seqkeys-text: #3a5a9a; --seqkeys-strong: #1a1f2e;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.7; font-size: 15px; }
+  body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background:
+      radial-gradient(900px 420px at 85% -10%, var(--glow-1), transparent 60%),
+      radial-gradient(700px 380px at -10% 25%, var(--glow-2), transparent 60%),
+      radial-gradient(800px 500px at 60% 110%, rgba(183,148,246,.07), transparent 60%); }
+  ::selection { background: rgba(124,158,255,.35); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 56px 32px 100px; }
+
+  /* ── Header ── */
+  header { margin: 0 0 24px; padding: 44px 44px 36px; position: relative;
+    background: linear-gradient(180deg, rgba(124,158,255,.06), rgba(124,158,255,0) 85%), var(--panel);
+    border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }
+  header::after { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--grad); }
+  header .eyebrow { color: var(--accent-2); font-size: 12px; letter-spacing: 3px; text-transform: uppercase;
+    font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+  header .eyebrow::before { content: ""; width: 26px; height: 2px; background: var(--grad); border-radius: 2px; }
+  header h1 { margin: 0 0 10px; font-size: 38px; font-weight: 800; letter-spacing: -1px; line-height: 1.15;
+    background: var(--h1-grad);
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  header .sub { color: var(--muted); font-size: 15px; max-width: 860px; }
+  header .meta { margin-top: 20px; display: flex; gap: 10px; flex-wrap: wrap; }
+  header .meta span { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted);
+    background: var(--panel-2); border: 1px solid var(--border); padding: 5px 12px; border-radius: 999px; }
+  header .meta .dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* ── TOC ── */
+  nav.toc { position: sticky; top: 12px; z-index: 50; display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 10px 14px; margin: 0 0 48px;
+    background: var(--toc-bg); backdrop-filter: blur(14px);
+    border: 1px solid var(--border); border-radius: 14px; }
+  nav.toc a { color: var(--muted); text-decoration: none; font-size: 12.5px; padding: 4px 12px;
+    border-radius: 999px; border: 1px solid transparent; transition: all .15s ease; white-space: nowrap; }
+  nav.toc a:hover { color: var(--text); background: var(--panel-3); border-color: var(--border); }
+  nav.toc a .n { color: var(--accent); font-weight: 700; margin-right: 5px; font-family: "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ── Section ── */
+  section { margin: 60px 0; }
+  section > h2 { display: flex; align-items: center; gap: 14px; font-size: 23px; font-weight: 700;
+    margin: 0 0 8px; letter-spacing: -.3px; }
+  section > h2 .sec { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+    min-width: 38px; height: 38px; border-radius: 12px; background: var(--accent-dim);
+    border: 1px solid rgba(124,158,255,.35); color: var(--accent);
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 15px; font-weight: 700; }
+  section > .lead { color: var(--muted); margin: 2px 0 24px; font-size: 13.5px; margin-left: 52px; }
+  h3 { font-size: 16px; font-weight: 700; margin: 30px 0 12px; color: var(--text);
+    display: flex; align-items: center; gap: 10px; }
+  h3::before { content: ""; width: 8px; height: 8px; border-radius: 3px; background: var(--grad); flex-shrink: 0; }
+  p { margin: 10px 0; }
+  strong { color: #fff; font-weight: 600; }
+  [data-theme="light"] strong { color: var(--text); }
+  code { font-family: "SF Mono", Menlo, Consolas, monospace; background: var(--code-bg);
+    padding: 1.5px 7px; border-radius: 5px; font-size: 12.5px; color: var(--code-text); border: 1px solid var(--border); }
+  ul, ol { margin: 12px 0; padding-left: 26px; }
+  li { margin: 7px 0; }
+  li::marker { color: var(--accent); }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px;
+    overflow-x: auto; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; color: #c8d0e6;
+    line-height: 1.65; box-shadow: inset 0 2px 8px rgba(0,0,0,.3); margin: 16px 0; }
+  [data-theme="light"] pre { color: #2a3050; box-shadow: inset 0 2px 8px rgba(30,40,80,.05); }
+  pre .cm { color: var(--muted-2); }
+  pre .kw { color: var(--accent-2); }
+  pre .st { color: var(--ok); }
+
+  /* ── Callout ── */
+  .callout { background: linear-gradient(90deg, rgba(124,158,255,.07), transparent 70%), var(--panel-2);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 10px;
+    padding: 14px 18px; margin: 18px 0; }
+  .callout.warn { border-left-color: var(--warn); background: linear-gradient(90deg, rgba(252,129,129,.06), transparent 70%), var(--panel-2); }
+  .callout.ok { border-left-color: var(--ok); background: linear-gradient(90deg, rgba(104,211,145,.06), transparent 70%), var(--panel-2); }
+  .callout .tag { font-size: 11px; font-weight: 800; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--accent); margin-right: 8px; }
+  .callout .tag::before { content: "▸ "; }
+  .callout.warn .tag { color: var(--warn); }
+  .callout.ok .tag { color: var(--ok); }
+
+  /* ── 卡片 ── */
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin: 18px 0; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 18px 0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px;
+    transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+  .card:hover { transform: translateY(-3px); border-color: rgba(124,158,255,.4);
+    box-shadow: 0 12px 32px rgba(0,0,0,.32); }
+  .card .ttl { font-weight: 700; margin-bottom: 8px; color: var(--text); font-size: 15px;
+    display: flex; align-items: center; gap: 8px; }
+  .card .ttl::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--grad); flex-shrink: 0; }
+  .card .body { font-size: 13px; color: var(--muted); }
+  .card .body code { font-size: 11.5px; }
+
+  /* ── 表格 ── */
+  table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 18px 0;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    font-size: 13.5px; box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  tr:first-child th { background: var(--panel-2); color: var(--accent); font-weight: 700; font-size: 11.5px;
+    letter-spacing: .8px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: rgba(124,158,255,.04); }
+  tr:last-child td { border-bottom: none; }
+  td code { font-size: 12px; }
+  .ok-chip { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); font-weight: 700; font-size: 12.5px; }
+  .ok-chip::before { content: "✓"; }
+  .warn-chip { display: inline-flex; align-items: center; gap: 5px; color: var(--warn); font-weight: 700; font-size: 12.5px; }
+  .warn-chip::before { content: "✗"; }
+
+  /* ── 时间线 ── */
+  .timeline { position: relative; margin: 24px 0; padding-left: 32px; }
+  .timeline::before { content: ""; position: absolute; left: 10px; top: 8px; bottom: 8px; width: 2px;
+    background: linear-gradient(180deg, var(--accent), var(--accent-2), var(--core)); border-radius: 2px; opacity: .5; }
+  .tl-item { position: relative; margin: 0 0 20px; }
+  .tl-item::before { content: ""; position: absolute; left: -28px; top: 6px; width: 12px; height: 12px;
+    border-radius: 50%; background: var(--grad); box-shadow: 0 0 0 4px var(--bg), 0 0 12px rgba(124,158,255,.5); }
+  .tl-item .tl-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .tl-item .tl-phase { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; font-weight: 800;
+    color: var(--accent); background: var(--accent-dim); border: 1px solid rgba(124,158,255,.3);
+    padding: 2px 10px; border-radius: 999px; }
+  .tl-item .tl-title { font-weight: 700; font-size: 14.5px; }
+  .tl-item .tl-desc { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+  /* ── 流程图（阶段一闭环）── */
+  .flow-card { background: linear-gradient(180deg, rgba(124,158,255,.05), transparent 45%), var(--panel);
+    border: 1px solid var(--border); border-radius: 16px; padding: 30px 24px 22px; margin: 24px 0 28px;
+    box-shadow: var(--shadow-card); }
+  .flow-title { display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+    font-size: 13px; color: var(--muted); letter-spacing: 1px; }
+  .flow-title::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--grad); }
+  .flow-rows { display: flex; flex-direction: column; gap: 0; }
+  .frow { display: grid; grid-template-columns: 130px 1fr; gap: 14px; align-items: stretch; }
+  .frow .fnode { display: flex; flex-direction: column; align-items: center; justify-content: center;
+    border-radius: 12px; padding: 10px 8px; text-align: center; font-size: 12.5px; font-weight: 700;
+    border: 1px solid; position: relative; }
+  .frow .fnode .fsub { font-size: 10.5px; font-weight: 400; margin-top: 3px; opacity: .75; }
+  .fn-agent { background: color-mix(in srgb, var(--agent) 12%, transparent); border-color: color-mix(in srgb, var(--agent) 38%, transparent); color: var(--agent); }
+  .fn-proxy { background: color-mix(in srgb, var(--proxy) 12%, transparent); border-color: color-mix(in srgb, var(--proxy) 38%, transparent); color: var(--proxy); }
+  .fn-llm { background: color-mix(in srgb, var(--llm) 12%, transparent); border-color: color-mix(in srgb, var(--llm) 38%, transparent); color: var(--llm); }
+  .fn-core { background: color-mix(in srgb, var(--core) 12%, transparent); border-color: color-mix(in srgb, var(--core) 38%, transparent); color: var(--core); }
+  .fn-dash { background: color-mix(in srgb, var(--accent-2) 12%, transparent); border-color: color-mix(in srgb, var(--accent-2) 38%, transparent); color: var(--accent-2); }
+  .frow .fstep { display: flex; flex-direction: column; justify-content: center; gap: 4px;
+    background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 10px; padding: 10px 16px; }
+  .fstep .fs-main { font-size: 13px; color: var(--text); }
+  .fstep .fs-sub { font-size: 11.5px; color: var(--muted-2); font-family: "SF Mono", Menlo, Consolas, monospace; }
+  .fs-num { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+    width: 17px; height: 17px; border-radius: 50%; font-size: 10px; font-weight: 800; margin-right: 7px;
+    vertical-align: -2px; color: #0b0d15; }
+  .fs-agent .fs-num { background: var(--agent); }
+  .fs-proxy .fs-num { background: var(--proxy); }
+  .fs-core .fs-num { background: var(--core); }
+  .fs-dash .fs-num { background: var(--accent-2); }
+  .fs-llm .fs-num { background: var(--llm); }
+
+  /* ── 结果块 ── */
+  .result-box { background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 20px; margin: 16px 0; font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px; line-height: 1.8; color: #c8d0e6; }
+  [data-theme="light"] .result-box { color: #2a3050; }
+  .result-box .r-ok { color: var(--ok); font-weight: 700; }
+  .result-box .r-hl { color: var(--accent-2); }
+  .result-box .r-dim { color: var(--muted-2); }
+
+  /* ── 徽章 ── */
+  .badge-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .badge { display: inline-flex; align-items: center; gap: 7px; padding: 6px 14px; border-radius: 999px;
+    font-size: 12.5px; font-weight: 600; border: 1px solid; }
+  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+  .badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+  .badge.info { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+
+  /* ── 文件索引 ── */
+  .files { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; }
+  .file { display: flex; gap: 14px; padding: 11px 16px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; font-size: 13px; align-items: baseline;
+    transition: border-color .15s ease, background .15s ease; }
+  .file:hover { border-color: rgba(124,158,255,.4); background: var(--panel-2); }
+  .file .path { font-family: "SF Mono", Menlo, Consolas, monospace; color: var(--code-text); flex-shrink: 0;
+    min-width: 380px; font-size: 12.5px; }
+  .file .role { color: var(--muted); }
+  .file .loc { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px; color: var(--accent);
+    background: var(--accent-dim); padding: 1px 8px; border-radius: 5px; flex-shrink: 0; }
+
+  /* ── diff 标记 ── */
+  .diff-add { color: var(--ok); font-weight: 700; }
+  .diff-mod { color: var(--accent-2); font-weight: 700; }
+
+  /* ── Footer ── */
+  footer { margin-top: 80px; padding: 28px 0 0; border-top: 1px solid var(--border); color: var(--muted-2);
+    font-size: 12.5px; display: flex; justify-content: center; gap: 32px; flex-wrap: wrap; }
+
+  /* ── 主题切换 ── */
+  .theme-toggle { position: fixed; bottom: 22px; right: 22px; z-index: 100;
+    width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; line-height: 1; transition: transform .2s ease, border-color .2s ease;
+    box-shadow: var(--shadow-box); padding: 0; }
+  .theme-toggle:hover { transform: translateY(-2px); border-color: var(--accent); }
+  .theme-toggle:active { transform: translateY(0); }
+
+  @media (max-width: 820px) {
+    .wrap { padding: 28px 16px 60px; }
+    header { padding: 32px 22px 26px; }
+    header h1 { font-size: 28px; }
+    section > .lead { margin-left: 0; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .file { flex-direction: column; gap: 4px; }
+    .file .path { min-width: 0; word-break: break-all; }
+    .frow { grid-template-columns: 90px 1fr; }
+  }
+</style>
+<script>
+  (function(){ var t = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', t); })();
+</script>
+</head>
+<body>
+<button class="theme-toggle" id="themeToggle" title="切换深/浅色主题" aria-label="切换主题"></button>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">TencentDB Agent Memory · 实验报告</div>
+  <h1>dsh 原生插件接入实验</h1>
+  <div class="sub">从"everything is plugins"猜想出发，两阶段验证 deepseek-harness 能否以原生 Cordis 插件形态接入腾讯 agent memory —— 阶段一打通外部仪表盘答题，阶段二复刻三元组身份识别与上下文注入，全程零 dsh 源码改动</div>
+  <div class="meta">
+    <span><span class="dot" style="background:var(--agent)"></span>dsh headless</span>
+    <span><span class="dot" style="background:var(--accent-2)"></span>原生 Cordis 插件</span>
+    <span><span class="dot" style="background:var(--proxy)"></span>MemoryProxy</span>
+    <span><span class="dot" style="background:var(--core)"></span>MemoryCore Gateway</span>
+    <span>实验日期 2026-08-24</span>
+    <span>两阶段全部跑通 · 判据 6/6 + 6/6</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <a href="#origin"><span class="n">01</span>猜想起点</a>
+  <a href="#recon"><span class="n">02</span>调研发现</a>
+  <a href="#phase1"><span class="n">03</span>阶段一 · 仪表盘答题</a>
+  <a href="#phase2"><span class="n">04</span>阶段二 · 三元组+注入</a>
+  <a href="#evidence"><span class="n">05</span>实测证据</a>
+  <a href="#scope"><span class="n">06</span>修改范围</a>
+  <a href="#usage"><span class="n">07</span>实际使用</a>
+  <a href="#pitfalls"><span class="n">08</span>踩坑实录</a>
+  <a href="#conclusion"><span class="n">09</span>结论与展望</a>
+</nav>
+
+<!-- ═══════════════ 01 猜想起点 ═══════════════ -->
+<section id="origin">
+  <h2><span class="sec">1</span>猜想起点</h2>
+  <p class="lead">为什么想做这个实验 —— 一条从架构讨论长出来的技术路线</p>
+
+  <p>在讨论 TencentDB Agent Memory 的 session-init 机制时，我们发现了一个架构级缺口：MemoryProxy 自身<strong>不托管任何 UI</strong>——它通过把客户端 LLM base URL 指向自身被接入（如 CC 的 <code>ANTHROPIC_BASE_URL=http://proxy:8096/…</code>，<code>server.ts:177</code>），以<strong>反向代理 + 伪造 AskUserQuestion tool_call</strong> 的方式弹身份表单：proxy 把伪造的 form 注入请求流返回给客户端，借用<strong>客户端自己的表单渲染器</strong>展示。但 dsh 的 headless 模式没有这类 UI 工具——它不挂 ask-user preset，agent-loop 会把未知工具直接校验抛出（<code>handler.ts:706-714</code>），所以 proxy 只能对 headless 请求 bypass，身份识别在这个场景下是缺失的。</p>
+
+  <p>由此引出核心猜想：<strong>dsh 官方宣传 "everything is plugins"，那能不能不必让请求流经 proxy 的转发层，而是写一个 dsh 原生插件，直接在 dsh 的 workflow 生命周期节点上插入 Tencent agent memory？</strong>如果原生插件跑在客户端进程内，它甚至可以自己解决交互问题——把身份表单外包给一个外部仪表盘。</p>
+
+  <div class="callout">
+    <span class="tag">实验命题</span>dsh headless（无内置 UI 的一次性驱动模式）能否通过<strong>原生 Cordis 插件 + 外部浏览器仪表盘</strong>，把交互式人机问答与三元组身份识别完整搬到 dsh 进程内 —— 全程不改 dsh 一行源码。
+  </div>
+
+  <h3>两阶段验证策略</h3>
+  <p>命题太重，拆成两阶段，每阶段有独立的成功判据：</p>
+  <div class="grid-2">
+    <div class="card">
+      <div class="ttl">阶段一（P0–P3）· 建筑地基</div>
+      <div class="body">验证最底层的 architectural prerequisite：<strong>headless dsh 能否把 <code>ask_user_question</code> 工具的问答外包给外部浏览器仪表盘</strong>。LLM 调工具 → 插件 provider 收到 → SSE 推到浏览器 → 人点选项 → 答案回灌 → agent 继续。如果这层不通，后面全部免谈。</div>
+    </div>
+    <div class="card">
+      <div class="ttl">阶段二（P4-b）· 完整接入</div>
+      <div class="body">在地基上复刻 proxy 的完整 session-init：<strong>身份识别状态机（asset_confirm → team → agent → task，含 auto-select / bypass）+ 持久化到 proxy SessionStore + <code>&lt;session_context&gt;</code> 注入 system prompt</strong>。数据走 Gateway，身份走 proxy。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ 02 调研发现 ═══════════════ -->
+<section id="recon">
+  <h2><span class="sec">2</span>调研发现 · dsh 插件体系解剖</h2>
+  <p class="lead">读 deepseek-harness 源码确认的扩展点全貌（关键证据 file:line）</p>
+
+  <h3>插件形态：标准 Cordis 插件</h3>
+  <p>dsh 的"插件"就是标准 Cordis 插件——npm 包导出 <code>name</code> / <code>inject</code> / <code>apply(ctx, config)</code>。官方设计 note 原话：<strong>"native hooks are not a package — a native hook is just an ordinary Cordis plugin subscribing to the canonical lifecycle events"</strong>（<code>.agents/notes/implemented/feature/2026-06-30-interception-extension-points.md:9</code>）。preset 只是插件清单文件，加一行即挂载。</p>
+
+  <h3>生命周期事件（三种派发模式）</h3>
+  <table>
+    <tr><th>时机</th><th>扩展点</th><th>模式</th><th>能做什么</th></tr>
+    <tr><td>会话开始</td><td><code>agent/session-start</code></td><td><strong>emit</strong>（不阻塞）</td><td>通知类；跑状态机会被 LLM 抢跑（阶段二实测踩坑）</td></tr>
+    <tr><td><strong>LLM 请求前</strong></td><td><code>agent/pre-step</code></td><td><strong>waterfall</strong>（阻塞）</td><td>可改写消息批次 / 阻塞等待表单——<strong>状态机正确挂载点</strong></td></tr>
+    <tr><td>请求配置</td><td><code>agent/request</code></td><td>waterfall</td><td>只改 provider/model 等配置，不能改消息</td></tr>
+    <tr><td>系统提示</td><td><code>systemPrompt.section()</code></td><td>注册表</td><td>注册动态 system prompt 段（text 可以是函数）——<strong>注入正确方式</strong></td></tr>
+    <tr><td>交互问答</td><td><code>userQuestions.registerProvider()</code></td><td>单例注册</td><td>成为 ask_user_question 的 UI 后端——<strong>仪表盘的挂载点</strong></td></tr>
+    <tr><td>轮次结束</td><td><code>agent/turn-stopping</code></td><td>serial</td><td>轮次关闭前可 steer 续轮；可做写回捕获</td></tr>
+    <tr><td>历史追加后</td><td><code>session/event</code></td><td>emit（只读）</td><td>观察 assistant/message 等——L0 捕获可用</td></tr>
+    <tr><td>工具执行前后</td><td><code>tools/pre-execute</code> / <code>post-execute</code></td><td>waterfall</td><td>allow / deny / 改写结果</td></tr>
+  </table>
+
+  <div class="callout warn">
+    <span class="tag">已知缺口</span>"LLM 响应返回后、写入会话历史前"的拦截点<strong>不存在</strong>——<code>agent.ts:345-390</code> 是边流边写历史，中间无事件。响应内容只能写入后观察（<code>session/event</code>），不能改。此外 <code>userQuestions.ask()</code> 若无 provider 直接抛 <code>NO_PROVIDER</code>（不崩进程）；provider 永不 resolve 则<strong>进程永久挂死</strong>（工具执行器不放弃已启动 promise，<code>tools/index.ts:1529</code>）——插件必须自带超时。
+  </div>
+
+  <h3>headless 的交互原理</h3>
+  <p><code>dsh --profile headless "task"</code> 不挂 Host/HTTP/浏览器插件，跑完任务即退出。<code>userQuestions.ask()</code> 把问题交给注册的 provider——<strong>谁注册谁就是 UI</strong>。web-app 场景是 apiproxy 注册 provider 把题经 WebSocket/SSE 送到浏览器；headless 默认无人注册 → <code>NO_PROVIDER</code>。这正给了外部插件接管的空间。</p>
+</section>
+
+<!-- ═══════════════ 03 阶段一 ═══════════════ -->
+<section id="phase1">
+  <h2><span class="sec">3</span>阶段一（P0–P3）· 仪表盘答题闭环</h2>
+  <p class="lead">验证 headless dsh 能否把交互问答外包给外部浏览器 —— 判据 5/5 通过</p>
+
+  <h3>实验时间线</h3>
+  <div class="timeline">
+    <div class="tl-item">
+      <div class="tl-head"><span class="tl-phase">P0</span><span class="tl-title">分支 + 基线验证</span></div>
+      <div class="tl-desc">两个仓库各建实验分支；裸跑 <code>dsh --profile headless "reply ok"</code> 确认直连 DeepSeek API + headless pipeline 正常（exit 0）。</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-head"><span class="tl-phase">P1</span><span class="tl-title">dashboard-provider 插件 + 自测</span></div>
+      <div class="tl-desc">零依赖 Cordis 插件：<code>registerProvider</code> + HTTP 服务(:8790) + SSE 推题 + <code>POST /answer</code> 回灌。插件级自测 <strong>12/12</strong>：SSE 收题、答题 resolve、校验拦截（错 id / 非法选项 / 单选多选）、超时 reject、abort signal（中途 + 进入即 abort）。</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-head"><span class="tl-phase">P2</span><span class="tl-title">挂载接线</span></div>
+      <div class="tl-desc"><code>setup.mjs</code> 幂等写 profile 补丁 + 切 settings 直连 API。<strong>关键踩坑</strong>：<code>cordis.patch.yml</code> 新增插件必须用 <code>- insert:</code> 包裹（普通条目只覆盖已有行，见第 8 节）。</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-head"><span class="tl-phase">P3</span><span class="tl-title">端到端验证 ×3</span></div>
+      <div class="tl-desc">真实 LLM 跑通完整闭环，3 次成功（1 次因 tsx 冷编译超时失败，预热后稳定）。判据 <strong>5/5</strong>。</div>
+    </div>
+  </div>
+
+  <h3>阶段一闭环架构</h3>
+  <div class="flow-card">
+    <div class="flow-title">PHASE-1 FLOW · 外部仪表盘答题 · 5 步（P4-b 形态）</div>
+    <div class="flow-rows">
+      <div class="frow">
+        <div class="fnode fn-agent">Coding Agent<div class="fsub">headless CLI</div></div>
+        <div class="fstep fs-agent"><span class="fs-main"><span class="fs-num">1</span>dsh --profile headless "Ask user which database…"</span><span class="fs-sub">一次性驱动 · 无 UI · 任务经 cmdline 传入 · 首次 pre-step 触发状态机</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-core">memory-native<div class="fsub">pre-step 插件</div></div>
+        <div class="fstep fs-core"><span class="fs-main"><span class="fs-num">2</span>判断 session 未初始化 → 直接 ctx.userQuestions.ask() 弹身份题</span><span class="fs-sub">不经 LLM 工具层 · 省一轮往返 · LLM 首轮即带身份 · 行为同 proxy 的 session-init</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-dash">dashboard-provider<div class="fsub">Cordis 插件 :8790</div></div>
+        <div class="fstep fs-dash"><span class="fs-main"><span class="fs-num">3</span>provider 收到 pending → SSE 推送到浏览器仪表盘（auto-open 自动弹）</span><span class="fs-sub">GET /events · 断线重连自动重放 pending</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-dash">仪表盘<div class="fsub">浏览器</div></div>
+        <div class="fstep fs-dash"><span class="fs-main"><span class="fs-num">4</span>人点选项 → POST /answer → 校验 → resolve → 状态机续推到下一题</span><span class="fs-sub">asset_confirm → agent_select → task_select · 校验对齐 apiproxy matchesQuestions 语义</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-llm">LLM<div class="fsub">首轮</div></div>
+        <div class="fstep fs-llm"><span class="fs-main"><span class="fs-num">5</span>pre-step 完成 → 身份注入 systemPrompt → LLM 首轮请求 → 正常回复 → exit 0</span><span class="fs-sub">"Got it — we'll use MySQL as your database." · 问答不在 LLM 首轮上下文里</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>判据结果</h3>
+  <div class="result-box">
+<span class="r-dim">[e2e] ✓ dashboard server up</span><br>
+<span class="r-dim">[e2e] ✓ question received: q="Which database would you like to use?"</span><br>
+<span class="r-dim">[e2e]   options: MySQL / PostgreSQL / Redis</span><br>
+<span class="r-dim">[e2e] answering with: "MySQL" → answer POST → 200 {"ok":true}</span><br>
+<span class="r-ok">[e2e] ✓ question popped</span><br>
+<span class="r-ok">[e2e] ✓ answer accepted</span><br>
+<span class="r-ok">[e2e] ✓ dsh exit code 0</span><br>
+<span class="r-ok">[e2e] ✓ stdout contains "MySQL"</span>  <span class="r-dim">← "Got it — we'll use MySQL as your database."</span><br>
+<span class="r-hl">=== 5/5 passed · 3 runs ===</span>
+  </div>
+
+  <div class="callout ok">
+    <span class="tag">阶段一结论</span>headless dsh <strong>可以</strong>通过原生 Cordis 插件 + 外部仪表盘外包交互式问答，零 dsh 源码改动。profile 补丁机制、<code>registerProvider</code> 扩展点、LLM→工具→provider 链路、进程外 UI 桥接、挂死风险控制五个子命题全部验证通过。<strong>形态演进</strong>：P0-P3 经 LLM 工具层驱动弹窗（原始链路，已验证）；P4-b 起将其<strong>前置</strong>到 <code>agent/pre-step</code> 状态机直调，环节收敛为上述 5 步。
+  </div>
+</section>
+
+<!-- ═══════════════ 04 阶段二 ═══════════════ -->
+<section id="phase2">
+  <h2><span class="sec">4</span>阶段二（P4-b）· 三元组身份识别 + 上下文注入</h2>
+  <p class="lead">复刻 proxy session-init 状态机 + 持久化 + system prompt 注入 —— 判据 6/6 通过</p>
+
+  <p>用户决策（完整复刻方向）：状态机<strong>完整复刻</strong>（asset_confirm → team → agent → task，含 auto-select / bypass）、持久化<strong>复用 proxy SessionStore</strong>、注入<strong>完整链路</strong>。拆解为 5 个子阶段：</p>
+
+  <h3>子阶段拆解</h3>
+  <table>
+    <tr><th>阶段</th><th>交付物</th><th>验证</th></tr>
+    <tr><td><strong>P4-b-0</strong> Gateway client</td><td><code>memory-client.mjs</code> —— 直连 Gateway(:8420) 的零依赖 HTTP client，覆盖 7 方法：verifyAuth / listTeams / listAgents / listTasks / getAgent / getTask / appendParticipationLog</td><td><span class="ok-chip">自测 7/7</span></td></tr>
+    <tr><td><strong>P4-b-1</strong> proxy 写入端点</td><td><code>POST /v3/session/native-init</code> —— 外部插件选完三元组后 POST 给 proxy，落 SessionStore（L1 内存 + L2 SQLite），proxy 重启后 loadAllInitialized 恢复</td><td><span class="ok-chip">自测 200</span></td></tr>
+    <tr><td><strong>P4-b-2</strong> 状态机插件</td><td><code>memory-native.mjs</code> —— pre-step waterfall 里跑完整状态机：verifyAuth → listTeams(auto) → asset_confirm → listAgents → agent_select → listTasks → task_select(auto/bypass)</td><td><span class="ok-chip">3 轮 form 跑通</span></td></tr>
+    <tr><td><strong>P4-b-3</strong> 上下文注入</td><td>状态机完成后 <code>ctx.systemPrompt.section()</code> 注册动态段 —— <code>&lt;session_context&gt;</code> 包裹 <code>[Agent]</code>（id/name/description/prompt）+ <code>[Task]</code>（id/name/description）</td><td><span class="ok-chip">注入成功</span></td></tr>
+    <tr><td><strong>P4-b-4</strong> 端到端</td><td><code>run-e2e-native.mjs</code> 自动答 3 轮 form + 验证全链路</td><td><span class="ok-chip">6/6 判据</span></td></tr>
+  </table>
+
+  <h3>阶段二完整闭环</h3>
+  <div class="flow-card">
+    <div class="flow-title">PHASE-2 FLOW · 三元组身份识别 + 注入 · 10 步</div>
+    <div class="flow-rows">
+      <div class="frow">
+        <div class="fnode fn-agent">Coding Agent<div class="fsub">headless</div></div>
+        <div class="fstep fs-agent"><span class="fs-main"><span class="fs-num">1</span>任务触发 agent/pre-step waterfall（阻塞 LLM 请求）</span><span class="fs-sub">memory-native 插件在第一次 pre-step 接管</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-core">MemoryCore<div class="fsub">Gateway :8420</div></div>
+        <div class="fstep fs-core"><span class="fs-main"><span class="fs-num">2</span>verifyAuth(user_key) → user_id</span><span class="fs-sub">usr-d03quwpa51 · system_admin</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-core">MemoryCore</div>
+        <div class="fstep fs-core"><span class="fs-main"><span class="fs-num">3</span>listTeams → teams==1 → auto-select team</span><span class="fs-sub">team-d03qdb2oty (default-team) · 不弹 form</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-dash">仪表盘<div class="fsub">浏览器 :8790</div></div>
+        <div class="fstep fs-dash"><span class="fs-main"><span class="fs-num">4</span>弹 asset_confirm → 用户答"是，关联团队资产"</span><span class="fs-sub">选"否"则 bypass，保留请求直接放行（对齐 proxy 行为）</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-dash">仪表盘</div>
+        <div class="fstep fs-dash"><span class="fs-main"><span class="fs-num">5</span>listAgents → agents==2 → 弹 agent_select → 选 agent</span><span class="fs-sub">mem-e2e-agent (agt-icyfau04jg) / default-agent-admin / 跳过</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-dash">仪表盘</div>
+        <div class="fstep fs-dash"><span class="fs-main"><span class="fs-num">6</span>listTasks → tasks==2 → 弹 task_select → 选 task</span><span class="fs-sub">tasks==1 auto-select / tasks==0 agent-only 注册</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-core">MemoryCore</div>
+        <div class="fstep fs-core"><span class="fs-main"><span class="fs-num">7</span>getAgent + getTask 并行 → agentDetail / taskDetail</span><span class="fs-sub">appendParticipationLog fire-and-forget（失败仅 warn）</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-proxy">MemoryProxy<div class="fsub">:8096</div></div>
+        <div class="fstep fs-proxy"><span class="fs-main"><span class="fs-num">8</span>POST /v3/session/native-init → SessionStore 持久化</span><span class="fs-sub">composite_key = dsh:{session-id} · L1 内存 + L2 SQLite</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-agent">System Prompt</div>
+        <div class="fstep fs-agent"><span class="fs-main"><span class="fs-num">9</span>systemPrompt.section() 注册动态 &lt;session_context&gt; 段</span><span class="fs-sub">[Agent] id/name/description/prompt + [Task] id/name/description</span></div>
+      </div>
+      <div class="frow">
+        <div class="fnode fn-llm">LLM</div>
+        <div class="fstep fs-llm"><span class="fs-main"><span class="fs-num">10</span>pre-step 放行 → LLM 带身份上下文回复 → exit 0</span><span class="fs-sub">agent 侧状态缓存，后续 pre-step 只注入不再重问</span></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>判据结果</h3>
+  <div class="result-box">
+<span class="r-dim">[e2e-native] round 1: Asset Confirm → "是，关联团队资产"</span><br>
+<span class="r-dim">[e2e-native] round 2: Agent Select → "mem-e2e-agent"</span><br>
+<span class="r-dim">[e2e-native] round 3: Task Select → "session-init 全链路验证"</span><br>
+<span class="r-dim">[dsh:out] [memory-native] persisted to proxy: dsh:session-c52d2908-…</span><br>
+<span class="r-dim">[dsh:out] [memory-native] session-init complete: team=team-d03qdb2oty agent=agt-icyfau04jg task=task-icyf84pzjb</span><br>
+<span class="r-dim">[dsh:out] [memory-native] registered systemPrompt section "memory-native-session-context"</span><br>
+<span class="r-ok">✓ dashboard server up</span> · <span class="r-ok">✓ forms popped (3)</span> · <span class="r-ok">✓ all answers accepted</span><br>
+<span class="r-ok">✓ dsh exit code 0</span> · <span class="r-ok">✓ stdout indicates agent replied</span> · <span class="r-ok">✓ session-init completed / persisted</span><br>
+<span class="r-hl">=== 6/6 passed ===</span>
+  </div>
+
+  <div class="callout ok">
+    <span class="tag">阶段二结论</span>dsh 原生插件<strong>完整复刻</strong>了 proxy 的 session-init 状态机（含 auto-select / bypass 分支）、持久化到 proxy SessionStore、注入 <code>&lt;session_context&gt;</code> 到 system prompt。从身份识别到上下文注入全链路原生实现，不依赖 proxy 的请求流干预。
+  </div>
+</section>
+
+<!-- ═══════════════ 05 实测证据 ═══════════════ -->
+<section id="evidence">
+  <h2><span class="sec">5</span>实测证据</h2>
+  <p class="lead">真实环境数据 —— 非模拟、非 mock，全部来自本机 Gateway / proxy / DeepSeek API 实跑</p>
+
+  <h3>环境与身份</h3>
+  <table>
+    <tr><th>组件</th><th>实测值</th></tr>
+    <tr><td>MemoryCore Gateway</td><td><code>http://127.0.0.1:8420</code>（docker: tdai-memory-hub 系，serviceId=<code>default</code>，本地开发 apiKey 空）</td></tr>
+    <tr><td>MemoryProxy</td><td><code>http://127.0.0.1:8096</code>（实验期间本地 tsx 起，带 native-init 端点；平时 docker: tdai-proxy）</td></tr>
+    <tr><td>上游模型</td><td>DeepSeek 公共 API 直连（<code>api.deepseek.com</code>），key 走 <code>DEEPSEEK_API_KEY</code></td></tr>
+    <tr><td>用户身份</td><td><code>PROXY_USER_KEY</code> → verifyAuth → <code>usr-d03quwpa51</code>（system_admin，username=admin）</td></tr>
+  </table>
+
+  <h3>身份识别实测数据（3 轮 form 的真实选项）</h3>
+  <table>
+    <tr><th>阶段</th><th>候选（真实拉取）</th><th>行为</th></tr>
+    <tr><td>team</td><td><code>team-d03qdb2oty</code> (default-team) × 1</td><td><strong>auto-select</strong>，未弹 form</td></tr>
+    <tr><td>asset_confirm</td><td>是，关联团队资产 / 否，跳过</td><td>弹 form → 用户选"是"</td></tr>
+    <tr><td>agent</td><td><code>agt-icyfau04jg</code> (mem-e2e-agent)、<code>agt-d03qzbq9mj</code> (default-agent-admin)、跳过</td><td>弹 form → 选 mem-e2e-agent</td></tr>
+    <tr><td>task</td><td><code>task-icyf84pzjb</code> (session-init 全链路验证)、<code>task-d4hpqq8thj</code> (本地 agent 接入验证)、跳过</td><td>弹 form → 选 session-init 全链路验证</td></tr>
+  </table>
+
+  <h3>验证统计</h3>
+  <div class="badge-row">
+    <span class="badge ok">阶段一插件自测 12/12</span>
+    <span class="badge ok">阶段一端到端 5/5 × 3 runs</span>
+    <span class="badge ok">Gateway client 自测 7/7</span>
+    <span class="badge ok">native-init 端点 200</span>
+    <span class="badge ok">阶段二端到端 6/6</span>
+    <span class="badge ok">手动体验闭环 ×2（真人答题 → 身份注入 → exit 0）</span>
+    <span class="badge warn">tsx 冷编译超时 ×1（预热后消失）</span>
+    <span class="badge warn">注入方式返工 ×1（见踩坑 #4）</span>
+    <span class="badge warn">进程不退出 + 无答题入口（见踩坑 #6/#7，已修复）</span>
+  </div>
+</section>
+
+<!-- ═══════════════ 06 修改范围 ═══════════════ -->
+<section id="scope">
+  <h2><span class="sec">6</span>修改范围</h2>
+  <p class="lead">两个仓库、九个新文件、一处 proxy 增量 —— dsh 源码零改动，全部可回滚</p>
+
+  <h3>deepseek-harness 仓库 · <code>experiment/dashboard-provider</code> 分支</h3>
+  <div class="callout ok">
+    <span class="tag">零侵入</span>不改 dsh 任何源码、不动 packages/apps —— 全部内容在 <code>examples/headless-dashboard/</code> 一个目录里，删除即彻底移除。
+  </div>
+  <div class="files">
+    <div class="file"><span class="path">examples/headless-dashboard/dashboard-provider.mjs</span><span class="loc">阶段一</span><span class="role">核心 Cordis 插件：registerProvider + HTTP(:8790) + SSE + 校验 + 超时/abort 防挂死；含 auto-open 自动弹浏览器（#7）与 closeAllConnections 防进程不退出（#6）</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/dashboard.html</span><span class="loc">阶段一</span><span class="role">仪表盘单文件 HTML（深色主题、问题卡片、SSE 实时推送、断线重连重放）</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/setup.mjs</span><span class="loc">两阶段</span><span class="role">幂等挂载/卸载：写 profile 补丁（3 插件行）+ 备份切换 settings 直连 API</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/self-test.mjs</span><span class="loc">阶段一</span><span class="role">插件级自测（12 项：SSE/答题/校验/超时/abort 全路径）</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/run-e2e.mjs</span><span class="loc">阶段一</span><span class="role">端到端 runner：起 dsh → 等题 → 自动答 → 核对 5 判据</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/memory-client.mjs</span><span class="loc">阶段二</span><span class="role">Gateway HTTP client（7 方法，零依赖，user_key 从 ~/.dsh/.credentials.yaml 读）</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/test-memory-client.mjs</span><span class="loc">阶段二</span><span class="role">Gateway client 自测（调真实 Gateway 验证 7 方法）</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/memory-native.mjs</span><span class="loc">阶段二</span><span class="role">状态机 + 注入插件：pre-step waterfall 跑状态机 + systemPrompt.section 注入</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/run-e2e-native.mjs</span><span class="loc">阶段二</span><span class="role">端到端 runner：自动答 3 轮 form + 核对 6 判据</span></div>
+    <div class="file"><span class="path">examples/headless-dashboard/README.md</span><span class="loc">两阶段</span><span class="role">实验说明 + 复现步骤 + 技术要点 + 结论</span></div>
+  </div>
+
+  <h3>TencentDB-Agent-Memory 仓库 · <code>exp/dsh-dashboard-provider</code> 分支</h3>
+  <div class="files">
+    <div class="file"><span class="path">MemoryProxy/src/routes/session-native-init.ts</span><span class="loc diff-add">新增</span><span class="role">POST /v3/session/native-init —— 外部插件写入 SessionStore 的端点（实验用，无鉴权；bind identity + store.set 走 L1+L2 持久化）</span></div>
+    <div class="file"><span class="path">MemoryProxy/src/server.ts</span><span class="loc diff-mod">+6 行</span><span class="role">注册 native-init 路由（动态 import，不影响现有任何路由）</span></div>
+    <div class="file"><span class="path">docs/dsh-headless-dashboard-experiment.md</span><span class="loc diff-add">新增</span><span class="role">实验结论归档（P0–P3 + P4-b 全记录）</span></div>
+  </div>
+
+  <h3>运行时环境改动（setup.mjs 管理，uninstall 全恢复）</h3>
+  <table>
+    <tr><th>位置</th><th>实验期间</th><th>回滚后</th></tr>
+    <tr><td><code>~/.dsh/profiles/headless/cordis.patch.yml</code></td><td><span class="diff-add">+ insert</span> 3 插件行（tool-ask-user / dashboard-provider / memory-native）</td><td>恢复空补丁</td></tr>
+    <tr><td><code>~/.dsh/settings.yaml</code></td><td>llm-deepseek 直连 <code>api.deepseek.com</code>（原配置备份至 <code>.bak-exp</code>）</td><td>恢复 proxy 路由配置</td></tr>
+    <tr><td>docker: tdai-proxy</td><td>实验期间 stop（本地 tsx 起带 native-init 的 proxy）</td><td>docker start 恢复</td></tr>
+  </table>
+</section>
+
+<!-- ═══════════════ 07 实际使用 ═══════════════ -->
+<section id="usage">
+  <h2><span class="sec">7</span>实际使用</h2>
+  <p class="lead">复现完整实验 / 手动体验的操作手册</p>
+
+  <h3>前置条件</h3>
+  <ul>
+    <li>MemoryCore Gateway 运行在 <code>127.0.0.1:8420</code>（serviceId=<code>default</code>），元数据里有至少一个 team/agent</li>
+    <li>MemoryProxy 带 native-init 端点运行在 <code>127.0.0.1:8096</code>（docker 版无此端点，需本地 tsx 起：<code>node --import tsx/esm src/index.ts --config config.yaml</code>）</li>
+    <li><code>~/.dsh/.credentials.yaml</code> 里有有效的 <code>PROXY_USER_KEY</code></li>
+    <li>dsh 仓库在 <code>experiment/dashboard-provider</code> 分支</li>
+  </ul>
+
+  <h3>一键复现（阶段二完整链路）</h3>
+  <pre>
+<span class="cm"># 1. 停 docker proxy，本地起（带 native-init 端点）</span>
+docker stop tdai-proxy
+cd ../../Projects/TencentDB-Agent-Memory/MemoryProxy
+node --import tsx/esm src/index.ts --config config.yaml &amp;
+
+<span class="cm"># 2. 挂载实验插件（3 个）+ 切直连 API</span>
+cd ../../deepseek-harness
+node examples/headless-dashboard/setup.mjs
+
+<span class="cm"># 3. 端到端验证（自动答 3 轮 form，核对 6 判据）</span>
+node examples/headless-dashboard/run-e2e-native.mjs
+
+<span class="cm"># 4. 卸载 + 恢复环境</span>
+node examples/headless-dashboard/setup.mjs uninstall
+docker start tdai-proxy
+  </pre>
+
+  <h3>手动体验（真人答题）</h3>
+  <pre>
+<span class="cm"># 挂载后跑任意任务——首道题出现时自动弹出浏览器（无需手动开 :8790）</span>
+pnpm dsh --profile headless <span class="st">"帮我做点数据库维护"</span>
+<span class="cm"># 浏览器自动弹出仪表盘，依次答题：</span>
+<span class="cm">#   ① Asset Confirm（是/否）→ ② Agent Select → ③ Task Select</span>
+<span class="cm"># 答完后 agent 带身份上下文继续回复，进程正常退出（exit 0）</span>
+  </pre>
+
+  <h3>分项自测</h3>
+  <pre>
+node examples/headless-dashboard/self-test.mjs          <span class="cm"># 阶段一插件自测 12 项（无需 LLM/Gateway）</span>
+node examples/headless-dashboard/test-memory-client.mjs <span class="cm"># Gateway client 自测 7 项（需 Gateway 在跑）</span>
+node examples/headless-dashboard/run-e2e.mjs            <span class="cm"># 阶段一端到端（单轮问答）</span>
+  </pre>
+
+  <h3>可调参数（env）</h3>
+  <table>
+    <tr><th>变量</th><th>默认</th><th>说明</th></tr>
+    <tr><td><code>DASHBOARD_PORT</code></td><td>8790</td><td>仪表盘/答题服务端口</td></tr>
+    <tr><td><code>DASHBOARD_TIMEOUT_MS</code></td><td>600000</td><td>答题超时（防 provider 挂死）</td></tr>
+    <tr><td><code>DASHBOARD_AUTO_OPEN</code></td><td>1</td><td>有 pending 问题时自动打开浏览器（=0 关闭，无人值守场景用）</td></tr>
+    <tr><td><code>MEMORY_ENDPOINT</code></td><td>http://127.0.0.1:8420</td><td>Gateway 地址</td></tr>
+    <tr><td><code>MEMORY_SERVICE_ID</code></td><td>default</td><td>x-tdai-service-id 租户标识</td></tr>
+    <tr><td><code>PROXY_ENDPOINT</code></td><td>http://127.0.0.1:8096</td><td>native-init 持久化地址</td></tr>
+  </table>
+</section>
+
+<!-- ═══════════════ 08 踩坑实录 ═══════════════ -->
+<section id="pitfalls">
+  <h2><span class="sec">8</span>踩坑实录</h2>
+  <p class="lead">六个非显而易见的坑 —— 每个都消耗了真实调试时间，全部有源码级根因</p>
+
+  <table>
+    <tr><th>#</th><th>症状</th><th>根因</th><th>解法</th></tr>
+    <tr>
+      <td>1</td>
+      <td>补丁里的插件完全不加载，LLM 说"没有 ask_user_question 工具"</td>
+      <td><code>cordis.patch.yml</code> 的普通条目是<strong>对已有行的覆盖</strong>——id 匹配不到已有行时 <code>applyEntryPatches</code> 直接 warn+skip（<code>cordis-plugin-include/src/index.ts:110-114</code>）</td>
+      <td>新增插件必须用 <code>- insert:</code> 包裹（无 id 的 insert 顶层 push，对照 headless bundle 自己的写法 <code>packages/bundle/headless/cordis.patch.yml:22-35</code>）</td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>阶段二初期：状态机还在弹第一轮 form，LLM 已经回复完毕</td>
+      <td><code>agent/session-start</code> 是 <strong>emit（fire-and-forget）</strong>，agent loop 不等 listener（<code>agent-loop/src/index.ts:567</code>）</td>
+      <td>状态机改挂 <code>agent/pre-step</code> <strong>waterfall</strong>（阻塞 LLM 请求直到表单答完）</td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>provider 永不 resolve 时进程永久挂死（工具 promise 不被放弃）</td>
+      <td>dsh 工具执行器"永不放弃已启动的 promise"（<code>tools/index.ts:1529</code>），且 ask_user_question 未声明 timeoutMs，无兜底 deadline</td>
+      <td>插件 provider 强制 10 min 超时 + 监听 <code>request.signal</code> abort</td>
+    </tr>
+    <tr>
+      <td>4</td>
+      <td>注入后 DeepSeek API 报 <code>TRANSPORT: stream failed</code>，exit 1</td>
+      <td>在 pre-step waterfall 里<strong>改写 messages 数组</strong>破坏了 dsh LLM adapter 期望的消息格式</td>
+      <td>放弃改 messages，改用 <code>ctx.systemPrompt.section()</code> 注册动态段（text 为函数，每次 assemble 取最新 session 状态）——注入后 exit 0</td>
+    </tr>
+    <tr>
+      <td>5</td>
+      <td>Gateway 调用 <code>invalid_user_key</code> / <code>missing_user_key</code></td>
+      <td>user_key 位置因端点而异：auth/verify 在 <strong>body</strong>；team/agent/task/list 需 <strong>header（x-tdai-user-key）+ body（user_key）双带</strong>（SDK <code>metadata-client.ts:274,188,225</code>）</td>
+      <td>memory-client 统一在 header 带 user-key、body 合并 user_key</td>
+    </tr>
+    <tr>
+      <td>6</td>
+      <td><strong>手动体验才暴露</strong>：agent 回复完、<code>session-init complete</code> 已打印，进程却卡住永不退出（自动化 e2e 跑不到——脚本答完题就断开连接了）</td>
+      <td>headless 退出链 = <code>io.exit()</code> → <code>shutdown.shutdown()</code> → <strong>await 整个 cordis tree 的 <code>fiber.dispose()</code></strong>（<code>apps/cli/src/profile-boot.ts:210,257</code>）。dispose 会关 dashboard-provider 的 HTTP server，而 Node 的 <code>server.close()</code> 会<strong>等所有 keep-alive 连接自然断开</strong>——浏览器开着仪表盘时 SSE 长连接（<code>/events</code>）永远挂着 → close 永不回调 → dispose 挂起 → 进程永不退出</td>
+      <td><code>close()</code> 里先调 <code>server.closeAllConnections()</code>（Node 18.2+）强制断开 keep-alive/SSE 连接再 <code>server.close()</code>——修复后手动答题全程跑通、答完即退（exit 0）</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>每次都要手动开浏览器访问 <code>:8790</code> 才能答题，忘了开就卡到 10 min 超时</td>
+      <td>交互是"人看仪表盘答题"的，但 headless 无 UI 提示，答题入口没人提醒</td>
+      <td>dashboard-provider 加 <strong>auto-open</strong>：首个 pending 问题出现时用系统命令自动打开默认浏览器（win32 <code>cmd /c start</code> / macOS <code>open</code> / Linux <code>xdg-open</code>），仅触发一次；env <code>DASHBOARD_AUTO_OPEN=0</code> 可关（无人值守场景）</td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <span class="tag">方法论</span>坑 #1 和 #2 的共性：<strong>dsh 的事件语义（emit / waterfall / serial）和 patch 语义（insert / override）在文档里不显眼，读源码 + 对照官方 bundle 自己的写法是唯一可靠路径</strong>。这本身就是"everything is plugins"的隐性学习成本。坑 #6 的教训：<strong>keep-alive/SSE 长连接会让 <code>server.close()</code> 静默挂起</strong>——凡是"进程退出依赖 dispose 完成"的架构（cordis、Koa、优雅停机），插件里的 HTTP server 都要显式 <code>closeAllConnections()</code>。
+  </div>
+</section>
+
+<!-- ═══════════════ 09 结论与展望 ═══════════════ -->
+<section id="conclusion">
+  <h2><span class="sec">9</span>结论与展望</h2>
+  <p class="lead">两阶段判据全绿 —— 架构路线的定论与下一步</p>
+
+  <h3>核心结论</h3>
+  <div class="grid-2">
+    <div class="card">
+      <div class="ttl">① "everything is plugins" 是真的</div>
+      <div class="body">dsh 的原生扩展点（pre-step waterfall / systemPrompt.section / userQuestions.registerProvider / tools 事件）对外部插件完全开放。本实验全程<strong>零 dsh 源码修改</strong>——一个 examples 目录 + 一个 profile 补丁文件完成了全部接入。</div>
+    </div>
+    <div class="card">
+      <div class="ttl">② headless 身份缺口被缝合</div>
+      <div class="body">proxy 在 headless 场景伪造 form 被拒的缺口，由<strong>进程内原生插件 + 外部仪表盘</strong>补上：状态机在 pre-step 阻塞弹表单，用户在浏览器答题，身份识别在请求离开进程前完成。</div>
+    </div>
+    <div class="card">
+      <div class="ttl">③ proxy 角色可以转变</div>
+      <div class="body">身份识别与注入移入原生插件后，proxy 从<strong>请求流转发者</strong>（改 base URL 接入、拦截一切 LLM 请求的层）转为<strong>持久化后端 + prewarm 服务</strong>：本实验的 native-init 端点是第一步——插件选完三元组 POST 给 proxy 落 SessionStore，proxy 与原生插件共享同一份会话状态。</div>
+    </div>
+    <div class="card">
+      <div class="ttl">④ 与 OpenClaw 插件同构</div>
+      <div class="body">本实验的形态与 <code>MemoryCore/openclaw-plugin</code>（hooks + SDK 委托 Gateway 的框架适配层）完全同构——验证了这条路线在不同 harness 间的<strong>可复制性</strong>。</div>
+    </div>
+  </div>
+
+  <h3>下一步（未做）</h3>
+  <ul>
+    <li><strong>P4-a · proxy 语义缝合验证</strong>：dsh 挂上 <code>ask_user_question</code> 工具后走 proxy(:8096)——handler 的 bypass 判定（<code>agentSource=dsh 且 tools 不含 ask_user_question</code>，<code>handler.ts:706-714</code>）将不再命中，proxy 伪造的 session-init form 会以合法 tool_call 进入我们的 provider，两条身份链路的交互值得单独验证</li>
+    <li><strong>完整 prewarm</strong>：注入目前只做 <code>&lt;session_context&gt;</code>（[Agent]/[Task]），prewarm 链路（skill listing / knowledge / L2 场景索引 / L3 画像 / <code>&lt;tdai_memory_tools&gt;</code>）尚未搬到插件——Gateway client 已就绪，照 proxy 的 injector 清单逐个补即可</li>
+    <li><strong>L0 会话捕获</strong>：<code>session/event</code>（只读）+ <code>agent/turn-stopping</code> 可承担 proxy 的写 L0 职责，让记忆闭环完整落地在原生侧</li>
+    <li><strong>生产化</strong>：native-init 端点加鉴权；状态机补 retry/maxRetries 强制 bypass；SDK 正式接入替代手写 client</li>
+  </ul>
+
+  <div class="callout ok">
+    <span class="tag">一句话总结</span>从"DSH 能否原生接入 workflow 节点"的猜想出发，两阶段实验证明：<strong>dsh 原生插件 + 外部仪表盘，是 headless dsh 接入腾讯 agent memory 的可行完整路径</strong>——身份识别、表单交互、持久化、上下文注入全链路原生实现，proxy 退居持久化与预热服务之位。
+  </div>
+</section>
+
+<footer>
+  <span>dsh 原生插件接入实验报告 · 2026-08-24</span>
+  <span>deepseek-harness@experiment/dashboard-provider · TencentDB-Agent-Memory@exp/dsh-dashboard-provider</span>
+</footer>
+
+</div>
+<script>
+  (function(){
+    var btn = document.getElementById('themeToggle');
+    function render(){ btn.textContent = document.documentElement.getAttribute('data-theme') === 'light' ? '🌙' : '☀️'; }
+    render();
+    btn.addEventListener('click', function(){
+      var next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      render();
+    });
+  })();
+</script>
+</body>
+</html>

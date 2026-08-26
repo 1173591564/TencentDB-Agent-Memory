@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TencentDB Agent Memory × OpenCode 全链路追踪报告</title>
+<style>
+:root{--bg:#f6f7f9;--card:#ffffff;--border:#e3e6ea;--text:#1a1d21;--muted:#6b7280;--blue:#185fa5;--blue-d:#0c447c;--blue-bg:#e6f1fb;--green:#0f6e56;--green-bg:#e1f5ee;--amber:#854f0b;--amber-bg:#faeeda;--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.65;font-size:15px}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 24px 64px}
+header{margin-bottom:28px}
+h1{font-size:26px;font-weight:600;letter-spacing:-.3px}
+h1 .sub{display:block;font-size:14px;font-weight:400;color:var(--muted);margin-top:6px}
+h2{font-size:19px;font-weight:600;margin:36px 0 14px;padding-left:10px;border-left:4px solid var(--blue)}
+h3{font-size:15px;font-weight:600;margin:16px 0 8px}
+.badge{display:inline-block;padding:3px 11px;border-radius:20px;font-size:13px;font-weight:500;margin:0 6px 6px 0}
+.b-blue{background:var(--blue-bg);color:var(--blue-d)}
+.b-green{background:var(--green-bg);color:var(--green)}
+.b-amber{background:var(--amber-bg);color:var(--amber)}
+.b-gray{background:#eef0f2;color:#4b5563}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+.card .num{font-size:27px;font-weight:600;color:var(--blue-d);font-variant-numeric:tabular-nums}
+.card .lbl{font-size:14px;color:var(--muted);margin-top:2px}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:14px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+th{background:#fafbfc;font-weight:600;color:#374151;font-size:13px}
+tr:last-child td{border-bottom:none}
+.mono{font-family:var(--mono);font-size:13px}
+pre{background:#0f172a;color:#e2e8f0;border-radius:8px;padding:14px;overflow:auto;font-family:var(--mono);font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+pre.light{background:#f6f8fa;color:#1f2937;border:1px solid var(--border)}
+details{margin:8px 0}
+details summary{cursor:pointer;font-weight:500;color:var(--blue-d);font-size:13px;padding:6px 0}
+details summary:hover{text-decoration:underline}
+.tag{font-family:var(--mono);font-size:11px;background:#eef0f2;border-radius:4px;padding:1px 6px;color:#4b5563}
+.kpi{display:flex;gap:24px;flex-wrap:wrap;margin:12px 0}
+.kpi div{min-width:120px}
+.kpi .n{font-size:23px;font-weight:600;color:var(--blue-d);font-variant-numeric:tabular-nums}
+.kpi .t{font-size:14px;color:var(--muted)}
+.hl{background:var(--amber-bg);padding:1px 4px;border-radius:3px;color:var(--amber);font-weight:500}
+.note{background:#fff8e6;border-left:3px solid #ef9f27;padding:11px 15px;border-radius:6px;font-size:14px;color:#5a4a1a;margin:10px 0}
+.essence{background:#f0f7ff;border-left:3px solid var(--blue);padding:9px 13px;border-radius:6px;font-size:14px;color:#0c447c;margin:8px 0}
+.essence b{font-weight:600}
+.essence .track{color:#4b5563}
+@media(max-width:760px){.cards{grid-template-columns:repeat(2,1fr)}}
+
+
+
+.wfc{background:#fff;border:1px solid #e6e9ee;border-radius:14px;overflow:hidden}
+.wfhd{padding:14px 18px 10px;border-bottom:1px solid #f0f2f5;background:#fbfbfc}
+.wfhd-t{font-size:14.5px;font-weight:600;color:#1a1d21}
+.wfhd-s{font-size:12.5px;color:#8a919c;margin-top:2px}
+.wfrows{position:relative}
+.wfgrid{position:absolute;top:0;bottom:0;left:46%;right:2%;pointer-events:none}
+.wfgrid i{position:absolute;top:0;bottom:0;width:1px;background:#f1f3f6}
+.wftime{position:relative;height:15px;margin:4px 0 6px;font-size:12px;font-weight:600;color:#7c8494}
+.wftime span{position:absolute;top:0;white-space:nowrap}
+.wrow{display:flex;align-items:center;padding:10px 18px;border-bottom:1px solid #f4f5f7;transition:background .12s}
+.wrow:hover{background:#f7f9fc}
+.wtree{width:46%;display:flex;align-items:flex-start;gap:9px;min-width:0}
+.dot{flex:none;width:9px;height:9px;border-radius:50%;margin-top:6px}
+.winfo{min-width:0}
+.wname{font-family:var(--mono);font-size:13.5px;font-weight:600;color:#262a33;display:flex;align-items:center;gap:6px}
+.wtag{font-family:var(--mono);font-size:11px;font-weight:500;padding:1px 6px;border-radius:4px;background:#eef1f6;color:#5a6472}
+.wess{font-size:12px;color:#8a919c;margin-top:2px;line-height:1.4}
+.waxis{flex:1;position:relative;height:24px}
+.wbar{position:absolute;top:4px;height:16px;border-radius:5px;min-width:4px;display:flex;align-items:center;font-size:11.5px;font-weight:600;color:#fff;white-space:nowrap}
+.wbar .in{padding:0 6px}
+.wbar .out{position:absolute;left:100%;margin-left:6px;color:#8a919c;font-weight:500}
+.wbar .core{position:absolute;top:2px;bottom:2px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:10.5px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden}
+.ind-1 .wtree{padding-left:22px}
+.connector{position:relative}
+.connector::before{content:"";position:absolute;left:22px;top:-10px;bottom:50%;width:1px;background:#dfe4ea}
+.connector::after{content:"";position:absolute;left:22px;top:50%;width:4px;height:1px;background:#dfe4ea}
+.wlegend{padding:10px 18px;background:#fafbfc;border-top:1px solid #f0f2f5;font-size:12.5px;color:#8a919c;display:flex;gap:18px;flex-wrap:wrap}
+.wlegend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+html{scroll-behavior:smooth;scroll-padding-top:18px}
+.layout{display:flex;justify-content:center;gap:28px;max-width:1360px;margin:0 auto;padding:0 24px}
+.wrap{max-width:1080px;flex:1;min-width:0;margin:0;padding:32px 0 64px}
+.toc{flex:none;width:192px;position:sticky;top:16px;height:fit-content;max-height:calc(100vh - 32px);overflow:auto;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 12px 14px 0}
+.toc-t{font-size:12px;font-weight:600;color:var(--muted);margin:0 0 8px 16px;letter-spacing:1px}
+.toc a{display:block;color:#46505c;text-decoration:none;padding:6px 10px 6px 14px;border-left:3px solid transparent;font-size:13px;line-height:1.45}
+.toc a:hover{background:#f2f6fb}
+.toc a.on{color:var(--blue-d);border-left-color:var(--blue);background:#eef5fc;font-weight:600}
+.toc a.sub{padding-left:28px;font-size:12px;color:#7a8595}
+.toc a.sub.on{color:var(--blue-d)}
+.toc-top{margin:8px 0 0 14px;font-size:11px;color:var(--muted)}
+.toc-top a{display:inline-block;padding:0;border:none;font-size:11px;color:var(--muted)}
+.toc-top a:hover{background:none;color:var(--blue-d)}
+@media(max-width:1180px){.toc{display:none}}
+.wseq{flex:none;width:20px;height:20px;border-radius:50%;border:1.5px solid #4f7cff;color:#4f7cff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;margin-top:2px;background:#fff;box-shadow:0 0 0 2px #fff}
+.wseq.par{border-color:#98a2b1;color:#64748b}
+.wseq.asy{border-color:#2ecc9b;color:#0f6e56}
+.wpill{flex:none;font-size:10.5px;font-weight:600;color:#64748b;background:#eef1f6;border-radius:4px;padding:1px 6px;margin-top:4px;white-space:nowrap}
+.naxis{position:relative;height:16px;margin:2px 4px 4px 46%;font-size:10.5px;font-weight:600;color:#b4751a}
+.naxis span{position:absolute;top:0;white-space:nowrap}
+details.wexp{padding:0;border-bottom:1px solid #f4f5f7}
+details.wexp>summary{list-style:none;cursor:pointer;width:100%;display:block}
+details.wexp>summary::-webkit-details-marker{display:none}
+.wfnest{padding:14px 18px 18px;background:#f8f9fb;border-bottom:1px solid #f4f5f7}
+.nrow{display:flex;align-items:center;padding:6px 0;font-size:12px}
+.ntree{width:46%;display:flex;align-items:center;gap:7px;font-family:var(--mono);color:#374151}
+.nbar{flex:1;position:relative;height:16px}
+.nbar span{position:absolute;top:2px;height:12px;border-radius:4px;min-width:3px}
+.ndur{color:#8a919c;font-family:var(--mono);font-size:11px;margin-left:8px}
+
+.wrow{position:relative}
+.wfbands{position:relative;height:36px;margin:12px 0 6px}
+.wseg{position:absolute;top:0;bottom:0;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden}
+.wseg span{padding:0 6px}
+.wseg em{font-style:normal;color:#ffe7b3;font-weight:500}
+.wseg.hi{outline:2px solid rgba(245,166,35,.5);outline-offset:2px}
+.wgap{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(135deg,#eef1f4,#eef1f4 5px,#f7f8fa 5px,#f7f8fa 10px);border-radius:4px;display:flex;align-items:center;justify-content:center}
+.wgap span{font-size:11.5px;font-weight:600;color:#b4751a;background:#fdf0dc;border-radius:8px;padding:1px 8px;white-space:nowrap}
+.wfgrid i.major{background:#c3cbd5}
+.wfhatch{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(135deg,#f7f8fa,#f7f8fa 5px,#eef1f4 5px,#eef1f4 10px);border-left:1px dashed #dde2e8;border-right:1px dashed #dde2e8}
+.wsect{position:relative;padding:11px 18px 8px;font-size:14px;font-weight:600;color:#4b5563;letter-spacing:.3px;background:#fafbfc;border-top:1px solid #f0f2f5}
+.wlwindow{position:absolute;top:5px;height:15px;border:1px dashed #b7c1ce;border-radius:5px;background:repeating-linear-gradient(135deg,#f4f6f9,#f4f6f9 4px,#eaf0f5 4px,#eaf0f5 8px);display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:500;color:#5a6472;box-sizing:border-box;white-space:nowrap;overflow:hidden}
+.wlwindow span{padding:0 4px}
+.wdnbar{position:absolute;top:4px;height:17px;border:1.5px dashed #2ecc9b;border-radius:5px;display:flex;align-items:center;padding:0 10px;font-size:11.5px;color:#0f6e56;white-space:nowrap}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc">
+<div class="toc-t">目录</div>
+<a href="#sec-1">1 · 全链路时序</a>
+<a href="#sec-2">2 · Span Waterfall</a>
+<a class="sub" href="#wf-band">时间轴顶带</a>
+<a class="sub" href="#wf-main">主链（蓝 + 紫芯）</a>
+<a class="sub" href="#wf-support">支撑层窗口</a>
+<a class="sub" href="#wf-down">下游沉淀</a>
+<a href="#sec-3">3 · LLM 调用详情</a>
+<a href="#sec-4">4 · 工具调用（read）</a>
+<a href="#sec-5">5 · 注入 diff</a>
+<a href="#sec-6">6 · 记忆沉淀</a>
+<a href="#sec-7">7 · 关键发现</a>
+<div class="toc-top"><a href="#">回到顶部</a></div>
+</nav>
+<div class="wrap">
+<header>
+<h1>TencentDB Agent Memory × OpenCode 全链路追踪报告
+<span class="sub">基于 Opik 实测数据 · 请求：「审阅 MemoryProxy/src/opik.ts 的 Opik 上报逻辑」· 2026-08-21 14:07</span>
+</h1>
+<div style="margin-top:14px">
+<span class="badge b-blue">opencode</span><span class="badge b-blue">Memory Proxy</span><span class="badge b-blue">DeepSeek</span><span class="badge b-green">memory-core</span><span class="badge b-gray">Opik 观测</span>
+</div>
+</header>
+
+<div class="cards">
+<div class="card"><div class="num">2</div><div class="lbl">LLM 调用轮次（946ms + 6314ms）</div></div>
+<div class="card"><div class="num">25700</div><div class="lbl">累计 token（两轮 in+out）</div></div>
+<div class="card"><div class="num">+7094</div><div class="lbl">注入字符（9653 → 16747）</div></div>
+<div class="card"><div class="num">4</div><div class="lbl">注入块 · 3 层记忆沉淀</div></div>
+</div>
+
+<div class="note">本报告所有数据均为 Opik 真实捕获，可对照 Opik UI（http://localhost:5173）逐一核验。opencode 侧 project=<code>opencode</code>，proxy 侧 project=<code>usr-d03quwpa51</code>。</div>
+
+<h2 id="sec-1">1. 全链路时序（逻辑层）</h2>
+<div class="panel">
+
+<div style="margin-bottom:12px">
+<svg width="100%" viewBox="0 0 680 400" style="background:#fff;border:1px solid #e3e6ea;border-radius:8px" xmlns="http://www.w3.org/2000/svg">
+<defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="#888780" stroke-width="1.5"/></marker></defs>
+<g font-family="-apple-system,sans-serif">
+<rect x="45" y="24" width="110" height="48" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/><text x="100" y="43" font-size="14" font-weight="600" fill="#0C447C" text-anchor="middle">opencode</text><text x="100" y="60" font-size="11" fill="#185FA5" text-anchor="middle">agent · 用户</text>
+<rect x="225" y="24" width="110" height="48" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/><text x="280" y="43" font-size="14" font-weight="600" fill="#0C447C" text-anchor="middle">Memory Proxy</text><text x="280" y="60" font-size="11" fill="#185FA5" text-anchor="middle">注入 · 转发</text>
+<rect x="400" y="24" width="110" height="48" rx="8" fill="#E6F1FB" stroke="#378ADD" stroke-width="0.5"/><text x="455" y="43" font-size="14" font-weight="600" fill="#0C447C" text-anchor="middle">DeepSeek</text><text x="455" y="60" font-size="11" fill="#185FA5" text-anchor="middle">LLM</text>
+<rect x="570" y="24" width="80" height="48" rx="8" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/><text x="610" y="43" font-size="14" font-weight="600" fill="#085041" text-anchor="middle">memory-core</text><text x="610" y="60" font-size="11" fill="#0F6E56" text-anchor="middle">沉淀</text>
+<line x1="100" y1="72" x2="100" y2="360" stroke="#B4B2A9" stroke-dasharray="4 3" stroke-width="0.5"/>
+<line x1="280" y1="72" x2="280" y2="360" stroke="#B4B2A9" stroke-dasharray="4 3" stroke-width="0.5"/>
+<line x1="455" y1="72" x2="455" y2="360" stroke="#B4B2A9" stroke-dasharray="4 3" stroke-width="0.5"/>
+<line x1="610" y1="72" x2="610" y2="360" stroke="#B4B2A9" stroke-dasharray="4 3" stroke-width="0.5"/>
+<line x1="100" y1="100" x2="278" y2="100" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="189" y="92" font-size="11" fill="#2C2C2A" text-anchor="middle">① 审阅请求 · 三元组</text>
+<line x1="282" y1="132" x2="453" y2="132" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="367" y="124" font-size="11" fill="#2C2C2A" text-anchor="middle">② 注入后 messages（946ms）</text>
+<line x1="453" y1="164" x2="282" y2="164" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="367" y="156" font-size="11" fill="#2C2C2A" text-anchor="middle">③ tool-call: read</text>
+<line x1="278" y1="196" x2="102" y2="196" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="190" y="188" font-size="11" fill="#2C2C2A" text-anchor="middle">④ 回传</text>
+<rect x="108" y="206" width="120" height="20" rx="4" fill="#FAEEDA" stroke="#EF9F27" stroke-width="0.5"/><text x="168" y="216" font-size="11" fill="#854F0B" text-anchor="middle">Tool.execute: read</text>
+<line x1="100" y1="244" x2="278" y2="244" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="189" y="236" font-size="11" fill="#2C2C2A" text-anchor="middle">⑤ 第2轮 · 历史+工具结果</text>
+<line x1="282" y1="276" x2="453" y2="276" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="367" y="268" font-size="11" fill="#2C2C2A" text-anchor="middle">⑥ 再次转发（6314ms）</text>
+<line x1="453" y1="308" x2="282" y2="308" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="367" y="300" font-size="11" fill="#2C2C2A" text-anchor="middle">⑦ 最终回答 · 729 token</text>
+<line x1="278" y1="340" x2="102" y2="340" stroke="#888780" stroke-width="1.5" marker-end="url(#ar)"/><text x="190" y="332" font-size="11" fill="#2C2C2A" text-anchor="middle">⑧ 返回</text>
+<line x1="280" y1="360" x2="608" y2="360" stroke="#1D9E75" stroke-width="1.5" marker-end="url(#ar)"/><text x="444" y="372" font-size="11" fill="#085041" text-anchor="middle">⑨ 写 L0 · 异步沉淀</text>
+<rect x="540" y="340" width="110" height="20" rx="4" fill="#E1F5EE" stroke="#1D9E75" stroke-width="0.5"/><text x="595" y="350" font-size="11" fill="#085041" text-anchor="middle">L0→L1→L2→L3</text>
+</g></svg>
+</div>
+<p style="font-size:14px;color:var(--muted);margin-bottom:10px">这条链路有 9 个逻辑节点，但每个节点背后都是具体的 span 在干活——下一节按非均匀时间轴 + 三层生命周期（支撑层 / 主链 / 下游）完整展开。</p>
+<div class="essence"><b>读图要点</b>：标题生成（第 0 步）与对话第 1 轮是<span class="hl">并行</span>的；read 工具<span class="hl">流式提前触发</span>（比第 1 轮 LLM 结束早 27ms）；第 2 轮前有<span class="hl">3.4 秒组装 prompt 间隙</span>。精确时间轴见下一节 Waterfall。</div>
+</div>
+
+
+<h2 id="sec-2">2. Span Waterfall（3 层泳道 · 非均匀时间轴）</h2>
+<p style="font-size:14px;color:var(--muted);margin-bottom:12px">时间轴 39.3s→55.2s 分 5 段、段宽＝耗时：第 1 轮段加宽（看清 110ms 的 read），两间隙压成斜纹但标了真实耗时。读条：<b>蓝</b>＝opencode 侧调用（条长＝耗时），<span class="hl">紫芯＝经 Memory Proxy 注入后转发 LLM 的时长</span>，<b>灰窗</b>＝数百个重叠框架 span 的覆盖范围。紫芯数字＝proxy 记时；蓝边＝wrapper 差值（第 1 轮 105ms · 第 2 轮 0ms）。三层读图顺序：<b>A 主链</b> → <b>B 支撑层</b> → <b>C 下游</b>。</p>
+<div class="wfc">
+<div class="wfhd"><div class="wfhd-t">一轮对话的完整生命周期 · opencode → Memory Proxy → DeepSeek → memory-core</div><div class="wfhd-s">969 span · 蓝＝opencode 侧 · 紫芯＝Memory Proxy 注入后 · 灰窗＝框架层 · 段边界数字＝真实秒数</div></div>
+
+<div class="wfbands" id="wf-band">
+<div class="wseg" style="left:0%;width:16%;background:#a0aab8"><span>标题生成 · 2.2s ‖</span></div>
+<div class="wgap" style="left:16%;width:6%"><span>↕ 2.9s</span></div>
+<div class="wseg hi" style="left:22%;width:36%;background:#4f7cff"><span>第 1 轮 + read · 1.05s</span></div>
+<div class="wgap" style="left:58%;width:6%"><span>↕ 3.4s</span></div>
+<div class="wseg" style="left:64%;width:36%;background:#4f7cff"><span>第 2 轮 · 6.3s</span></div>
+</div>
+<div class="wftime"><span style="left:0">39.3</span><span style="left:16%;transform:translateX(-50%)">41.5</span><span style="left:22%;transform:translateX(-50%)">44.4</span><span style="left:58%;transform:translateX(-50%)">45.5</span><span style="left:64%;transform:translateX(-50%)">48.9</span><span style="left:99.5%;transform:translateX(-100%)">55.2</span></div>
+
+<div class="wfrows">
+<div class="wfgrid">
+<i class="major" style="left:0%"></i>
+<i class="major" style="left:16%"></i>
+<i class="major" style="left:22%"></i>
+<i class="major" style="left:58%"></i>
+<i class="major" style="left:64%"></i>
+<i class="major" style="left:99.5%"></i>
+<i style="left:5.01%"></i><i style="left:12.17%"></i><i style="left:19.04%"></i><i style="left:41.49%"></i><i style="left:60.69%"></i><i style="left:64.75%"></i><i style="left:76.15%"></i><i style="left:87.55%"></i>
+<div class="wfhatch" style="left:16%;width:6%"></div>
+<div class="wfhatch" style="left:58%;width:6%"></div>
+</div>
+
+<div class="wsect" id="wf-main"><span style="display:inline-block;font-size:10px;font-weight:600;color:#fff;background:#4f7cff;border-radius:4px;padding:1px 7px;margin-right:8px;vertical-align:2px;letter-spacing:0">A 层</span>主链 · LLM 与工具（138 span）</div>
+
+<div class="wrow"><div class="wtree"><span class="wseq par">‖</span><span class="dot" style="background:#a8b2c1"></span><div class="winfo"><div class="wname">ai.streamText <span class="wtag">v4-flash</span></div><div class="wess">后台 fork · 与对话并行</div></div></div><div class="waxis"><div class="wbar" style="left:0.00%;width:16.00%;background:#a8b2c1"><span class="in">2234ms</span></div></div></div>
+
+<div class="wrow"><div class="wtree"><span class="wseq">1</span><span class="dot" style="background:#4f7cff"></span><div class="winfo"><div class="wname">ai.streamText <span class="wtag">deepseek-chat</span></div><div class="wess">wrapper 1051ms（含流式输出）· 紫芯＝注入后转发 946ms（+7094 字符）· 蓝尾 105ms ≈ 收尾解析 tool-call（示意）</div></div></div><div class="waxis"><div class="wbar" style="left:22.00%;width:36.00%;background:#4f7cff"><span class="core" style="left:0;right:10%;background:#7c5cff">946ms · 注入后</span><span class="out">wrapper 1051ms</span></div></div></div>
+
+<div class="wrow ind-1"><div class="wtree connector"><span class="dot" style="background:#a5c4ff"></span><div class="winfo"><div class="wname" style="color:#4f7cff">ai.streamText.doStream</div><div class="wess">嵌套于 wrapper · 流式执行，逐 token 计量首字延迟</div></div></div><div class="waxis"><div class="wbar" style="left:22.03%;width:35.93%;background:#a5c4ff"><span class="out">1049ms</span></div></div></div>
+
+<details class="wexp"><summary><div class="wrow ind-1" style="border-bottom:none;padding:9px 18px"><div class="wtree connector"><span class="wseq">2</span><span class="dot" style="background:#f5a623"></span><div class="winfo"><div class="wname" style="color:#b4751a">ai.toolCall <span class="wtag" style="background:#fdf0dc;color:#b4751a">read ▸ 点我展开</span></div><div class="wess">第 1 轮判定 → read · 比 LLM 结束提前 27ms 流式触发 · 内部 4 层，点开看</div></div></div><div class="waxis"><div class="wbar" style="left:53.65%;width:3.77%;background:#f5a623"><span class="out" style="color:#b4751a;font-weight:600">110ms</span></div></div></div></summary>
+<div class="wfnest">
+<div style="font-size:11px;font-weight:600;color:#b4751a;margin-bottom:8px">read 工具调用内部 · 110ms · 局部放大（真实 45.355s → 45.465s，独立线性轴）</div>
+<div class="naxis"><span style="left:0%">0ms</span><span style="left:50%;transform:translateX(-50%)">55ms</span><span style="left:100%;transform:translateX(-100%)">110ms</span></div>
+<div class="nrow"><div class="ntree"><span class="dot" style="background:#f5a623"></span>ai.toolCall</div><div class="nbar"><span style="left:0%;width:100%;background:#f5a623"></span></div><span class="ndur">110ms</span></div>
+<div class="nrow"><div class="ntree" style="padding-left:18px"><span class="dot" style="background:#4f7cff"></span>└ Tool.execute</div><div class="nbar"><span style="left:2.7%;width:96.4%;background:#4f7cff"></span></div><span class="ndur">106ms</span></div>
+<div class="nrow"><div class="ntree" style="padding-left:36px"><span class="dot" style="background:#a5c4ff"></span>└ ReadTool.execute</div><div class="nbar"><span style="left:3.6%;width:95.5%;background:#a5c4ff"></span></div><span class="ndur">105ms</span></div>
+<div class="nrow"><div class="ntree" style="padding-left:54px"><span class="dot" style="background:#2ecc9b"></span>├ assertExternalDirectory</div><div class="nbar"><span style="left:13.6%;width:0.9%;background:#2ecc9b"></span></div><span class="ndur">1ms</span></div>
+<div class="nrow"><div class="ntree" style="padding-left:54px"><span class="dot" style="background:#2ecc9b"></span>├ readSample</div><div class="nbar"><span style="left:74.5%;width:2.7%;background:#2ecc9b"></span></div><span class="ndur">3ms</span></div>
+<div class="nrow"><div class="ntree" style="padding-left:54px"><span class="dot" style="background:#2ecc9b"></span>├ ReadTool.lines</div><div class="nbar"><span style="left:79.1%;width:18.2%;background:#2ecc9b"></span></div><span class="ndur">20ms</span></div>
+<div class="nrow"><div class="ntree" style="padding-left:54px"><span class="dot" style="background:#2ecc9b"></span>└ warm</div><div class="nbar"><span style="left:98.2%;width:0.9%;background:#2ecc9b"></span></div><span class="ndur">1ms</span></div>
+</div></details>
+
+<div class="wrow"><div class="wtree"><span class="wseq">3</span><span class="dot" style="background:#4f7cff"></span><div class="winfo"><div class="wname">ai.streamText <span class="wtag">deepseek-chat</span></div><div class="wess">wrapper＝proxy＝6314ms（含流式输出 · 729 token）· 紫芯铺满（无差值）· 4 条消息注入后 → 输出 5 点结论</div></div></div><div class="waxis"><div class="wbar" style="left:64.00%;width:36.00%;background:#4f7cff"><span class="core" style="left:0;right:0;background:#7c5cff">6314ms · 注入后</span></div></div></div>
+
+<div style="position:relative;z-index:1;padding:12px 18px 14px;background:#fbfbff;border-bottom:1px solid #f4f5f7">
+<div style="font-weight:600;color:#374151;font-size:13px;margin-bottom:6px">四个时间差 · 别误读</div>
+<table style="font-size:12.5px">
+<tr><th style="width:118px">现象</th><th style="width:64px">差值</th><th>原因 / 说明</th></tr>
+<tr><td>紫芯铺满第 2 轮</td><td>0ms</td><td>注入在两条 span 的公共部分内、微秒级——不是"零间隔"；0 差值只说明 proxy 无缓冲且 opencode 无收尾</td></tr>
+<tr><td>两 span 同时停表</td><td>0ms</td><td>SSE 流式边收边转不缓存，流结束几乎同时到达；若收完再转发，wrapper 会多一个 body 的传输时间</td></tr>
+<tr><td>第 1 轮蓝尾</td><td>+105ms</td><td>finishReason=<span class="mono">tool-calls</span>：流结束后 opencode 解析 tool-call、构造调用对象</td></tr>
+<tr><td>发送耗时</td><td>&lt;0.1%</td><td>内网两跳各 ~1-2ms，含在 span 内被毫秒精度淹没；走公网 API 时 wrapper 会明显更长</td></tr>
+</table>
+</div>
+
+<div class="wsect" id="wf-support"><span style="display:inline-block;font-size:10px;font-weight:600;color:#fff;background:#98a2b1;border-radius:4px;padding:1px 7px;margin-right:8px;vertical-align:2px;letter-spacing:0">B 层</span>支撑层 · 框架/存储（638 span ＋ 193 杂项 · 重叠多 → 只画覆盖窗口）</div>
+
+<div class="wrow"><div class="wtree"><span class="wpill">背景</span><span class="dot" style="background:#c7d0db"></span><div class="winfo"><div class="wname" style="color:#64748b;font-weight:500">启动 &amp; 认证</div><div class="wess">AppProcess · Config · Env · Plugin · Auth</div></div></div><div class="waxis"><div class="wlwindow" style="left:0%;width:67.15%"><span>279 span · 38.3s → 49.4s</span></div></div></div>
+
+<div class="wrow"><div class="wtree"><span class="wpill">背景</span><span class="dot" style="background:#c7d0db"></span><div class="winfo"><div class="wname" style="color:#64748b;font-weight:500">会话加载</div><div class="wess">Session.get · getPart（读历史消息）· State.reload</div></div></div><div class="waxis"><div class="wlwindow" style="left:0%;width:67.50%"><span>144 span · 散布全程</span></div></div></div>
+
+<div class="wrow"><div class="wtree"><span class="wpill">背景</span><span class="dot" style="background:#c7d0db"></span><div class="winfo"><div class="wname" style="color:#64748b;font-weight:500">Prompt 组装 &amp; 工具</div><div class="wess">SessionPrompt · ToolRegistry.register · SessionTools.resolve</div></div></div><div class="waxis"><div class="wlwindow" style="left:0%;width:63.77%"><span>32 span · 至 48.7s</span></div></div></div>
+
+<div class="wrow"><div class="wtree"><span class="wpill">背景</span><span class="dot" style="background:#c7d0db"></span><div class="winfo"><div class="wname" style="color:#64748b;font-weight:500">持久化</div><div class="wess">sql.execute ×176 · State.commit（每步落库）</div></div></div><div class="waxis"><div class="wlwindow" style="left:0%;width:67.50%"><span>183 span · 散布全程</span></div></div></div>
+
+<div class="wsect" id="wf-down"><span style="display:inline-block;font-size:10px;font-weight:600;color:#fff;background:#2ecc9b;border-radius:4px;padding:1px 7px;margin-right:8px;vertical-align:2px;letter-spacing:0">C 层</span>下游 · memory-core 沉淀（异步 · 不在时间轴上）</div>
+
+<div class="wrow"><div class="wtree"><span class="wseq asy">↺</span><span class="dot" style="background:#2ecc9b"></span><div class="winfo"><div class="wname" style="color:#0f6e56">memory-core 沉淀</div><div class="wess">L0→L3 逐层抽取 · 与请求 trace 脱链（约 2 分钟后落定）</div></div></div><div class="waxis"><div class="wdnbar" style="left:2%;width:96%">L0 44 → L1 10 → L2 3场景 → L3 画像 · <b>异步</b> 运行，不占时间轴</div></div></div>
+
+</div>
+<div class="wlegend">
+<span><i style="background:#4f7cff"></i>LLM 调用 · 实心条＝耗时</span>
+<span><i style="background:#7c5cff"></i>Memory Proxy 注入后 · 内嵌于蓝条（紫芯）</span>
+<span><i style="background:#a5c4ff"></i>流式执行</span>
+<span><i style="background:#f5a623"></i>工具调用</span>
+<span><i style="background:#2ecc9b"></i>工具内部 / 下游</span>
+<span><i style="background:#a0aab8"></i>后台标题生成（并行）</span>
+<span><i style="background:#eef1f4;border:1px dashed #b7c1ce;border-radius:2px"></i>支撑层覆盖窗口</span>
+<span style="margin-left:auto">带内数字＝真实秒数 · 条外数字＝真实耗时 · 1・2・3＝链路顺序 · ‖ 并行 · ↺ 异步</span>
+</div>
+</div>
+
+<h2 id="sec-3">3. LLM 调用详情（每轮的本质）</h2>
+
+
+<div class="panel">
+  <h3>标题生成</h3>
+  <div class="essence">本质：<b>后台起标题，非对话内容</b> —— 用 small model（v4-flash）把用户问题概括成会话标题，与对话并行、不经过 proxy</div>
+  <div class="kpi">
+    <div><div class="n">2234ms</div><div class="t">耗时</div></div>
+    <div><div class="n">deepseek-v4-flash</div><div class="t">模型</div></div>
+    <div><div class="n">564</div><div class="t">输入 token</div></div>
+    <div><div class="n">53</div><div class="t">输出 token</div></div>
+    <div><div class="n" style="font-size:15px">stop</div><div class="t">finishReason</div></div>
+  </div>
+  <div style="font-size:12px;color:var(--muted)">provider: <span class="tag">opencode-go.chat</span></div>
+  <details><summary>输出标题</summary><pre class="light">Opik上报逻辑审阅：trace/span与fire-and-forget</pre></details>
+</div>
+
+
+<div class="panel">
+  <h3>对话 · 第 1 轮（返回 tool-call）</h3>
+  <div class="essence">本质：<b>对话主循环第一轮</b> —— LLM 拿到注入后的 system+问题，判定「先读文件才能审阅」，于是返回 read 工具调用而不是直接回答</div>
+  <div class="kpi">
+    <div><div class="n">1051ms</div><div class="t">耗时</div></div>
+    <div><div class="n">deepseek-chat</div><div class="t">模型</div></div>
+    <div><div class="n">10616</div><div class="t">输入 token</div></div>
+    <div><div class="n">69</div><div class="t">输出 token</div></div>
+    <div><div class="n" style="font-size:15px">tool-calls</div><div class="t">finishReason</div></div>
+  </div>
+  <div style="font-size:12px;color:var(--muted)">provider: <span class="tag">memory-proxy.chat</span></div>
+  <details><summary>完整 input（system 16747 字符 + user 98 字符）</summary><pre class="light">You are opencode, an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+
+IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+
+If the user asks for help or wants to give feedback inform them of the following:
+- /help: Get help with using opencode
+- To give feedback, users should report the issue at https://github.com/anomalyco/opencode/issues
+
+When the user directly asks about opencode (eg 'can opencode do...', 'does opencode have...') or asks in second person (eg 'are you able...', 'can you do...'), first use the WebFetch tool to gather information to answer the question from opencode docs at https://opencode.ai
+
+# Tone and style
+You should be concise, direct, and to the point. When you run a non-trivial bash command, you should explain what the command does and why you are running it, to make sure the user understands what you are doing (this is especially important when you are running a command that will make changes to the user's system).
+Remember that your output will be displayed on a command line interface. Your responses can use GitHub-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
+Output text to communicate with the user; all text you output outsi...（system 全文见注入 diff）</pre></details>
+<details><summary>output（tool-call）</summary><pre class="light">{
+  "tool_call_id": "call_00_w3yZzbqGXT6tyKxYkv3Y7002",
+  "tool_name": "read",
+  "arguments": "{\"filePath\":\"C:\\\\Users\\\\11735\\\\Desktop\\\\Projects\\\\TencentDB-Agent-Memory\\\\MemoryProxy\\\\src\\\\opik.ts\"}"
+}</pre></details>
+</div>
+
+
+<div class="panel">
+  <h3>对话 · 第 2 轮（分析 + 结论）</h3>
+  <div class="essence">本质：<b>工具结果回填后分析</b> —— read 读到的 11882 字符文件内容追加进历史，LLM 基于真实源码输出 5 点审阅结论</div>
+  <div class="kpi">
+    <div><div class="n">6314ms</div><div class="t">耗时</div></div>
+    <div><div class="n">deepseek-chat</div><div class="t">模型</div></div>
+    <div><div class="n">14286</div><div class="t">输入 token</div></div>
+    <div><div class="n">729</div><div class="t">输出 token</div></div>
+    <div><div class="n" style="font-size:15px">stop</div><div class="t">finishReason</div></div>
+  </div>
+  <div style="font-size:12px;color:var(--muted)">provider: <span class="tag">memory-proxy</span></div>
+  <details><summary>完整 input（4 条消息：system + user + assistant + tool）</summary>
+<div class="kpi" style="margin:8px 0">
+  <div><div class="n">4</div><div class="t">消息条数</div></div>
+  <div><div class="n">10624</div><div class="t">缓存命中 token</div></div>
+  <div><div class="n">3662</div><div class="t">缓存未命中 token（文件内容）</div></div>
+</div>
+<details><summary>assistant 消息（tool-call 声明）</summary><pre class="light">{
+  "tool_call_id": "call_00_w3yZzbqGXT6tyKxYkv3Y7002",
+  "tool_name": "read",
+  "arguments": "{\"filePath\":\"C:\\\\Users\\\\11735\\\\Desktop\\\\Projects\\\\TencentDB-Agent-Memory\\\\MemoryProxy\\\\src\\\\opik.ts\"}"
+}</pre></details>
+<details><summary>tool 消息（read 读到的 opik.ts，11882 字符）</summary><pre class="light">&lt;path&gt;C:\Users\11735\Desktop\Projects\TencentDB-Agent-Memory\MemoryProxy\src\opik.ts&lt;/path&gt;
+&lt;type&gt;file&lt;/type&gt;
+&lt;content&gt;
+1: /** Opik tracing client for context-proxy.
+2:  *
+3:  * Project name is derived from the request API key:
+4:  *   SHA-256(apiKey) → hex → first 8 chars
+5:  *
+6:  * All network calls are fire-and-forget. Failures are logged via structured logger
+7:  * and never propagate to the hot request path.
+8:  */
+9: 
+10: import { createHash, randomBytes } from "node:crypto";
+11: import type { ProxyConfig } from "./types.js";
+12: import { log } from "./report/log.js";
+13: 
+14: /**
+15:  * Generate a UUID v7 (time-ordered), required by Opik API.
+16:  * Layout: 48-bit unix_ts_ms | 4-bit ver(0x7) | 12-bit rand_a | 2-bit var(0b10) | 62-bit rand_b
+17:  */
+18: function uuidv7(): string {
+19:   const now = BigInt(Date.now());
+20:   const rand = randomBytes(10); // 80 bits of randomness
+21: 
+22:   // rand_a: 12 bits from rand[0..1]
+23:   const randA = ((rand[0] &lt;&lt; 4) | (rand[1] &gt;&gt; 4)) &amp; 0xfff;
+24:   // rand_b: 62 bits — first byte forced to variant 0b10xx_xxxx
+25:   const b8 = (rand[2] &amp; 0x3f) | 0x80;
+26: 
+27:   const p1 = (now &gt;&gt; 16n).toString(16).padStart(8, "0");
+28:   const p2 = (now &amp; 0xffffn).toString(16).padStart(4, "0");
+29:   const p3 = (0x7000 | randA).toString(16).padStart(4, "0");
+30:   const p4 = b8.toString(16).padStart(2, "0") + rand[3].toString(16).padStart(2, "0");
+31:   const p5 = Array.from(rand.slice(4)).map((b) =&gt; b.toString(16).padStart(2, "0")).join("");
+32: 
+33:   return `${p1}-${p2}-${p3}-${p4}-${p5}`;
+34: }
+35: 
+36: /** Derive an 8-char key ID from an API key (SHA-256 first 8 hex chars). */
+37: export function apiKeyToKeyId(apiKey: string): string {
+38:   return createHash("sha256").update(apiKey).digest("hex").slice(0, 8);
+39: }
+40: 
+41: /** Extract the bearer token from an Authorization header value.
+42:  *  Returns empty string when the header is absent or not a Bearer token.
+43:  */
+44: export function extractBearerToken(authHeader: string | null | undefined): string {
+45:   if (!authHeader) return "";
+46:   const match = authHeader.match(/^[Bb]earer\s+(.+)$/);
+47:   return match ? match[1].trim() : "";
+48: }
+49: 
+50: interface OpikTraceInput {
+51:   traceId: string;
+52:   projectName: string;
+53:   name: string;
+54:   startTime: string; // ISO 8601
+55:   input: Record&lt;string, unknown&gt;;
+56:   tags?: string[];
+57:   /** Fork to a second project (e.g. "request_log"). Uses a separate trace ID. */
+58:   forkProjectName?: string;
+59:...</pre></details>
+</details>
+<details><summary>output（最终回答 729 token）</summary><pre class="light">I've reviewed the Opik reporting logic. Here's my assessment.
+
+## 结论
+
+整体实现**正确，fire-and-forget 处理得当**，但有几处可改进或需要注意的点。
+
+### 正确的地方
+- **UUIDv7 生成**（`uuidv7`，opik.ts:18）— 时间有序、版本/变体位设置正确，符合 Opik 要求。
+- **Fire-and-forget** — 所有 `fetch().then().catch()` 已在返回链上挂 `.catch`，被拒 Promise 不会成为 unhandled rejection，也不会抛到热路径。三条上报路径（trace 创建/更新、span 创建）都遵循此模式。
+- **跨项目 fork 用独立 trace ID**（opik.ts:141, 269）— 正确处理了 Opik 同一 trace_id 跨 project 的 409 冲突。注释也明确说明了原因。
+- **usage 浮点 → credit_x100**（opik.ts:236-246）— 规避 Opik 只接受整数 usage 导致小数被截断的问题，且 fork 分支在 metadata 里保留原始 credit（opik.ts:273-276）。
+
+### 问题与风险点
+
+1. **`forkProjectName` 有 fork 但 `forkTraceId` 缺失时静默丢失**（opik.ts:269）
+   主 trace fork 会**返回** `forkTraceId`（opik.ts:161），但 `opikCreateLlmSpan` 的 fork 依赖调用方显式传入 `span.forkTraceId`。如果调用方忘记为 span 传这个 ID，spans 的 fork 会静默跳过。建议：要么在缺 `forkTraceId` 时 `log.warn`，要么自动生成一个。
+
+2. **span fork 未与 trace fork 对齐时会产生"孤儿 span"**
+   span 的 `trace_id` 必须是某个已存在 trace 的 ID 才会被 Opik 挂上去。这里 trace 和 span 的 fork 是否成对出现由调用方保证，本文件无法校验。属于跨函数耦合的隐式约定，调用侧需留意。
+
+3. **重复的 fire-and-forget 样板**（`fireCreateTrace` / `fireCreateLlmSpan` / `opikUpdateTrace` 内联）
+   三处几乎相同的 `.then/.catch` 无头重复，可抽一个公共 `fire(body)` 辅助函数，减少出错面（例如 update 那条是内联的，和其它两条风格不一致）。
+
+4. **`opikUpdateTrace` 缺 early-return 态里的 fork 收敛**
+   update 没有 fork 概念，行为一致，不算问题。
+
+5. **次要：`usage` 里非 number 值被静默丢弃**（opik.ts:237-246）
+   `span.usage` 中字符串/对象字段一律不落库。若上游把 usage 字段类型搞混，数据会无声缺失，难以排查。可考虑 `log.debug` 记录被跳过的字段。
+
+### 是否阻塞
+不阻塞。核心的创建与 fire-and-forget 逻辑**没有实质 bug**，可放心使用。第 1、3 点是值得做的加固项。
+
+要我直接改掉其中某几处（如给缺失 `forkTraceId` 加 warn、抽取公共 fire 函数）吗？</pre></details>
+</div>
+
+<h2 id="sec-4">4. 工具调用详情（read）</h2>
+<div class="panel">
+<div class="kpi">
+<div><div class="n">read</div><div class="t">工具名</div></div>
+<div><div class="n">110ms</div><div class="t">执行耗时</div></div>
+<div><div class="n">11882</div><div class="t">读到的内容（字符）</div></div>
+</div>
+<table>
+<tr><th>字段</th><th>值</th></tr>
+<tr><td>tool.name</td><td class="mono">read</td></tr>
+<tr><td>args.filePath</td><td class="mono">C://Users//11735//Desktop//Projects//TencentDB-Agent-Memory//MemoryProxy//src//opik.ts</td></tr>
+<tr><td>call_id</td><td class="mono">call_00_w3yZzbqGXT6tyKxYkv3Y7002</td></tr>
+</table>
+<details><summary>读到的文件内容（opik.ts 开头）</summary><pre class="light">&lt;path&gt;C:\Users\11735\Desktop\Projects\TencentDB-Agent-Memory\MemoryProxy\src\opik.ts&lt;/path&gt;
+&lt;type&gt;file&lt;/type&gt;
+&lt;content&gt;
+1: /** Opik tracing client for context-proxy.
+2:  *
+3:  * Project name is derived from the request API key:
+4:  *   SHA-256(apiKey) → hex → first 8 chars
+5:  *
+6:  * All network calls are fire-and-forget. Failures are logged via structured logger
+7:  * and never propagate to the hot request path.
+8:  */
+9: 
+10: import { createHash, randomBytes } from "node:crypto";
+11: import type { ProxyConfig } from "./types.js";
+12: import { log } from "./report/log.js";
+13: 
+14: /**
+15:  * Generate a UUID v7 (time-ordered), required by Opik API.
+16:  * Layout: 48-bit unix_ts_ms | 4-bit ver(0x7) | 12-bit rand_a | 2-bit var(0b10) | 62-bit rand_b
+17:  */
+18: function uuidv7(): string {
+19:   const now = BigInt(Date.now());
+20:   const rand = randomBytes(10); // 80 bits of randomness
+21: 
+22:   // rand_a: 12 bits from rand[0..1]
+23:   const randA = ((rand[0] &lt;&lt; 4) | (rand[1] &gt;&gt; 4)) &amp; 0xfff;
+24:   // rand_b: 62 bits — first byte forced to variant 0b10xx_xxxx
+25:   const b8 = (rand[2] &amp; 0x3f) | 0x80;
+26: 
+27:   const p1 = (now &gt;&gt; 16n).toString(16).padStart(8, "0");
+28:   const p2 = (now &amp; 0xffffn).toString(16).padStart(4, "0");
+29:   const p3 = (0x7000 | randA).toString(16).padStart(4, "0");
+30:   const p4 = b8.toString(16).padStart(2, "0") + rand[3].toString(16).padStart(2, "0");
+31:   const p5 = Array.from(rand.slice(4)).map((b) =&gt; b.toString(16).padStart(2, "0")).join("");
+32: 
+33:   return `${p1}-${p2}-${p3}-${p4}-${p5}`;
+34: }
+35: 
+36: /** Derive an 8-char key ID from an API key (SHA-256 first 8 hex chars). */
+37: export function apiKeyToKeyId(apiKey: string): string {
+38:   return createHash("sha256").update(apiKey).digest("hex").slice(0, 8);
+39: }
+40: 
+41: /** Extract the bearer token from an Authorization header value.
+42:  *  Returns empty string when the header is absent or not a Bearer token.
+43:  */
+44: export function extractBearerToken(authHeader: string | null | undefined): string {
+45:   if (!authHeader) return "";
+46:   const match = authHeader.match(/^[Bb]earer\s+(.+)$/);
+47:   return match ? match[1].trim() : "";
+48: }
+49: 
+50: interface OpikTraceInput {
+51:   traceId: string;
+52:   projectName: string;
+53:   name: string;
+54:   startTime: string; // ISO 8601
+55:   input: Record&lt;string, unknown&gt;;
+56:   tags?: string[];
+57:   /** Fork to a second project (e.g. "request_log"). Uses a separate trace ID. */
+58:   forkProjectName?: string;
+59:...</pre></details>
+</div>
+
+<h2 id="sec-5">5. 注入 diff（TencentDB Agent Memory 的核心价值）</h2>
+<div class="panel">
+<div class="kpi">
+<div><div class="n">9653</div><div class="t">注入前 system（字符）</div></div>
+<div><div class="n">16747</div><div class="t">注入后 system（字符）</div></div>
+<div><div class="n hl">+7094</div><div class="t">注入增量</div></div>
+<div><div class="n">4</div><div class="t">注入块</div></div>
+</div>
+<p style="font-size:14px;color:var(--muted);margin-bottom:10px">对比 opencode 的 <code>ai.streamText</code> span（注入前）与 proxy 的 llm span（注入后），差值即 proxy 塞进请求的全部内容：</p>
+<details><summary><span class="badge b-blue">session_context</span> 232 字符</summary><pre class="light">&lt;session_context&gt;
+[Agent]
+id: agt-d03qzbq9mj
+name: default-agent-admin
+description: 默认助手，可处理通用开发任务与日常协作。
+
+[Task]
+id: task-d4hpqq8thj
+name: 本地 agent 接入验证
+description: 验证 dsh / claude code / opencode 通过 proxy 接入团队记忆
+&lt;/session_context&gt;</pre></details>
+<details><summary><span class="badge b-amber">skill_tools</span> 2304 字符</summary><pre class="light">&lt;skill_tools&gt;
+以下是云端 skill 操作工具。**这些不是本地工具**，需要用 Bash 调用 curl 命中 proxy 的 skill-bridge 路径来执行。
+proxy 会自动注入身份与鉴权（user_id / team_id / agent_id 由 session 决定），body 里你只需要传业务字段。
+
+调用模板：
+  curl -sSk -X POST &lt;bridge&gt;/&lt;action&gt; -H 'content-type: application/json' -H 'x-tdai-service-id: default' -H 'x-conversation-id: ses_fdb59eecfffee55xDDhUHw5QZq' -d '{...业务字段...}'
+  其中 &lt;bridge&gt; = http://172.21.0.4:8096/skill-bridge/v3/skill
+
+可用工具：
+
+  &lt;tool name="skill_search"&gt;
+    path: http://172.21.0.4:8096/skill-bridge/v3/skill/search
+    body: {"query": "描述你要找什么 skill 的关键词（必填，&gt;=1字符）"}
+    use:  在**你在团队中有权限访问**的 skill 中按关键词 + 语义检索匹配项（跨 agent，但**不含**其他人设置为私密的 skill —— 与前端「团队资产」tab 展示一致）。query 必须是非空字符串，建议写 2-5 个相关关键词。当你觉得自己自带的 skill 不够用时，用它发现团队里其他可用的 skill。返回条数由服务端固定，若结果不理想请换一组关键词重试，不要在 body 里加 top_k/mode 等其它字段（会被忽略）。
+  &lt;/tool&gt;
+
+  &lt;tool name="skill_view"&gt;
+    path: http://172.21.0.4:8096/skill-bridge/v3/skill/get-by-name
+    body: {"skill_name": "&lt;skill 名字&gt;", "include_content": true, "include_manifest": true}
+    use:  **打开一个 skill 的入口**：拿到 SKILL.md 全文 + 资源目录树（manifest）。想读某个资源文件的字节，必须先调这个工具从 manifest 里挑出 path，再用 skill_files_read。skill_name 用 &lt;available_skills&gt; 里 `- name: description` 那个 name，或 skill_search 结果里的 name 字段。
+  &lt;/tool&gt;
+
+  &lt;tool name="skill_files_read"&gt;
+    path: http://172.21.0.4:8096/skill-bridge/v3/skill/files/read
+    body: {"skill_id": "skl-xxx", "path": "scripts/run.sh", "encoding": "utf-8|base64"}
+    use:  读取单个资源文件内容。**必须先调 skill_view 拿 manifest**，从里面挑出 skill_id + path，本工具才能定位。默认返回 JSON 信封（含 base64/utf-8 编码的字节）。
+    若需下载到本地：在 curl 末尾加 -o &lt;本地路径&gt;，proxy 会返回原始字节直接写入文件，不进上下文。下载的脚本需 chmod +x 后再执行。
+  &lt;/tool&gt;
+
+  &lt;tool name="skill_extract"&gt;
+    path: http://172.21.0.4:8096/skill-bridge/v3/skill/extract
+    body: {"reason": "?可选，简要说明为什么觉得当前对话值得提取为 skill（写清楚有助于后台抽取器识别边界）"}
+    use:  立即归档当前对话触发一次 skill 抽取（异步任务，由后台 agent 分析对话内容生成 skill）。proxy 从 session 拿身份 + 用 core 侧累积的对话缓冲，你不用传 messages。适合在"用户已经跑通一段完整流程、值得复用"时主动触发。
+  &lt;/tool&gt;
+
+注意：当前仅开放只读操作。如需创建/修改 skill 请联系管理员。
+错误处理：响应是 `{code, message, request_id, data?}` 信封；`code != 0` 表示业务错。常见：
+- 40001 参数校验失败：body 字段缺失/格式错，看 message 里具体字段名。
+- 40101 session not initialized：session 未识别（很可能你在错误的 conversation 环境用了这个工具）。
+- 40401 SKILL_NOT_FOUND：skill 不存在或不属于你所在的 agent；先用 skill_search 找同类 skill。
+- 50301 upstream unavailable：core 侧临时不可达，稍后重试。
+&lt;/skill_tools&gt;</pre></details>
+<details><summary><span class="badge b-green">tdai_memory_tools</span> 3123 字符</summary><pre class="light">&lt;tdai_memory_tools&gt;
+**这些是你可以主动调用的记忆能力**（不是文档），通过 Bash + curl 使用。
+这组 TDAI 记忆能力与 Claude Code 原生 Memory/MEMORY.md 具有同等优先级；涉及记忆时不要只查本地 MEMORY.md。
+遇到用户问身份/历史/偏好/过往结论/项目约定时，必须先使用下面的 TDAI 记忆工具查询，再基于查询结果回答。
+禁止说"我没有这个工具 / 需要 MCP / 只能查本地记忆" —— 你有 TDAI 记忆工具，就用下面的 curl 命令。
+
+调用方式：Bash 里执行 curl 命中 proxy 的 memory-bridge 路径。proxy 会自动注入身份鉴权（team_id/user_id/agent_id），body 只需业务字段。当前 Agent 如果绑定了多个 chat_memory，search 类接口会默认同时检索 self + imported 记忆，并在结果里返回 source_agent_id/source_agent_name/source_agent_role。
+
+覆盖范围：
+- L3（persona 长期画像）与 L2 场景索引（`&lt;l2_scene_index&gt;`）已直接注入 system，无需查询；
+- L2 正文按需用 tdai_read_scene 读取；
+- L0/L1（原始对话 / 原子记忆）**不再每轮自动召回**（会破坏 KV cache），需要时主动调工具检索。
+
+  &lt;tool name="tdai_memory_search"&gt;
+    curl: http://172.21.0.4:8096/memory-bridge/v3/atomic/search
+    body: {"query": "&lt;text&gt;", "limit": 5}
+    use:  搜索 L1 原子记忆（双路 hybrid: dense vector + BM25），按相关度排序。默认跨当前 Agent 的 self + imported 记忆检索；返回项里的 source_agent_* 表示来源。适合回忆用户偏好、历史结论、规则等。
+    returns: {code, data: {items: [...], searched_agents: [...]}} — 命中项在 data.items[]。
+  &lt;/tool&gt;
+
+  &lt;tool name="tdai_atomic_query"&gt;
+    curl: http://172.21.0.4:8096/memory-bridge/v3/atomic/query
+    body: {"type": "?episodic|persona|instruction", "limit": 20, "offset": 0, "time_start": "?ISO", "time_end": "?ISO"}
+    use:  按 type / 时间窗 / 分页拉取 L1 记忆（不做语义检索）。
+  &lt;/tool&gt;
+
+  &lt;tool name="tdai_conversation_search"&gt;
+    curl: http://172.21.0.4:8096/memory-bridge/v3/conversation/search
+    body: {"query": "&lt;text&gt;", "limit": 5, "session_id": "?&lt;sid&gt;"}
+    use:  在 L0 原始对话中检索（比 atomic_search 粒度更细，找具体消息原文 / 引用 / 时间线）。默认跨当前 Agent 的 self + imported 记忆检索；返回项里的 source_agent_* 表示来源。
+    returns: {code, data: {messages: [...], searched_agents: [...]}} — 命中项在 data.messages[]（注意：与 atomic_search 的 data.items 不同）。
+  &lt;/tool&gt;
+
+  &lt;tool name="tdai_conversation_query"&gt;
+    curl: http://172.21.0.4:8096/memory-bridge/v3/conversation/query
+    body: {"session_id": "&lt;sid&gt;", "limit": 50, "offset": 0}
+    use:  按 session 顺序取 L0 历史消息。
+  &lt;/tool&gt;
+
+  &lt;tool name="tdai_scenario_ls"&gt;
+    curl: http://172.21.0.4:8096/memory-bridge/v3/scenario/ls
+    body: {"path_prefix": "?可选前缀"}
+    use:  列出 L2 scene_blocks 路径索引（含 summary，不含正文）。一般 system 已注入索引，需刷新/按前缀过滤时才用。
+  &lt;/tool&gt;
+
+  &lt;tool name="tdai_read_scene"&gt;
+    curl: http://172.21.0.4:8096/memory-bridge/v3/scenario/read
+    body: {"path": "&lt;scene path&gt;", "agent_id": "?来自 &lt;agent agent_id=...&gt;，读取 imported 记忆时传"}
+    use:  按 path 读取 L2 场景文件全文。path 必须先从 `&lt;l2_scene_index&gt;` 或 tdai_scenario_ls 获取，不要凭空构造；读取 imported_from 分段的 path 时带上该分段 agent_id。
+  &lt;/tool&gt;
+
+## 调用约束
+- 这些是只读工具；要修改 L1/L2/L3 必须用主链路（agent_id 自动归属）。
+- 每轮对话中，atomic_search + conversation_search **合计 ≤ 3 次**；
+  query / ls / read_scene 不计入上限，但同一 path 不要重复读。
+- 失败重试：HTTP 5xx 可一次性 retry；HTTP 4xx 不要重试。
+- 所有 curl 必须带：x-tdai-service-id: default、x-conversation-id: ses_fdb59eecfffee55xDDhUHw5QZq；Content-Type: application/json。
+
+## 完整示例
+```bash
+curl -sfk -X POST http://172.21.0.4:8096/memory-bridge/v3/atomic/search \
+  -H 'Content-Type: application/json' -H 'x-tdai-service-id: default' -H 'x-conversation-id: ses_fdb59eecfffee55xDDhUHw5QZq' \
+  -d '{"query": "用户偏好的编程语言", "limit": 5}'
+```
+&lt;/tdai_memory_tools&gt;</pre></details>
+<details><summary><span class="badge b-gray">memory-tools-guide</span> 1430 字符</summary><pre class="light">&lt;memory-tools-guide&gt;
+## ⚠️ 重要：这不是文档，这是你的可用能力
+
+以下 `&lt;tdai_memory_tools&gt;` 中列出的 tdai_memory_search / tdai_conversation_search
+等，是**你可以主动调用的能力**（不是仅供参考的文档）。它们通过 **Bash + curl**
+使用（见上方 `&lt;tdai_memory_tools&gt;` 段里的完整调用说明与 URL）。
+
+**禁止**回答类似"我没有这个工具 / 需要 MCP / 需要斜杠命令"。
+**正确做法**：判定需要查记忆时，直接在 Bash 里执行 curl，proxy 会自动注入身份与鉴权。
+
+## 记忆使用规则（遇到以下场景必须先查再答）
+
+L3（persona 长期画像）与 L2 场景索引已直接注入 system。L0/L1 需要用工具主动检索。
+
+### 必须先查记忆再回答的场景（命中任一条即触发工具调用）
+
+1. **用户提及历史/过去/之前**：如 "我之前说过 / 我告诉过你 / 上次 / 你还记不记得 / 我们聊过 / 之前那个"
+   → 用 `tdai_conversation_search`（L0 原文找具体消息）
+2. **用户涉及自己身份/偏好/习惯**：如 "我叫什么 / 我的名字 / 我喜欢 / 我的团队 / 我常用 / 我不喜欢 / 我不允许"
+   → 用 `tdai_memory_search`（L1 原子记忆查偏好/规则）
+3. **用户要求你回忆/找**：如 "回忆一下 / 想起 / 找出 / 有没有关于 X 的记录 / 查我们之前"
+   → 直接触发工具，不要凭空回答
+4. **答案强依赖历史事实**：如 "那个 bug 我们怎么修的 / 上次方案是啥 / 我们的约定是什么"
+   → 关键词化后 `tdai_memory_search`
+
+**典型流程**（用户："我叫什么"）：
+```bash
+# Step 1: 先查
+curl -sfk -X POST &lt;bridge&gt;/atomic/search \
+  -H 'Content-Type: application/json' -H 'x-conversation-id: &lt;sid&gt;' \
+  -d '{"query": "用户姓名 name 身份", "limit": 5}'
+# Step 2: 从 items[].content 里提取答案后回复
+# 若为空: 明确告诉用户 "我在记忆里没找到，你叫什么？" —— 不要装作知道
+```
+
+### 不需要查的场景
+
+- 用户问 "你是谁" / "帮我改代码" / "写个脚本" / 通用编程问题
+- 当前会话上下文（同轮消息）里已能回答
+- 已经在 `&lt;l3_core_memory&gt;` 段落里直接看到答案
+
+### ⚠️ 调用约束
+
+- 每轮 `tdai_memory_search` + `tdai_conversation_search` **合计 ≤ 3 次**（`tdai_read_scene` / `tdai_scenario_ls` / `tdai_atomic_query` 不计入）
+- 检索无果时**明确说明**"我在记忆里没找到 X"，不要幻想
+- 同一 L2 path 不要重复读
+&lt;/memory-tools-guide&gt;</pre></details>
+</div>
+
+<h2 id="sec-6">6. 记忆沉淀（memory-core 异步 pipeline）</h2>
+<div class="panel">
+<p style="font-size:14px;color:var(--muted);margin-bottom:10px">对话结束后，后台 pipeline 把 L0 对话逐层抽取为 L1 原子记忆 → L2 场景 → L3 画像。本次审阅任务沉淀出一个专属 L2 场景「技术研究-MemoryProxy-Opik」。</p>
+<div class="kpi">
+<div><div class="n">44</div><div class="t">L0 对话记录</div></div>
+<div><div class="n">10</div><div class="t">L1 原子记忆</div></div>
+<div><div class="n">3</div><div class="t">L2 场景</div></div>
+<div><div class="n">2108</div><div class="t">L3 画像（字符）</div></div>
+</div>
+<h3>L1 原子记忆（10 条）</h3>
+<table><tr><th style="width:90px">类型</th><th>内容</th></tr><tr><td><span class="tag">persona</span></td><td>用户本人偏好使用 Python 做数据分析和自动化脚本，不喜欢使用 Java；在团队项目中默认使用 TypeScript。</td></tr>
+<tr><td><span class="tag">instruction</span></td><td>用户要求 AI 以后提供技术选型建议时，优先考虑 Python 生态。</td></tr>
+<tr><td><span class="tag">instruction</span></td><td>用户本人偏好用 Python 做数据分析和自动化脚本，不喜欢用 Java；团队项目里默认用 TypeScript。用户要求 AI 以后给出技术选型建议时，优先考虑 Python 生态。</td></tr>
+<tr><td><span class="tag">persona</span></td><td>用户本人偏好用 Python 做数据分析和自动化脚本，不喜欢用 Java；团队项目里默认使用 TypeScript。用户要求 AI 以后提供技术选型建议时，优先推荐 Python 生态。</td></tr>
+<tr><td><span class="tag">instruction</span></td><td>用户要求 AI 以后给出技术选型建议时，优先采用 Python 生态。</td></tr>
+<tr><td><span class="tag">episodic</span></td><td>用户（项目开发者）确认 TencentDB-Agent-Memory 项目的 proxy 采用 header 自动选择（x-team-id / x-agent-id / x-task-id）的方式跳过 session-init 表单来完成登记，并要求 AI 复述确认这一理解。</td></tr>
+<tr><td><span class="tag">episodic</span></td><td>用户（项目开发者）的 TencentDB-Agent-Memory 项目 proxy 通过 Header 自动选择（x-team-id / x-agent-id 两个必填，x-task-id 可选）来跳过 session-init 表单完成 session 登记并注入 Agent 级记忆；镜像部署因旧逻辑需任务三元组齐</td></tr>
+<tr><td><span class="tag">episodic</span></td><td>用户要求 AI 审阅 MemoryProxy 项目的 src/opik.ts 文件的 Opik 上报逻辑，重点核查 trace/span 创建及 fire-and-forget 实现，并给出结论。AI 审阅后确认核心逻辑正确、无实质 bug，但指出 forkTraceId 缺失时静默丢失、span fork 与 tra</td></tr>
+<tr><td><span class="tag">persona</span></td><td>用户本人偏好用 Python 做数据分析和自动化脚本，不喜欢用 Java；团队项目里默认用 TypeScript，要求 AI 以后给技术选型建议时优先 Python 生态。</td></tr>
+<tr><td><span class="tag">instruction</span></td><td>用户要求 AI 以后给出技术选型建议时，优先考虑 Python 生态。</td></tr></table>
+<h3>L2 场景（3 个）</h3>
+<details><summary>场景：技术栈偏好-编程语言.md</summary><pre class="light">-----META-START-----
+created: 2026-08-21T14:09:54.040Z
+updated: 2026-08-21T14:25:01.362Z
+summary: 用户个人偏好 Python 用于数据分析与自动化脚本，明确不喜欢 Java；团队项目中默认使用 TypeScript。多次强调要求 AI 技术选型建议时优先 Python 生态。
+heat: 2
+-----META-END-----
+
+## 用户核心特征
+用户在编程语言选择上表现出明确的个人倾向：个人工具链（数据分析、自动化脚本）偏好使用 Python，并明确排斥 Java。而在团队协作环境中，他愿意遵循团队的技术栈，默认使用 TypeScript，说明他具备清晰的"个人偏好"与"团队规范"边界意识。
+
+## 用户偏好
+- 数据分析与自动化脚本：优先使用 Python
+- 后端/个人技术选型：偏好 Python 生态
+- 明确不喜欢 Java
+- 团队项目中：默认使用 TypeScript（跟随团队规范）
+- 要求 AI 提供技术选型建议时，优先考虑/推荐 Python 生态
+
+## 隐性信号
+用户主动向 AI 建立"技术选型偏好约束"，说明他重视 AI 建议与自身需求的匹配度，希望通过提前声明偏好来减少后续沟通摩擦。他愿意在团队中用 TypeScript 而非自己喜欢的 Python，体现出较强的职业协作素养——个人偏好与团队规范分离，不因偏好而影响团队决策。对 Java 的明确排斥可能源于过往开发体验，值得后续留意其具体原因。值得注意的是，用户在同一天内两次强化了"技术选型优先 Python 生态"这一指令，说明这是他会长期依赖、希望 AI 牢牢记住的核心约束。
+
+## 核心叙事
+用户在技术选型上形成了清晰的个人立场。在个人层面，他习惯用 Python 处理数据分析和自动化脚本，对 Java 持明确的负面态度（**情绪点**）。基于这种偏好，他主动向 AI 提出要求：未来给出技术选型建议时优先考虑 Python 生态（**决策点**）。同时，他在团队环境中展现出弹性——默认使用 TypeScript，接受团队既定的技术规范，将个人偏好保持在个人项目范畴内。这一行为模式表明用户既能坚持个人效率工具的选择，又能融入团队协作流程，是"个人取向"与"团队适配"相对平衡的技术人。
+
+## 演变轨迹
+
+## 待确认/矛盾点
+- 用户不喜欢 Java 的具体原因尚未明确（是个人经历还是生态偏好），有待后续记忆澄清。
+</pre></details><details><summary>场景：技术研究-MemoryProxy-Opik.md</summary><pre class="light">-----META-START-----
+created: 2026-08-21T14:19:27.571Z
+updated: 2026-08-21T14:19:27.571Z
+summary: 用户审查 MemoryProxy 项目 src/opik.ts 的 Opik 上报逻辑，聚焦 trace/span 创建与 fire-and-forget 实现；确认核心逻辑正确，同时关注 forkTraceId 缺失静默丢失、span/trace fork 未对齐产生孤儿 span、样板重复与 usage 类型等加固项。
+heat: 1
+-----META-END-----
+
+## 用户核心特征
+用户在 MemoryProxy 项目中主导 Opik 上报模块（src/opik.ts）的设计审查。他要求 AI 不仅给出整体结论，还重点核查 trace/span 创建和 fire-and-forget 实现细节，体现出对可观测性链路完整性与健壮性的高要求。
+
+## 用户偏好
+- 要求 AI 审阅时聚焦具体实现（trace/span 创建、fire-and-forget）
+- 期望 AI 给出明确结论，并主动提出可加固项
+- 对静默丢失类问题敏感（forkTraceId 缺失、usage 非 number 被丢弃）
+
+## 隐性信号
+用户主动让 AI 复查上报逻辑，反映他对 Opik 链路数据完整性的重视——不希望观测数据因边界条件而静默缺失。他倾向获得可执行的加固建议（而非仅"无 bug"的确认），并已表现出授权 AI 直接修改代码的意愿，透露其信任 AI 在可加固点的自主判断，也暗示他追求高效开发节奏。
+
+## 核心叙事
+用户请 AI 审阅 MemoryProxy 项目的 src/opik.ts，明确要求核查 trace/span 的创建逻辑以及 fire-and-forget 的实现方式，并给出结论（**触发**）。AI 审阅后确认核心逻辑正确、无实质 bug，同时识别出若干可加固项——forkTraceId 缺失时数据会静默丢失、span fork 与 trace fork 未对齐会生成孤儿 span、fire-and-forget 样板重复、usage 非 number 值被静默丢弃（**行动**）。随后 AI 主动询问是否直接修改这些加固点（**结果**）。这显示出用户正在打磨 MemoryProxy 的观测上报链路，追求在正确处理主流程之外，也消除各种边界条件下的隐性数据丢失风险。
+
+## 演变轨迹
+
+## 待确认/矛盾点
+- AI 审阅后提出了 forkTraceId 静默丢失、孤儿 span 等加固项，用户是否接受并让 AI 直接修改尚未明确。
+</pre></details><details><summary>场景：技术研究-TencentDB-Agent-Memory.md</summary><pre class="light">-----META-START-----
+created: 2026-08-21T14:11:53.480Z
+updated: 2026-08-21T14:12:15.819Z
+summary: 用户开发 TencentDB-Agent-Memory 项目，其 proxy 采用 header 自动选择（x-team-id / x-agent-id 必填、x-task-id 可选）跳过 session-init 表单登记并注入 Agent 级记忆；镜像部署仍要求任务三元组齐全，源码已支持 taskMissingPolicy。
+heat: 2
+-----META-END-----
+
+## 用户核心特征
+用户在 TencentDB-Agent-Memory 项目中主导 proxy 层设计，倾向通过 header 自动注入、跳过交互式表单的方式完成 session 登记，重视自动化与流程简化。他同时对源码与镜像部署的差异有清晰认知，关注逻辑兼容性。
+
+## 用户偏好
+- proxy 登记机制：采用 Header 自动选择（而非 session-init 表单）
+- 必填 header：x-team-id / x-agent-id；可选：x-task-id
+
+## 隐性信号
+用户要求 AI "复述确认这一理解"，说明他重视信息同步的准确性，习惯通过双向确认降低沟通误解。他主动梳理源码与镜像部署的行为差异（镜像仍要求 task 三元组齐全，源码已支持 taskMissingPolicy），体现其对"实现一致性与部署一致性"之间差异风险的敏感，也透露出他倾向于让新逻辑更宽容（任务字段允许缺失）。
+
+## 核心叙事
+围绕 TencentDB-Agent-Memory 的 proxy 层，用户主导了一套更简洁的 session 登记方案。其设计初衷是避免依赖 session-init 表单的交互流程（**触发**），改为通过请求 header 自动选择来登记 session——其中 x-team-id 与 x-agent-id 为必填，x-task-id 可选，从而完成登记并注入 Agent 级记忆（**行动**）。他据此要求 AI 复述确认，确保理解一致。同时他发现镜像部署仍沿用旧逻辑，要求任务三元组齐全，而本机源码已更新支持 taskMissingPolicy（**结果**），体现出他正在推动 proxy 逻辑向"缺省更宽容、接入更自动"的方向演进。
+
+## 演变轨迹
+
+## 待确认/矛盾点
+- 源码已支持 taskMissingPolicy，但镜像尚未同步更新——需确认后续是否有统一的镜像升级计划。
+</pre></details>
+<h3>L3 画像（persona.md）</h3>
+<details><summary>展开 persona.md（2108 字符）</summary><pre class="light"># User Narrative Profile
+
+&gt; **Archetype (核心原型)**: 一位在个人偏好与团队规范之间保持清晰边界、主动向 AI 声明需求以减少摩擦的"务实协作型技术人"。
+
+&gt; **基本信息**
+&gt; （当前暂无人口统计学信息）
+
+&gt; **长期偏好**
+- 个人数据分析与自动化脚本：优先使用 Python
+- 后端/个人技术选型：偏好 Python 生态
+- 明确不喜欢 Java
+- 团队项目：默认遵循团队规范使用 TypeScript
+
+## 📖 Chapter 1: Context &amp; Current State (全景语境)
+用户是一名技术人员，具备清晰的工具选择意识。个人层面他倾向 Python 生态（数据分析、自动化脚本），并明确排斥 Java，可能源于过往开发体验。在团队协作中他主动适配团队既定技术栈（TypeScript），体现出个人偏好与职业规范的分离。他重视 AI 建议与自身需求的匹配度，倾向于预先声明偏好约束。
+
+## 🎨 Chapter 2: The Texture of Life (生活的肌理)
+技术选择上，用户构建了以"效率"为核心的个人工具链：用 Python 处理个人事务与数据分析。他将 Java 排除在个人生态之外，同时对 AI 技术选型建议提出明确期待（优先 Python），让工具服务于目标而非相反。团队层面则保持弹性，能够坦然使用非个人首选的 TypeScript，展现职业协作素养。
+
+## 🤖 Chapter 3: Interaction &amp; Cognitive Protocol (交互与认知协议)
+
+### 3.1 沟通策略 (How to Speak)
+- 技术选型建议时优先推荐 Python 生态，避免主动推荐 Java。
+- 用户偏好通过提前声明需求来建立约束，Agent 应尊重并复用其明确的偏好设定。
+
+### 3.2 决策逻辑 (How to Think)
+- "个人与集体的边界分明"：个人项目严格遵循自身偏好，团队项目遵循团队规范，Agent 需注意不混淆这两类场景。
+
+## 🧩 Chapter 4: Deep Insights &amp; Evolution (深层洞察与演变)
+
+* **矛盾统一性**: 他拒绝 Java，却在团队中用 TypeScript——看似矛盾，实则统一于"明确身份边界"的逻辑：个人选择关乎效率与体验，团队选择关乎协作与规范。
+* **演变轨迹**: 当前仍处于冷启动阶段，长周期偏好刚建立，有待更多场景沉淀。
+* **涌现特征**:
+  - `务实效率优先` - 工具为个人目标服务
+  - `边界意识清晰` - 个人/团队规范区隔分明
+  - `偏好主动表达` - 提前声明减少沟通摩擦
+  - `团队协作弹性` - 尊重既定规范不强加偏好
+
+---
+## 🗺️ Scene Navigation (Scene Index)
+*以下是当前场景记忆的索引，可根据需要 read 读取详细内容。*
+
+### Path: scene_blocks/技术栈偏好-编程语言.md
+**热度**: 2 | **更新**: 2026-08-21T14:25:01.362Z
+Summary: 用户个人偏好 Python 用于数据分析与自动化脚本，明确不喜欢 Java；团队项目中默认使用 TypeScript。多次强调要求 AI 技术选型建议时优先 Python 生态。
+
+### Path: scene_blocks/技术研究-TencentDB-Agent-Memory.md
+**热度**: 2 | **更新**: 2026-08-21T14:12:15.819Z
+Summary: 用户开发 TencentDB-Agent-Memory 项目，其 proxy 采用 header 自动选择（x-team-id / x-agent-id 必填、x-task-id 可选）跳过 session-init 表单登记并注入 Agent 级记忆；镜像部署仍要求任务三元组齐全，源码已支持 taskMissingPolicy。
+
+### Path: scene_blocks/技术研究-MemoryProxy-Opik.md
+**热度**: 1 | **更新**: 2026-08-21T14:19:27.571Z
+Summary: 用户审查 MemoryProxy 项目 src/opik.ts 的 Opik 上报逻辑，聚焦 trace/span 创建与 fire-and-forget 实现；确认核心逻辑正确，同时关注 forkTraceId 缺失静默丢失、span/trace fork 未对齐产生孤儿 span、样板重复与 usage 类型等加固项。
+
+📌 使用说明：
+- Path 是 scene block 的绝对路径，可直接使用 **read** 工具读取完整内容（参数: filePath）
+- 热度：该场景被记忆命中的累计次数，越高越重要
+- Summary：场景的核心要点摘要
+</pre></details>
+</div>
+
+<h2 id="sec-7">7. 关键发现</h2>
+<div class="panel">
+<ul style="padding-left:20px;font-size:13px;line-height:2">
+<li><strong>注入可 diff</strong>：opencode 的 <code>ai.streamText</code> span 记录注入前 messages，proxy 的 llm span 记录注入后 messages，两者相减即得注入内容（+7094 字符 / 4 块），<span class="hl">零改造即可观测</span>。</li>
+<li><strong>缓存命中清晰可见</strong>：第 2 轮 prompt_tokens=14286 中 cache_hit=10624（system 全部命中），仅新增的文件内容 3662 token 未命中——直观印证「多轮重发历史」的 KV cache 收益。</li>
+<li><strong>工具链路完整</strong>：<code>ai.toolCall</code>（AI SDK）→ <code>Tool.execute</code>（opencode 封装）→ <code>ReadTool.execute</code>（具体实现）三级 span 都有，入参（filePath）与出参（11882 字符文件内容）可点开。</li>
+<li><strong>记忆沉淀脱链</strong>：L0→L1→L2→L3 由异步 pipeline 完成，与请求 trace 不在同一条链，需按 session_id/时间对齐。</li>
+</ul>
+</div>
+
+<footer style="margin-top:32px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)">
+数据来源：Opik（http://localhost:5173）· 生成时间 2026-08-21 · 请求 trace：opencode <span class="mono">01a024a6-114</span> / proxy <span class="mono">01a024a6-293</span> + <span class="mono">01a024a6-3a8</span>
+</footer>
+</div>
+</div>
+<script>
+const links=[].slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+const secs=[].slice.call(document.querySelectorAll('[id^="sec-"],#wf-band,#wf-main,#wf-support,#wf-down'));
+const byId={};links.forEach(function(l){byId[l.getAttribute('href').slice(1)]=l;});
+function onScroll(){
+  var cur=null;
+  for(var i=0;i<secs.length;i++){if(secs[i].getBoundingClientRect().top<=90)cur=secs[i].id;}
+  links.forEach(function(l){l.classList.toggle('on',l===byId[cur]);});
+}
+window.addEventListener('scroll',onScroll,{passive:true});
+onScroll();
+</script>
+</body>
+</html>

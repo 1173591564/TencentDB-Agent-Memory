@@ -8,7 +8,7 @@
  *   - 分页模式: 每页 3 个 agent + "更多→" 按钮
  */
 
-export { handleSessionInit } from "./init.js";
+export { handleSessionInit, completeRegistration } from "./init.js";
 export type { SessionRequestContext, SessionInitResult } from "./init.js";
 
 export { buildFormResponse, containsFormTitle, isSessionInitToolCallId } from "./form.js";

@@ -504,15 +504,15 @@ model:
   extra_headers:
     x-team-id: <从面板获取的 team_id>
     x-agent-id: <从面板获取的 agent_id>
-    x-task-id: <从面板获取的 task_id>
-    x-conversation-id: <自定义的会话标识>
+    # x-task-id 可选：不传则仅注入 Agent 级记忆。需要任务级记忆时再填。
+    # x-conversation-id 可选：不传则 Proxy 按 API key 自动分配并续接会话。
 ```
 
 - `base_url`：Proxy 地址 + `/hermes/<spaceId>` 路径。`<spaceId>` 是 memory 实例 ID（从面板获取，通常为 `default`）
 - `api_key`：业务用户的 `user_key`（从管理面板"API Key"页获取）
 - `x-team-id` / `x-agent-id`：从管理面板对应页面获取，与 CodeBuddy / Claude Code 的获取方式相同
-- `x-task-id`：从管理面板"任务管理"页获取。**当前版本必填**——缺少此字段会导致 session 注册失败，记忆功能不生效（见下方[已知限制](#关于-x-task-id-的已知限制)）
-- `x-conversation-id`：用户自定义的会话标识（见下方[已知限制](#关于-x-conversation-id-的已知限制)）
+- `x-task-id`：可选。从管理面板"任务管理"页获取；不传则 session 仍注册，仅注入 Agent 级记忆（见下方[x-task-id 可选](#关于-x-task-id-可选)）
+- `x-conversation-id`：可选。不传则 Proxy 自动分配会话 ID（见下方[x-conversation-id 自动管理](#关于-x-conversation-id-自动管理)）
 
 ## 通过 Proxy 使用 OpenClaw
 
@@ -533,9 +533,7 @@ model:
         "api": "openai-completions",
         "headers": {
           "x-team-id": "<从面板获取的 team_id>",
-          "x-agent-id": "<从面板获取的 agent_id>",
-          "x-task-id": "<从面板获取的 task_id>",
-          "x-conversation-id": "<自定义的会话标识>"
+          "x-agent-id": "<从面板获取的 agent_id>"
         },
         "request": {
           "allowPrivateNetwork": true
@@ -559,7 +557,7 @@ model:
 
 - `baseUrl`：Proxy 地址 + `/openclaw/<spaceId>` 路径
 - `apiKey`：业务用户的 `user_key`
-- `headers`：必须包含 `x-team-id`、`x-agent-id`、`x-task-id`、`x-conversation-id`。其中 `x-task-id` 当前版本为必填（见下方[已知限制](#关于-x-task-id-的已知限制)）
+- `headers`：至少包含 `x-team-id`、`x-agent-id`。`x-task-id` / `x-conversation-id` 可选（见下方说明）
 - `models[].id`：必须与 Proxy 上游配置的模型 ID 匹配
 
 ## 其他平台接入（通用）
@@ -586,10 +584,10 @@ http://<proxy-host>:<port>/<agent-source>/<spaceId>
 | `Authorization: Bearer <user_key>` | 业务用户的 API Key（从面板"API Key"页获取） |
 | `x-team-id` | 团队 ID |
 | `x-agent-id` | Agent ID |
-| `x-task-id` | 任务 ID（当前版本必填，见下方[已知限制](#关于-x-task-id-的已知限制)） |
-| `x-conversation-id` | 会话标识，由客户端自行生成和管理 |
+| `x-task-id` | 任务 ID（可选；不传则仅注入 Agent 级记忆，见[x-task-id 可选](#关于-x-task-id-可选)） |
+| `x-conversation-id` | 会话标识（可选；不传则 Proxy 自动分配，见[x-conversation-id 自动管理](#关于-x-conversation-id-自动管理)） |
 
-以上 header 缺一不可——Proxy 会通过 header 直接完成 session 注册，跳过交互式表单。无法提供 headers 的平台将触发 session bypass，记忆注入和对话回流均不生效。
+`x-team-id` + `x-agent-id` 即可直接完成 session 注册。无法提供这两个 header 的平台仍会走交互式表单；Hermes / OpenClaw 无法填表，因此至少要配这两个。无效的 `x-task-id` 按 `headerAutoSelect.onMismatch` 处理（默认回表单；Hermes 建议配 `bypass`）。
 
 ## 可选能力：`sessionInit.defaultTaskId`（"本次不关联任务"选项）
 
@@ -630,6 +628,11 @@ sessionInit:
   injectAgentContext: true
   injectTaskContext: true
   defaultTaskId: "no-task"     # 任意稳定字符串,不需要内核里真实存在
+  taskMissingPolicy: "skip"    # skip | default | reject — 缺 x-task-id 时
+  autoConversationId:
+    enabled: true
+    ttlMinutes: 30
+    strategy: "per-key"
   headerAutoSelect:
     enabled: true
     teamHeader: "x-team-id"
@@ -720,31 +723,29 @@ pipeline 时才有意义。
 > YAML 模板加上 `assetReflection` 段,要么用 `PROXY_CONFIG_DIR` 指向你
 > 自己维护的 `config.yaml` 目录,绕开自动生成。
 
-## 关于 `x-task-id` 的已知限制
+## 关于 `x-task-id` 可选
 
-> ⚠️ **当前版本限制**：`x-task-id` 在 Hermes / OpenClaw 场景下为**必填项**。
+> `x-task-id` 已不再是 Hermes / OpenClaw 的接入硬门槛。只配 `x-team-id` + `x-agent-id` 即可完成 session 注册，注入 **Agent 级**记忆 / skill。需要任务级记忆时再带上合法的 `x-task-id`。
 >
-> Proxy 的 header 预选机制要求 `x-team-id` + `x-agent-id` + `x-task-id` 三者齐全才能完成 session 直接注册。缺少 `x-task-id` 时，Proxy 会尝试弹出交互式表单让用户选择 task，但 Hermes / OpenClaw 无法响应交互式表单，最终导致 session bypass（记忆注入和对话回流均不生效）。
+> Proxy 配置 `sessionInit.taskMissingPolicy`：
 >
-> 这带来的不便：
+> - `skip`（默认）：不绑定 task，仅 Agent 级注入，并在 `<session_context>` 中提示补充 `x-task-id`
+> - `default`：使用 `defaultTaskId` 占位（等效表单选「本次不关联任务」）
+> - `reject`：旧行为，缺 task 则 bypass
 >
-> 1. 用户需要预先在面板上创建 Task 并获取 `task_id`，增加了接入门槛。
-> 2. 切换不同任务时需要手动修改配置文件中的 `x-task-id`。
->
-> 我们将在下一个版本中支持 `x-task-id` 可选：当 header 中未指定 task 时，Proxy 自动选择该 agent 下的默认 task 或跳过 task 绑定，直接完成 session 注册。
+> 传入无效 `x-task-id` 不会被静默忽略，而是按 `headerAutoSelect.onMismatch` 处理（默认 `form`；Hermes / OpenClaw 建议设为 `bypass`）。
 
-## 关于 `x-conversation-id` 的已知限制
+## 关于 `x-conversation-id` 自动管理
 
-> ⚠️ **当前版本限制**：Hermes 和 OpenClaw 需要在配置文件中静态指定 `x-conversation-id`。
-> 这与 Claude Code / CodeBuddy 不同（它们由 SDK 自动管理 session ID）。
+> 未携带任何 conversation / session 头时，Proxy 按 API key 自动分配 UUID，并在 30 分钟滑动 TTL 内续接（含 tool-call 后续请求丢失 extra headers 的情况）。显式传入 `x-conversation-id` / `x-session-id` / `x-deepseek-harness-session-id` 等则原样使用，不触发自动分配。
 >
-> 当前限制：
+> 默认 `strategy: per-key`：报文像新对话（至多 1 条 user、无 assistant/tool）时开新会话；多轮 / 工具轮按 key 续接。多窗口并行请改 `per-key-msg`，或每个窗口自己传 `x-conversation-id`。
 >
-> 1. **同一个 conversation ID 的所有请求共享同一个 session** —— 记忆注入、对话回流都绑定到这个 ID。
-> 2. **每次开启新对话时需要手动更换 conversation ID**，否则会继续沿用上次的 session 状态。
-> 3. **部分客户端的 tool call 后续请求可能不携带 extra headers**，导致那些轮次跳过记忆注入和对话回流。
+> **OpenCode**：优先用其原生每请求都带的 `X-Session-Id`，不要在 provider headers 里写死 `x-conversation-id`（否则所有会话会共用一个 ID）。
 >
-> 我们将在下一个版本中优化 conversation ID 的使用体验。
+> **DeepSeek Harness**：原生每请求都带 `x-deepseek-harness-session-id`，无需再配会话头。
+>
+> 自动分配器是单节点内存实现（TTL + LRU）。多 pod 时各节点独立分配；跨节点一致尚未做。
 
 ## 停止 / 清理
 

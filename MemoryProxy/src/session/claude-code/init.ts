@@ -417,7 +417,7 @@ function applyArtifactsAndContext(
   return { messages: injected, systemAppend };
 }
 
-async function completeRegistration(
+export async function completeRegistration(
   resolved: SessionInitData,
   state: SessionInitState,
   cachedTeams: TeamOption[],
@@ -441,29 +441,39 @@ async function completeRegistration(
     await store.set(compositeKey, { status: "initialized", bypassed: true } as SessionInitState);
     return { intercepted: false, bypassed: true };
   }
-  // 新增契约：只有 team + agent + task 三者齐全才注入。task_id 缺失一律 bypass —
-  // 覆盖 0-task team、header 只带 team+agent、debugForceIdentity 不带 task 等场景。
-  // 所有走到这里的调用方都必须先解析出 task_id；auto-select 级联负责在 tasks.length===1
-  // 时自动选中，tasks.length===0 由 advanceFromAgentPicked 直接 bypass 不会到这里。
-  // 这里做兜底防御，防止将来新增调用方漏传 task_id。
+  // taskMissingPolicy：缺 task 不再一律 bypass。
+  //   reject  → 旧行为 bypass；default → defaultTaskId 占位（未配置则降级 skip）；
+  //   skip    → 无 task 注册：regData.task_id=undefined → shouldFetchTask 短路、
+  //             participation log 守卫跳过、[Task] 段不产出，仅 Agent 级注入。
   if (!resolved.task_id) {
-    console.warn(
-      `[session-init:cc] session=${compositeKey} agent=${resolved.agent_id} without task → bypass (task required for injection)`,
-    );
-    await store.set(compositeKey, {
-      status: "initialized",
-      keyId: sessionKey,
-      startedAt: state.startedAt,
-      attemptCount: state.attemptCount,
-      userId: regUserId,
-      cachedTeams,
-      selectedTeamId,
-      sessionInfo: null,
-      agentDetail: null,
-      taskDetail: null,
-      bypassed: true,
-    } as SessionInitState);
-    return { intercepted: false, bypassed: true };
+    const policy = config.taskMissingPolicy ?? "skip";
+    if (policy === "reject") {
+      console.warn(
+        `[session-init:cc] session=${compositeKey} agent=${resolved.agent_id} without task → bypass (taskMissingPolicy=reject)`,
+      );
+      await store.set(compositeKey, {
+        status: "initialized",
+        keyId: sessionKey,
+        startedAt: state.startedAt,
+        attemptCount: state.attemptCount,
+        userId: regUserId,
+        cachedTeams,
+        selectedTeamId,
+        sessionInfo: null,
+        agentDetail: null,
+        taskDetail: null,
+        bypassed: true,
+      } as SessionInitState);
+      return { intercepted: false, bypassed: true };
+    }
+    if (policy === "default" && config.defaultTaskId) {
+      resolved = { ...resolved, task_id: config.defaultTaskId };
+    } else if (policy === "default") {
+      console.warn(`[session-init:cc] session=${compositeKey} taskMissingPolicy=default 但未配置 defaultTaskId → 降级 skip`);
+    }
+    if (!resolved.task_id) {
+      console.log(`[session-init:cc] session=${compositeKey} agent=${resolved.agent_id} without task → register agent-only (policy=${policy})`);
+    }
   }
   const regData = buildRegistrationData(resolved, cachedTeams, sessionKey, regUserId);
   if (!regData) {
@@ -761,7 +771,7 @@ async function handleSessionInitInner(
 
     // ── Header-driven pre-selection: skip forms when identity is provided ──
     if (presetIdentity && config.headerAutoSelect?.enabled) {
-      const pr = resolvePresetIdentity(teams, presetIdentity);
+      const pr = resolvePresetIdentity(teams, presetIdentity, config.taskMissingPolicy ?? "skip");
 
       if (pr.hadMismatch) {
         if (config.headerAutoSelect.onMismatch === "bypass") {

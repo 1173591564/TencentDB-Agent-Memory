@@ -251,6 +251,25 @@ export interface SessionInitConfig {
    * 若未配置，task_select 阶段不会出现"跳过"选项。
    */
   defaultTaskId?: string;
+  /**
+   * x-task-id 缺失时的策略（仅影响 team+agent 已齐全的场景；mismatch 仍走 headerAutoSelect.onMismatch）：
+   * - "skip"（默认）：不绑定 task 直接注册，仅注入 Agent 级记忆/skill
+   * - "default"：以 defaultTaskId 占位（等效表单选"本次不关联任务"；未配置 defaultTaskId 时降级 skip）
+   * - "reject"：旧行为，缺 task 一律 bypass
+   */
+  taskMissingPolicy?: "skip" | "default" | "reject";
+  /**
+   * 请求未携带任何 conversation/session 头时，按 API key 自动分配并维护会话 ID。
+   * 显式头（x-conversation-id / x-session-id / x-deepseek-harness-session-id 等）永远优先，不触发分配。
+   */
+  autoConversationId?: {
+    /** 默认 true。 */
+    enabled?: boolean;
+    /** 活跃会话滑动超时（分钟），默认 30。 */
+    ttlMinutes?: number;
+    /** "per-key"（默认，单活跃会话）| "per-key-msg"（按首条 user 消息区分，支持多窗口）。 */
+    strategy?: "per-key" | "per-key-msg";
+  };
   headerAutoSelect?: {
     /** 是否启用 header 自动预选。默认 true。 */
     enabled: boolean;
@@ -792,6 +811,12 @@ export interface RawYamlConfig {
     injectAgentContext?: boolean;
     injectTaskContext?: boolean;
     defaultTaskId?: string;
+    taskMissingPolicy?: string;
+    autoConversationId?: {
+      enabled?: boolean;
+      ttlMinutes?: number;
+      strategy?: string;
+    };
     debugForceIdentity?: {
       team_id?: string;
       agent_id?: string;

@@ -376,14 +376,27 @@ export async function completeRegistration(
     await store.set(compositeKey, { status: "initialized", bypassed: true } as SessionInitState);
     return { intercepted: false, bypassed: true, justRegistered: true };
   }
-  // 与 CC 侧一致：只有 team + agent + task 三者齐全才注入。task_id 缺失一律 bypass。
-  // CodeBuddy 的 team+agent+task 在同一 form 里提交，用户如果没选 task 就走 bypass。
+  // taskMissingPolicy：缺 task 不再一律 bypass。
+  //   reject  → 旧行为 bypass；default → defaultTaskId 占位（未配置则降级 skip）；
+  //   skip    → 无 task 注册：regData.task_id=undefined → shouldFetchTask 短路、
+  //             participation log 守卫跳过、[Task] 段不产出，仅 Agent 级注入。
   if (!resolved.task_id) {
-    console.warn(
-      `[session-init:cb] session=${compositeKey} agent=${resolved.agent_id} without task → bypass (task required for injection)`,
-    );
-    await store.set(compositeKey, { status: "initialized", bypassed: true } as SessionInitState);
-    return { intercepted: false, bypassed: true, justRegistered: true };
+    const policy = config.taskMissingPolicy ?? "skip";
+    if (policy === "reject") {
+      console.warn(
+        `[session-init:cb] session=${compositeKey} agent=${resolved.agent_id} without task → bypass (taskMissingPolicy=reject)`,
+      );
+      await store.set(compositeKey, { status: "initialized", bypassed: true } as SessionInitState);
+      return { intercepted: false, bypassed: true, justRegistered: true };
+    }
+    if (policy === "default" && config.defaultTaskId) {
+      resolved = { ...resolved, task_id: config.defaultTaskId };
+    } else if (policy === "default") {
+      console.warn(`[session-init:cb] session=${compositeKey} taskMissingPolicy=default 但未配置 defaultTaskId → 降级 skip`);
+    }
+    if (!resolved.task_id) {
+      console.log(`[session-init:cb] session=${compositeKey} agent=${resolved.agent_id} without task → register agent-only (policy=${policy})`);
+    }
   }
   const regData = buildRegistrationData(resolved, cachedTeams, sessionKey, regUserId);
   if (!regData) {
@@ -779,7 +792,7 @@ async function handleSessionInitInner(
 
     // ── Header-driven pre-selection: skip forms when identity is provided ──
     if (presetIdentity && config.headerAutoSelect?.enabled) {
-      const pr = resolvePresetIdentity(teams, presetIdentity);
+      const pr = resolvePresetIdentity(teams, presetIdentity, config.taskMissingPolicy ?? "skip");
 
       if (pr.hadMismatch) {
         if (config.headerAutoSelect.onMismatch === "bypass") {

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session ID 跨轮关联问题 · 完整调研与方案收敛</title>
+<style>
+  :root {
+    --bg: #0a0c13; --bg-2: #0e1119;
+    --panel: #12151f; --panel-2: #181c29; --panel-3: #1e2333;
+    --border: #242a3d; --border-soft: #1b2031;
+    --text: #e8ebf4; --muted: #97a0b8; --muted-2: #6b7490;
+    --accent: #7c9eff; --accent-2: #b794f6; --accent-dim: rgba(124,158,255,.14);
+    --agent: #f6ad55; --proxy: #7c9eff; --core: #4fd1c5; --llm: #8aa1b8;
+    --warn: #fc8181; --ok: #68d391; --amber: #f6c177; --code-bg: #0c0f18;
+    --strong-text: #ffffff;
+    --pre-text: #c8d0e6;
+    --grad: linear-gradient(135deg, #7c9eff 0%, #b794f6 100%);
+    --h1-grad: linear-gradient(120deg, #ffffff 20%, #b9c6f4 55%, #9fd8cf 100%);
+    --shadow-card: 0 16px 48px rgba(0,0,0,.28);
+    --shadow-box: 0 4px 14px rgba(0,0,0,.22);
+    --chip-text: #eec58a;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif; line-height: 1.75; font-size: 15px; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 40px 32px 120px; }
+  header.hero { margin: 0 0 24px; padding: 44px 44px 36px; position: relative;
+    background: linear-gradient(180deg, rgba(124,158,255,.06), rgba(124,158,255,0) 85%), var(--panel);
+    border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }
+  header.hero .eyebrow { color: var(--accent-2); font-size: 12px; letter-spacing: 3px; text-transform: uppercase;
+    font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; }
+  header.hero .eyebrow::before { content: ""; width: 26px; height: 2px; background: var(--grad); border-radius: 2px; }
+  h1 { font-size: 38px; font-weight: 800; letter-spacing: -1px; line-height: 1.15; margin: 0 0 10px;
+    background: var(--h1-grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .subtitle { color: var(--muted); font-size: 15px; margin: 0 0 20px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip { font-size: 12px; padding: 4px 12px; border-radius: 20px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--chip-text); }
+  h2 { font-size: 21px; margin: 48px 0 14px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border); font-weight: 600; }
+  h2 .num { color: var(--accent); margin-right: 10px; }
+  h3 { font-size: 16px; margin: 24px 0 10px; color: var(--strong-text); font-weight: 600; }
+  p { margin: 10px 0; }
+  .lead { font-size: 16px; color: var(--text); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; margin: 16px 0; }
+  .panel.hl { border-color: var(--accent-dim); background: linear-gradient(180deg, var(--panel), var(--panel-2)); }
+  .callout { border-left: 3px solid var(--accent); background: var(--panel-2);
+    padding: 12px 18px; border-radius: 0 8px 8px 0; margin: 14px 0; color: var(--pre-text); }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.ok { border-left-color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: .4px; }
+  tr:hover td { background: var(--panel-2); }
+  td code, th code { color: var(--code-text, #9db4f0); }
+  code { font-family: "SFMono-Regular", "JetBrains Mono", Consolas, monospace;
+    background: var(--code-bg); padding: 1px 6px; border-radius: 4px; font-size: 13px; color: #9db4f0; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; overflow-x: auto; font-size: 13px; line-height: 1.6; }
+  pre code { background: none; padding: 0; color: var(--pre-text); }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    margin-left: 6px; vertical-align: middle; font-weight: 600; }
+  .tag.verdict-no { background: rgba(252,129,129,.14); color: var(--warn); }
+  .tag.verdict-yes { background: rgba(104,211,145,.14); color: var(--ok); }
+  .tag.verdict-partial { background: rgba(246,193,119,.14); color: var(--amber); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+  .toc { position: sticky; top: 12px; z-index: 50; display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 10px 14px; margin: 0 0 48px;
+    background: rgba(13,16,25,.84); backdrop-filter: blur(14px);
+    border: 1px solid var(--border); border-radius: 14px; }
+  .toc a { color: var(--muted); text-decoration: none; font-size: 12.5px; padding: 4px 12px;
+    border-radius: 999px; border: 1px solid transparent; transition: all .15s ease; white-space: nowrap; }
+  .toc a:hover { color: var(--text); background: var(--panel-3); border-color: var(--border); }
+  .toc a .n { color: var(--accent); font-weight: 700; margin-right: 5px; font-family: "SF Mono", Menlo, Consolas, monospace; }
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-family: monospace; font-size: 13px; margin: 12px 0; }
+  .flow .step { background: var(--panel-2); border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; color: var(--pre-text); }
+  .flow .arrow { color: var(--muted-2); }
+  .keybox { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin: 12px 0; }
+  .keybox .k { color: var(--accent); font-weight: 600; }
+  footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted-2); font-size: 13px; }
+  .concl { background: linear-gradient(135deg, rgba(124,158,255,.08), rgba(79,209,197,.06));
+    border: 1px solid var(--accent-dim); border-radius: 12px; padding: 22px 24px; margin: 20px 0; }
+  .concl .title { color: var(--strong-text); font-weight: 700; font-size: 16px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">TencentDB Agent Memory · 调研报告系列 · 第 ④ 篇</div>
+  <h1>Session ID 跨轮关联问题 · 完整调研与方案收敛</h1>
+  <p class="subtitle">为什么「agent 不传 sid」会击穿 proxy 的记忆关联，以及在不改核心架构的前提下，解决方案收敛到哪一步。</p>
+  <div class="meta">
+    <span class="chip">MemoryProxy</span>
+    <span class="chip">2026-08-25 ~ 08-26 讨论沉淀</span>
+    <span class="chip">约束：不改核心架构，只找 solution</span>
+  </div>
+</header>
+
+<nav class="series-nav" style="margin:18px 0 4px;padding:13px 18px;background:#12151f;border:1px solid #242a3d;border-radius:12px;line-height:1.6;">
+  <div style="font-size:11px;color:#6b7490;letter-spacing:.8px;margin-bottom:7px;">TENANTDB AGENT MEMORY · 调研报告系列 · 观测 → 机制 → 例外 → 收敛</div>
+  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:5px;font-size:13px;">
+    <a href="opik-trace-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">① 流量观测</a>
+    <span style="color:#6b7490;">›</span>
+    <a href="session-init-flow.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">② 身份机制</a>
+    <span style="color:#6b7490;">›</span>
+    <a href="dsh-native-integration-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">③ headless 例外</a>
+    <span style="color:#6b7490;">›</span>
+    <span style="color:#e8ebf4;padding:3px 10px;border-radius:6px;border:1px solid #7c9eff;background:rgba(124,158,255,.2);font-weight:600;">④ sid 收敛</span>
+  </div>
+</nav>
+
+<nav class="toc">
+  <a href="#s1"><span class="n">01</span>问题定义</a>
+  <a href="#s2"><span class="n">02</span>五个关键发现</a>
+  <a href="#s3"><span class="n">03</span>降级链拆解</a>
+  <a href="#s4"><span class="n">04</span>方案探索历程</a>
+  <a href="#s5"><span class="n">05</span>锚点两条件</a>
+  <a href="#s6"><span class="n">06</span>最终 solution</a>
+  <a href="#s7"><span class="n">07</span>已否决清单</a>
+  <a href="#s8"><span class="n">08</span>源码索引</a>
+</nav>
+
+<div class="concl" style="margin-top:28px">
+  <div class="title">核心结论（TL;DR）</div>
+  <p style="margin:0">sid 的本质是 proxy 的「跨轮挂载点」，<strong>不是</strong> agent 生态的事实。它只需要满足三条功能要求——<strong>跨轮稳定、会话区分、可持久化</strong>——而不必等于 agent 的真实 sid。因此「构造」优于「寻找」；而任何锚定在<strong>消息内容</strong>（首条 prompt / 摘要）上的 sid 都会在 compaction 下失效。最终收敛到：<strong>账户/keyId/工作区 这类「会话级不变量」做锚点 + 持久化 + 抗 compaction 兜底</strong>，在 <code>autoConversationId</code> 这一环增强，不碰 <code>compositeKey</code> / session-init 状态机 / 三元组归属。</p>
+</div>
+
+<h2 id="s1"><span class="num">一</span>问题定义</h2>
+<p class="lead">会话 id 是 agent 客户端自己构造的「对话线程索引」，但上游 LLM 协议本身<strong>无状态、无 session 字段</strong>。于是有的 agent 请求里不传 sid，导致依赖跨轮关联的 proxy 层拿不到它。</p>
+<div class="callout">
+  proxy 的接入机制是「改发送地址的转发代理」——agent 的 <code>base_url</code> 被指向 proxy，请求目标就是 proxy，proxy 做身份识别 + 注入后转发给真实 LLM。<strong>不是</strong> MITM 嗅探，但业务层对双向流量有控制权。
+</div>
+<p>sid 在 TencentDB 里的唯一用途：作为 <code>compositeKey = ${agentSource}:${sessionKey}</code> 的 sessionKey 部分，充当 <code>SessionStore</code> 的 Map key，承载「记忆—身份—状态」的挂载。它需要满足三条功能要求：</p>
+<div class="keybox">
+  <span class="k">① 跨轮稳定</span>：同一会话的每轮请求 key 一致（否则状态机、L0-L3 全断）<br>
+  <span class="k">② 会话区分</span>：不同会话不撞（否则记忆串了）<br>
+  <span class="k">③ 可持久化 + 可反查身份</span>：跨重启/pod 能恢复，能反查回 team/agent/task 三元组
+</div>
+<p class="lead" style="color:var(--accent)">关键洞察：这三条没有一条要求「sid 等于 agent 的真实 sid」。agent 的真实 sid 只是恰好满足三条的一个来源，不是唯一、更不是必须。</p>
+
+<h2 id="s2"><span class="num">二</span>五个关键发现</h2>
+
+<h3>发现 1 · sid 归属 agent 生态</h3>
+<p>session id 是 agent 生态的自有概念，TencentDB 只是「借用」它做挂载点，不是发明者。</p>
+<table>
+  <tr><th>agent</th><th>sid 载体</th><th>源码</th></tr>
+  <tr><td>dsh</td><td><code>x-deepseek-harness-session-id</code>（session-&lt;uuid&gt;）</td><td><code>session-key.ts:14</code></td></tr>
+  <tr><td>codex</td><td><code>session-id</code> header（primary）+ <code>client_metadata.session_id</code>（fallback）</td><td><code>codexHandler.ts:167-175</code></td></tr>
+  <tr><td>Claude Code</td><td><code>x-conversation-id</code> / <code>x-claude-code-session-id</code></td><td><code>session-key.ts:11,13</code></td></tr>
+  <tr><td>WorkBuddy / CodeBuddy</td><td><code>session-id</code> header + <code>client_metadata.session_id</code>；进程内 env <code>CODEBUDDY_SESSION_ID</code></td><td><code>workbuddyHandler.ts:161-174</code></td></tr>
+</table>
+
+<h3>发现 2 · 工具面没有「查询 sid」的工具</h3>
+<p>穷举 <code>&lt;tdai_memory_tools&gt;</code>（6 个只读工具）、skill-bridge、memory-bridge、meta 端点——全是「消费 sid」或「skill CRUD」，<strong>没有 get-session / list-sessions</strong>。sid 是「约定共享的秘密」，由 proxy 渲染工具模板时写死注入（<code>x-conversation-id: {sessionId}</code>），无需查询。</p>
+
+<h3>发现 3 · sid 与 ask-question 的因果</h3>
+<p>不是「为了调用 ask-question 所以要 sid」，而是 sid 是跨轮状态关联键（session-init 状态机 <code>pending_* → initialized</code> 必须跨多轮存活），ask-question 只是状态机借用的交互载体。<strong>没有 sid → 表单循环当场断。</strong></p>
+
+<h3>发现 4 · 不传 sid 的根源</h3>
+<p>agent 无会话概念（无状态脚本/单轮），或有但不带出（协议没这字段 / 刻意不暴露）。<strong>传是自定义扩展，不传是协议默认。</strong></p>
+<div class="callout warn">
+  活标本：WorkBuddy 自己。它内部有 sid（env <code>CODEBUDDY_SESSION_ID</code> 实测可达），但发请求时大概率不把 sid 带进 header（抓包独有 header 集合无 sid，且 <code>workbuddyHandler.ts:875</code> 有 <code>${keyId}:${traceId}</code> 降级）——正是「有 sid 但不带出」。
+</div>
+
+<h3>发现 5 · proxy 的降级链与代价</h3>
+<p>详见下一节的精确拆解——原始表述「一条链」是错的，实际是两条独立链 + 一层被漏掉的 <code>autoConversationId</code>。</p>
+
+<h2 id="s3"><span class="num">三</span>降级链的精确拆解（含纠错）</h2>
+<p>最初把降级链写成 <code>conversationId ?? profile.sessionKey(headers) ?? ${keyId}:${traceId}</code>，这是<strong>把两个 handler 的两条独立链缝合成了不存在的一条</strong>。实际是：</p>
+
+<h3>链 A — OpenAI handler（CB / dsh，<code>handler.ts:663</code>）</h3>
+<div class="flow">
+  <span class="step">resolveConversationId（6 header）</span>
+  <span class="arrow">→</span>
+  <span class="step">profile.sessionKey(headers)</span>
+  <span class="arrow">→</span>
+  <span class="step">裸 keyId</span>
+  <span class="arrow">→</span>
+  <span class="step">autoConversationId mint/reuse</span>
+</div>
+
+<h3>链 B — codex / workbuddy handler（<code>codexHandler.ts:352-353</code>）</h3>
+<div class="flow">
+  <span class="step">extractCodexSessionId</span>
+  <span class="arrow">→</span>
+  <span class="step">${keyId}:${traceId}</span>
+</div>
+
+<div class="callout warn">
+  <strong>关键纠错</strong>：<code>${keyId}:${traceId}</code> 里的 <code>traceId = uuidv7()</code>（<code>codexHandler.ts:281</code>）<strong>每请求新建</strong>，所以它是「每请求必变」的伪 key，跨轮 compositeKey 永不命中——「能转发，不能记忆」。而链 A 的裸 <code>keyId</code> 是跨轮稳定的。
+</div>
+
+<h3>「能记忆」的判据不是「有没有 sid」，而是「降级 key 是否跨轮稳定」</h3>
+<table>
+  <tr><th>降级层</th><th>跨轮稳定性</th><th>能转发</th><th>能记忆</th></tr>
+  <tr><td>显式 sid</td><td>稳定</td><td>✅</td><td>✅ 精确</td></tr>
+  <tr><td>裸 keyId（链 A fallback）</td><td>稳定</td><td>✅</td><td>⚠️ 能记但会串（同 key 并行会话合并）</td></tr>
+  <tr><td>${keyId}:${traceId}（链 B fallback）</td><td>每请求变</td><td>✅</td><td>❌ 必断</td></tr>
+  <tr><td>autoConversationId</td><td>稳定但受限</td><td>✅</td><td>⚠️ 能记，但纯内存、不回传、TTL 30min、串并行</td></tr>
+</table>
+
+<h2 id="s4"><span class="num">四</span>方案探索历程</h2>
+
+<h3>4.1 两阶段 sid 探测 <span class="tag verdict-no">否决</span></h3>
+<p>复用 session-init「伪造 form + 不转发上游」机制，第零轮让 LLM 用 agent 的 bash/read 工具找 sid、固定格式回传 proxy。</p>
+<div class="callout ok">
+  opik trace 实证（<code>try-reports/opik-trace-report.html</code>）：agent ↔ 上游 LLM 所有通信经 proxy；LLM 的 tool_call 经 proxy 回 agent、<strong>工具在 agent 侧执行</strong>（<code>ReadTool.execute</code>），tool_result 下轮经 proxy 回 LLM。所以「LLM 通过 agent 通用工具间接访问 agent 本地资源」是成立的。
+</div>
+<p>WorkBuddy 自身实测：<code>env | grep -i session</code> 一行命中 <code>CODEBUDDY_SESSION_ID</code>，且能靠「jsonl 实时写入 + 时间戳」确认是当前 session。</p>
+<p><strong>否决理由</strong>：① 依赖 LLM 探索，不可靠；② env 探测会带出 Bearer token（安全副作用）；③ dsh 进程内 sid 通用工具够不到；④ 本质是 autoConversationId 的「value 来源升级」（mint 伪 UUID → 探测真实 sid），而非「让 session-init 能跑」的前提——而后者 autoConversationId 已覆盖。</p>
+
+<h3>4.2 构造 vs 寻找 <span class="tag verdict-yes">结论：构造更优</span></h3>
+<table>
+  <tr><th>维度</th><th>构造 sid（autoConversationId 思路）</th><th>寻找 sid（两阶段探测）</th></tr>
+  <tr><td>依赖</td><td>零（不依赖 agent 发 header / 落盘 / LLM）</td><td>依赖 LLM 探索 + sid 落盘</td></tr>
+  <tr><td>确定性</td><td>纯函数/分配器</td><td>LLM 能力，不确定</td></tr>
+  <tr><td>延迟</td><td>零</td><td>多一轮</td></tr>
+  <tr><td>泄漏风险</td><td>无</td><td>env 探测带 token</td></tr>
+  <tr><td>通用性</td><td>所有 agent</td><td>进程内型（dsh）除外</td></tr>
+</table>
+<p class="lead">sid 是 proxy 的需求，不是 agent 的事实；满足需求靠「构造」就够了，「寻找」是过度设计。</p>
+
+<h3>4.3 compaction 死穴（内容型 sid 的致命伤）</h3>
+<p>开源 PR <a href="https://github.com/TencentCloud/TencentDB-Agent-Memory/pull/1138" style="color:var(--accent)">#1138</a>（Cursor 适配器）提出「首条 user prompt hash」构造 sid：</p>
+<pre><code>sid = "cursor-" + sha256( JSON.stringify([body.user, 首条 block 型 user 消息 content]) ).hex.slice(0,32)</code></pre>
+<p>这本质是 <code>autoConversationId</code> 的 <code>per-key-msg</code> 单 agent 特化。它的致命问题是<strong>怕 compaction</strong>——compaction 恰恰丢弃首条 prompt。</p>
+
+<h3>主流 agent 的 compaction 行为</h3>
+<table>
+  <tr><th>agent</th><th>compaction 机制</th><th>首条 prompt 保留吗</th></tr>
+  <tr><td><strong>Codex CLI</strong></td><td>「用户消息神圣不可侵犯」：只删 assistant/tool，保留所有 user 消息</td><td>✅ <strong>保留</strong>（local path）</td></tr>
+  <tr><td>Claude Code</td><td><code>/compact</code> 用摘要替换整个历史</td><td>❌ 丢（压进摘要）</td></tr>
+  <tr><td>Cursor / Cline</td><td>摘要作为新会话起点</td><td>❌ 丢</td></tr>
+  <tr><td>OpenCode</td><td>可逆隐藏 + 回放最后一条 user</td><td>❌ 只回放最后一条</td></tr>
+</table>
+
+<div class="callout warn">
+  摘要的「角色/位置」本身也不统一：codex local 是 <code>user</code> 角色（<code>_summary</code> 前缀）、codex remote 是 AES 加密 blob、Claude Code 旧版 TS 是 <code>user</code>（<code>isCompactSummary:true</code>）、新版 Rust 重写后是 <code>system</code>（带 <code>compact_boundary</code>）。<strong>同一 agent 的摘要角色都跨版本变过</strong>——这是内部实现细节，不是可依赖的协议约定。
+</div>
+<div class="callout">
+  因果链闭合：<strong>历史单调累积 → 撞上下文窗口 → compaction → 丢首条/改写摘要 → 内容型 sid 失效</strong>。任何锚定在消息内容上的 sid，都站在这条会被 compaction 改写的链上。
+</div>
+
+<h2 id="s5"><span class="num">五</span>锚点选择的两个必要条件</h2>
+<p class="lead">一个能当 sid 锚点的东西，必须同时满足：<strong>① 在每轮请求里（proxy 拿得到）+ ② 跨轮稳定（不变）</strong>。</p>
+<table>
+  <tr><th>候选锚点</th><th>① 在请求里</th><th>② 稳定</th><th>结论</th></tr>
+  <tr><td>首条 user prompt</td><td>✅（历史每轮重发）</td><td>❌（compaction 丢）</td><td>不可靠</td></tr>
+  <tr><td>compaction 摘要</td><td>✅（历史里）</td><td>❌（每次 merge 变）</td><td>不可靠</td></tr>
+  <tr><td>session 标题</td><td>❌（只在 title-gen 出现一次）</td><td>✅</td><td>不可达</td></tr>
+  <tr><td><strong>账户 / keyId / 工作区</strong></td><td>✅（header/body/system）</td><td>✅</td><td>✅ <strong>唯一双满足</strong></td></tr>
+</table>
+<p>标题的问题是「对称但方向相反」：首条/摘要「在请求里但不稳定」，标题「稳定但不在请求里」。账户/keyId/工作区是唯一「既在请求里、又稳定」的——会话级不变量。</p>
+
+<h2 id="s6"><span class="num">六</span>最终 solution：S1 + S2 + S3</h2>
+<div class="callout ok">
+  约束：<strong>不改核心架构与设计思路</strong>（sid 仍是 compositeKey 跨轮键、session-init 状态机不变、记忆按三元组归属不变、push 注入不变）。solution 只能落在「agent 不传 sid 时，sessionKey 如何稳定构造」这一环 = <code>autoConversationId</code>（<code>conversation-allocator.ts</code>）的增强。
+</div>
+
+<h3>S1 — 持久化 allocator <span class="tag verdict-yes">解「跨重启/pod 丢」</span></h3>
+<p><code>conversation-allocator.ts</code> 的 <code>byAlias</code> / <code>lastActive</code> 是纯 <code>Map</code>，进程重启全丢、多 pod 各存各的。解法：落到 Redis/SQLite，复用 <code>SessionStore</code> 的 L2 存储层，只换存储后端，不碰 key 语义。</p>
+
+<h3>S2 — 不变量升级 <span class="tag verdict-yes">解「per-key 串并行」</span></h3>
+<p>alias 从 <code>keyId</code> 升级成 <code>keyId + X-User-Id/body.user + workspace_folder</code>（<code>identity.ts</code> 已提取）。这些是「账户/工作区级不变量」，比 keyId 细、且抗 compaction，能分开「不同工作区的并行会话」。</p>
+
+<h3>S3 — 抗 compaction 指纹 <span class="tag verdict-partial">解「per-key-msg 怕 compaction」</span></h3>
+<p><code>firstUserFingerprint</code>（取首条 hash）改成「最近 N 轮滚动指纹」——compaction 专丢最老、不动最近 N 轮（保护区），故滚动指纹抗 compaction。仍不能区分「最近 N 轮内容相同的并行会话」，但把脆弱点从「必被 compaction 打」挪到「极少数极端场景」。</p>
+
+<div class="concl">
+  <div class="title">诚实边界</div>
+  <p style="margin:0">S1+S2+S3 能做到「优化常见路径 + 兜底极端场景」，<strong>不是完美解决</strong>。同账户、同工作区、真正并行的多个会话仍无法区分——这不是工程没做够，是信息论约束：<strong>无 header 的请求流里，没有信息能区分「同账户同工作区的两个并行会话」</strong>。</p>
+</div>
+
+<h2 id="s7"><span class="num">七</span>已否决方案清单</h2>
+<table>
+  <tr><th>方案</th><th>否决原因</th></tr>
+  <tr><td>MCP server</td><td>拉式工具模型，与「push 注入」目标根本方向分歧</td></tr>
+  <tr><td>三元组降维（跨轮键 sid → 三元组）</td><td>碰核心设计思路</td></tr>
+  <tr><td>响应流埋点（响应末尾注入 sid marker）</td><td>污染响应文本</td></tr>
+  <tr><td>两阶段 sid 探测（LLM 用 bash 找 sid）</td><td>依赖 LLM 不可靠 + token 泄漏 + 进程内型够不到</td></tr>
+  <tr><td>首条 user prompt hash</td><td>怕 compaction（首条被摘要替换）</td></tr>
+  <tr><td>compaction 摘要 hash + 换 sid</td><td>识别脆弱 + 摘要连环变 + 状态迁移复杂，本质仍是内容型 sid</td></tr>
+  <tr><td>session 标题做锚点</td><td>稳定但不在请求里（不可达）</td></tr>
+</table>
+
+<h2 id="s8"><span class="num">八</span>关键源码索引</h2>
+<table>
+  <tr><th>文件</th><th>关键点</th></tr>
+  <tr><td><code>session/session-key.ts</code></td><td><code>resolveConversationId</code>（6 个硬编码 header）、<code>resolveCursorConversationId</code>（首条 hash，PR #1138）</td></tr>
+  <tr><td><code>session/conversation-allocator.ts</code></td><td><code>autoConversationId</code>：per-key / per-key-msg 策略、<code>firstUserFingerprint</code></td></tr>
+  <tr><td><code>handler.ts</code></td><td>链 A 降级链（:663）、autoConversationId 分配块（:728-755）</td></tr>
+  <tr><td><code>codexHandler.ts</code></td><td><code>extractCodexSessionId</code>（:167）、<code>${keyId}:${traceId}</code>（:353）、<code>traceId = uuidv7()</code>（:281）</td></tr>
+  <tr><td><code>workbuddyHandler.ts</code></td><td><code>extractWorkbuddySessionId</code>（:161）、<code>${keyId}:${traceId}</code>（:875）</td></tr>
+  <tr><td><code>identity.ts</code></td><td><code>extractClientIdentity</code>：keyId、sessionId、wechatWorkId、<code>workspace_folder</code> 提取</td></tr>
+  <tr><td><code>session/store.ts</code></td><td><code>SessionStore</code>：compositeKey 作 Map key、L1/L2a/L2b 三层</td></tr>
+  <tr><td><code>session/codebuddy/init.ts</code></td><td>session-init 状态机（pending_* → initialized）</td></tr>
+  <tr><td><code>session/context-injector.ts</code></td><td><code>&lt;session_context&gt;</code> 注入（[Agent]/[Task]，无 sid）</td></tr>
+</table>
+
+<footer>
+  <p>本报告由 TencentDB-Agent-Memory 项目讨论沉淀而成，覆盖 2026-08-25 至 08-26 的完整推理链。</p>
+  <p>约束底线：不改核心架构（sid 跨轮键 / session-init 状态机 / 三元组归属 / push 注入），只在不传 sid 时的 sessionKey 构造这一环找 solution。</p>
+</footer>
+
+</div>
+</body>
+</html>

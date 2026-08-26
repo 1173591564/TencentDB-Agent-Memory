@@ -77,6 +77,7 @@ export function parsePresetIdentity(
 export function resolvePresetIdentity(
   teams: TeamOption[],
   preset: PresetIdentity,
+  policy: "skip" | "default" | "reject" = "reject",
 ): PresetResolution {
   const res: PresetResolution = { canRegister: false, hadMismatch: false };
   if (!preset.teamId) return res;
@@ -101,10 +102,8 @@ export function resolvePresetIdentity(
     else res.hadMismatch = true;
   }
 
-  // team + agent + task 三者齐全（且无 mismatch）→ 才走"直接登记"快捷路径。
-  // 与 CC/CB completeRegistration 的守卫一致：缺 task 直接 bypass，不再"只注入
-  // agent"；header 缺 task_id 时也不走 shortcut，回退到交互式流程（该流程内部
-  // 的 auto-select 级联在 tasks.length===0 时也会 bypass）。
-  res.canRegister = !!res.agentId && !!res.taskId && !res.hadMismatch;
+  // team + agent 齐全（且无 mismatch）即可走"直接登记"快捷路径。
+  // task 缺失时按 policy 决定：reject = 旧行为要求三者齐全；skip/default 允许不绑 task。
+  res.canRegister = !!res.agentId && !res.hadMismatch && (!!res.taskId || policy !== "reject");
   return res;
 }

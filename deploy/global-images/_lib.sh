@@ -77,6 +77,15 @@ find_docker() {
 
 DOCKER="$(find_docker)"
 
+# Windows Git Bash 没有 /usr/bin/curl，走 PATH 里的 curl（mingw64）
+if [[ -x /usr/bin/curl ]]; then
+  CURL=/usr/bin/curl
+elif command -v curl >/dev/null 2>&1; then
+  CURL="$(command -v curl)"
+else
+  die "找不到 curl。请安装 curl，或在 Git Bash / Linux 环境下运行。"
+fi
+
 # PULL=1 时拉取镜像最新版本。
 # 默认关闭：docker run 在本地没有镜像时会自动拉，但本地已有同名 :latest 时会直接复用，
 # 不会感知远端更新——想升级到最新 latest 就带 PULL=1。

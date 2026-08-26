@@ -513,6 +513,13 @@ sessionInit:
     agentHeader: "x-agent-id" # 携带 agent_id 的请求头名
     taskHeader: "x-task-id"  # 携带 task_id 的请求头名（可选）
     onMismatch: "form"       # header 值查不到时：form=回退交互表单（默认）| bypass=跳过 session init
+  # 缺 x-task-id 时的策略：skip=不绑 task 仅注入 Agent 级（默认）| default=用 defaultTaskId 占位 | reject=旧行为 bypass
+  taskMissingPolicy: "skip"
+  # 未携带任何 conversation/session 头时按 API key 自动分配会话 ID（显式头永远优先）
+  autoConversationId:
+    enabled: true
+    ttlMinutes: 30
+    strategy: "per-key"   # per-key=单活跃会话（新对话 mint，多轮/tool 按 key 续接）| per-key-msg=按首条消息区分多窗口
 
   # ── DEBUG：本地开发/e2e 短路 ────────────────────────────────────────────────
   # 打开 debugForceIdentity 后，agentSource=workbuddy 和 agentSource=codebuddy

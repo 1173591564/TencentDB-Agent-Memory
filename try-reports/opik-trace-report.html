@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TencentDB Agent Memory × OpenCode 全链路追踪报告</title>
 <style>
-:root{--bg:#f6f7f9;--card:#ffffff;--border:#e3e6ea;--text:#1a1d21;--muted:#6b7280;--blue:#185fa5;--blue-d:#0c447c;--blue-bg:#e6f1fb;--green:#0f6e56;--green-bg:#e1f5ee;--amber:#854f0b;--amber-bg:#faeeda;--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
+:root{--bg:#0a0c13;--card:#12151f;--border:#242a3d;--text:#e8ebf4;--muted:#97a0b8;--blue:#7c9eff;--blue-d:#aac3f6;--blue-bg:rgba(124,158,255,.16);--green:#4fd1c5;--green-bg:rgba(79,209,197,.13);--amber:#f6c177;--amber-bg:rgba(246,193,119,.13);--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.65;font-size:15px}
 .wrap{max-width:1080px;margin:0 auto;padding:32px 24px 64px}
@@ -120,34 +120,137 @@ details.wexp>summary::-webkit-details-marker{display:none}
 .wlwindow{position:absolute;top:5px;height:15px;border:1px dashed #b7c1ce;border-radius:5px;background:repeating-linear-gradient(135deg,#f4f6f9,#f4f6f9 4px,#eaf0f5 4px,#eaf0f5 8px);display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:500;color:#5a6472;box-sizing:border-box;white-space:nowrap;overflow:hidden}
 .wlwindow span{padding:0 4px}
 .wdnbar{position:absolute;top:4px;height:17px;border:1.5px dashed #2ecc9b;border-radius:5px;display:flex;align-items:center;padding:0 10px;font-size:11.5px;color:#0f6e56;white-space:nowrap}
+
+/* ── Series unified dark-theme overrides ── */
+.b-gray{background:rgba(151,160,184,.14);color:#97a0b8}
+table{background:#12151f !important;color:#e8ebf4 !important;border-color:#242a3d !important}
+table th,table td{background:#181c29 !important;color:#e8ebf4 !important;border:1px solid #242a3d !important;padding:8px 10px !important}
+[style*="background:#fbfbff"]{background:#12151f !important}
+[style*="background:#eef1f4"]{background:#1e2333 !important;border-color:#2c3350 !important}
+[style*="background:#f4f5f7"]{background:#161a26 !important;border-color:#242a3d !important}
+[style*="#f4f5f7"]{border-color:#242a3d !important}
+pre.light{background:#0c0f18;color:#c8d0e6}
+.tag{background:rgba(151,160,184,.14);color:#97a0b8}
+.note{background:rgba(246,193,119,.08);color:#e8d5b0}
+.essence{background:rgba(124,158,255,.08);color:#aac3f6}
+.essence .track{color:#97a0b8}
+.wfc{background:#12151f;border-color:#242a3d}
+.wfhd{border-bottom-color:#1b2031;background:#181c29}
+.wfhd-t{color:#e8ebf4}
+.wfhd-s{color:#97a0b8}
+.wfgrid i{background:#1b2031}
+.wftime{color:#8a93ab}
+.wrow{border-bottom-color:#1b2031}
+.wrow:hover{background:#181c29}
+.wname{color:#c8d0e6}
+.wtag{background:#1e2333;color:#97a0b8}
+.wess{color:#97a0b8}
+.wbar .out{color:#8a93ab}
+.connector::before{background:#2c3350}
+.connector::after{background:#2c3350}
+.wlegend{background:#181c29;border-top-color:#1b2031;color:#97a0b8}
+.toc a{color:#97a0b8}
+.toc a:hover{background:#181c29}
+.toc a.on{color:#aac3f6;border-left-color:#7c9eff;background:rgba(124,158,255,.12)}
+.toc a.sub{color:#6b7490}
+.wseq{color:#9db4f0;background:#0a0c13;box-shadow:0 0 0 2px #0a0c13}
+.wseq.par{color:#97a0b8}
+.wseq.asy{color:#4fd1c5}
+.wpill{color:#97a0b8;background:#1e2333}
+.naxis{color:#f6c177}
+details.wexp{border-bottom-color:#1b2031}
+.wfnest{background:#161a26;border-bottom-color:#1b2031}
+.ntree{color:#c8d0e6}
+.ndur{color:#8a93ab}
+.wgap{background:repeating-linear-gradient(135deg,#1e2333,#1e2333 5px,#161a26 5px,#161a26 10px)}
+.wgap span{color:#f6c177;background:rgba(246,193,119,.12)}
+.wfgrid i.major{background:#2c3350}
+.wfhatch{background:repeating-linear-gradient(135deg,#161a26,#161a26 5px,#1e2333 5px,#1e2333 10px);border-left-color:#2c3350;border-right-color:#2c3350}
+.wsect{color:#97a0b8;background:#181c29;border-top-color:#1b2031}
+.wlwindow{border-color:#2c3350;background:repeating-linear-gradient(135deg,#161a26,#161a26 4px,#1e2333 4px,#1e2333 8px);color:#97a0b8}
+.wdnbar{color:#4fd1c5}
+svg[viewBox]{filter:invert(.92) hue-rotate(180deg);border-radius:8px}
+a{color:#7c9eff}
+/* unified section headings (series standard: .sec badge + h3 marker) */
+h2{display:flex;align-items:center;gap:14px;font-size:23px;font-weight:700;margin:52px 0 12px;letter-spacing:-.3px;padding-left:0;border-left:none}
+h2 .sec{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;min-width:38px;height:38px;border-radius:12px;background:rgba(124,158,255,.14);border:1px solid rgba(124,158,255,.35);color:#7c9eff;font-family:var(--mono);font-size:15px;font-weight:700}
+h3{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700;margin:24px 0 10px;color:var(--text)}
+h3::before{content:"";width:8px;height:8px;border-radius:3px;background:linear-gradient(135deg,#7c9eff,#4fd1c5);flex-shrink:0}
+code{font-family:var(--mono);background:#181c29;padding:1.5px 7px;border-radius:5px;font-size:12.5px;color:#aac3f6;border:1px solid var(--border)}
+li::marker{color:#7c9eff}
+.panel{border-radius:12px}
+.card{border-radius:12px}
+.panel h3:first-child{margin-top:0}
+h2,h3{scroll-margin-top:74px}
+/* collapsible details interaction (exclude waterfall .wexp) */
+details:not(.wexp){background:rgba(13,16,25,.55);border:1px solid var(--border);border-radius:10px;margin:10px 0;padding:2px 14px}
+details:not(.wexp) summary{cursor:pointer;font-weight:600;color:#aac3f6;font-size:13.5px;padding:10px 0;list-style:none;display:flex;align-items:center;gap:8px}
+details:not(.wexp) summary::-webkit-details-marker{display:none}
+details:not(.wexp) summary::before{content:"▸";color:#7c9eff;transition:transform .15s ease;font-size:12px}
+details:not(.wexp)[open] summary::before{transform:rotate(90deg)}
+details:not(.wexp) summary:hover{color:#e8ebf4}
+details:not(.wexp) pre.light{margin:0 0 12px}
+/* unified series header */
+header{margin:0 0 24px;padding:44px 44px 36px;position:relative;background:linear-gradient(180deg,rgba(124,158,255,.06),rgba(124,158,255,0) 85%),var(--card);border:1px solid var(--border);border-radius:18px;overflow:hidden}
+header .eyebrow{color:#b794f6;font-size:12px;letter-spacing:3px;text-transform:uppercase;font-weight:700;margin-bottom:12px}
+header h1{margin:0 0 10px;font-size:38px;font-weight:800;letter-spacing:-1px;line-height:1.15;background:linear-gradient(120deg,#ffffff 20%,#b9c6f4 55%,#9fd8cf 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+header h1 .sub{-webkit-text-fill-color:var(--muted);background:none;font-weight:400}
+/* unified top toc (pill style, matches series standard) */
+.layout{display:block;max-width:1200px;margin:0 auto;padding:0 32px}
+.layout .wrap{max-width:none;flex:none;min-width:0;margin:0;padding:32px 0 64px;width:100%}
+.layout .toc{position:sticky;top:12px;z-index:50;width:auto;height:auto;max-height:none;overflow:visible;display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:10px 14px;margin:0 0 28px;background:rgba(13,16,25,.84);backdrop-filter:blur(14px);border:1px solid var(--border);border-radius:14px}
+.toc-t{display:none}
+.toc a{display:inline-block;color:var(--muted);text-decoration:none;font-size:12.5px;padding:4px 12px;border-radius:999px;border:1px solid transparent;transition:all .15s ease;white-space:nowrap}
+.toc a .n{color:#7c9eff;font-weight:700;margin-right:5px;font-family:var(--mono)}
+.toc a:hover{color:var(--text);background:#1e2333;border-color:var(--border)}
+.toc a.on{color:var(--text);background:rgba(124,158,255,.16);border-color:#7c9eff;font-weight:600}
+.toc a.sub{padding-left:12px;font-size:12px;color:#6b7490}
+.toc a.sub.on{color:var(--text)}
+.toc-top{margin:0 0 0 8px;font-size:11px;color:var(--muted)}
+.toc-top a{display:inline-block;padding:4px 10px;border:none;font-size:11px;color:var(--muted)}
+.toc-top a:hover{color:var(--text);background:#1e2333;border-radius:999px}
 </style>
 </head>
 <body>
 <div class="layout">
+<div class="wrap">
+<header>
+  <div class="eyebrow">TencentDB Agent Memory · 调研报告系列 · 第 ① 篇</div>
+  <h1>OpenCode 全链路追踪报告</h1>
+  <div style="font-size:14px;color:var(--muted);margin:0 0 6px">基于 Opik 实测数据 · 请求：「审阅 MemoryProxy/src/opik.ts 的 Opik 上报逻辑」· 2026-08-21 14:07</div>
+  <div style="margin-top:14px">
+    <span class="badge b-blue">opencode</span><span class="badge b-blue">Memory Proxy</span><span class="badge b-blue">DeepSeek</span><span class="badge b-green">memory-core</span><span class="badge b-gray">Opik 观测</span>
+  </div>
+</header>
+
+<nav class="series-nav" style="margin:18px 0 4px;padding:13px 18px;background:#12151f;border:1px solid #242a3d;border-radius:12px;line-height:1.6;">
+  <div style="font-size:11px;color:#6b7490;letter-spacing:.8px;margin-bottom:7px;">TENANTDB AGENT MEMORY · 调研报告系列 · 观测 → 机制 → 例外 → 收敛</div>
+  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:5px;font-size:13px;">
+    <span style="color:#e8ebf4;padding:3px 10px;border-radius:6px;border:1px solid #7c9eff;background:rgba(124,158,255,.2);font-weight:600;">① 流量观测</span>
+    <span style="color:#6b7490;">›</span>
+    <a href="session-init-flow.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">② 身份机制</a>
+    <span style="color:#6b7490;">›</span>
+    <a href="dsh-native-integration-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">③ headless 例外</a>
+    <span style="color:#6b7490;">›</span>
+    <a href="sid-session-key-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">④ sid 收敛</a>
+  </div>
+</nav>
+
 <nav class="toc">
 <div class="toc-t">目录</div>
-<a href="#sec-1">1 · 全链路时序</a>
-<a href="#sec-2">2 · Span Waterfall</a>
+<a href="#sec-1"><span class="n">01</span>全链路时序</a>
+<a href="#sec-2"><span class="n">02</span>Span Waterfall</a>
 <a class="sub" href="#wf-band">时间轴顶带</a>
 <a class="sub" href="#wf-main">主链（蓝 + 紫芯）</a>
 <a class="sub" href="#wf-support">支撑层窗口</a>
 <a class="sub" href="#wf-down">下游沉淀</a>
-<a href="#sec-3">3 · LLM 调用详情</a>
-<a href="#sec-4">4 · 工具调用（read）</a>
-<a href="#sec-5">5 · 注入 diff</a>
-<a href="#sec-6">6 · 记忆沉淀</a>
-<a href="#sec-7">7 · 关键发现</a>
+<a href="#sec-3"><span class="n">03</span>LLM 调用详情</a>
+<a href="#sec-4"><span class="n">04</span>工具调用（read）</a>
+<a href="#sec-5"><span class="n">05</span>注入 diff</a>
+<a href="#sec-6"><span class="n">06</span>记忆沉淀</a>
+<a href="#sec-7"><span class="n">07</span>关键发现</a>
 <div class="toc-top"><a href="#">回到顶部</a></div>
 </nav>
-<div class="wrap">
-<header>
-<h1>TencentDB Agent Memory × OpenCode 全链路追踪报告
-<span class="sub">基于 Opik 实测数据 · 请求：「审阅 MemoryProxy/src/opik.ts 的 Opik 上报逻辑」· 2026-08-21 14:07</span>
-</h1>
-<div style="margin-top:14px">
-<span class="badge b-blue">opencode</span><span class="badge b-blue">Memory Proxy</span><span class="badge b-blue">DeepSeek</span><span class="badge b-green">memory-core</span><span class="badge b-gray">Opik 观测</span>
-</div>
-</header>
 
 <div class="cards">
 <div class="card"><div class="num">2</div><div class="lbl">LLM 调用轮次（946ms + 6314ms）</div></div>
@@ -158,7 +261,7 @@ details.wexp>summary::-webkit-details-marker{display:none}
 
 <div class="note">本报告所有数据均为 Opik 真实捕获，可对照 Opik UI（http://localhost:5173）逐一核验。opencode 侧 project=<code>opencode</code>，proxy 侧 project=<code>usr-d03quwpa51</code>。</div>
 
-<h2 id="sec-1">1. 全链路时序（逻辑层）</h2>
+<h2 id="sec-1"><span class="sec">1</span>全链路时序（逻辑层）</h2>
 <div class="panel">
 
 <div style="margin-bottom:12px">
@@ -191,7 +294,7 @@ details.wexp>summary::-webkit-details-marker{display:none}
 </div>
 
 
-<h2 id="sec-2">2. Span Waterfall（3 层泳道 · 非均匀时间轴）</h2>
+<h2 id="sec-2"><span class="sec">2</span>Span Waterfall（3 层泳道 · 非均匀时间轴）</h2>
 <p style="font-size:14px;color:var(--muted);margin-bottom:12px">时间轴 39.3s→55.2s 分 5 段、段宽＝耗时：第 1 轮段加宽（看清 110ms 的 read），两间隙压成斜纹但标了真实耗时。读条：<b>蓝</b>＝opencode 侧调用（条长＝耗时），<span class="hl">紫芯＝经 Memory Proxy 注入后转发 LLM 的时长</span>，<b>灰窗</b>＝数百个重叠框架 span 的覆盖范围。紫芯数字＝proxy 记时；蓝边＝wrapper 差值（第 1 轮 105ms · 第 2 轮 0ms）。三层读图顺序：<b>A 主链</b> → <b>B 支撑层</b> → <b>C 下游</b>。</p>
 <div class="wfc">
 <div class="wfhd"><div class="wfhd-t">一轮对话的完整生命周期 · opencode → Memory Proxy → DeepSeek → memory-core</div><div class="wfhd-s">969 span · 蓝＝opencode 侧 · 紫芯＝Memory Proxy 注入后 · 灰窗＝框架层 · 段边界数字＝真实秒数</div></div>
@@ -279,7 +382,7 @@ details.wexp>summary::-webkit-details-marker{display:none}
 </div>
 </div>
 
-<h2 id="sec-3">3. LLM 调用详情（每轮的本质）</h2>
+<h2 id="sec-3"><span class="sec">3</span>LLM 调用详情（每轮的本质）</h2>
 
 
 <div class="panel">
@@ -450,7 +553,7 @@ Output text to communicate with the user; all text you output outsi...（system 
 要我直接改掉其中某几处（如给缺失 `forkTraceId` 加 warn、抽取公共 fire 函数）吗？</pre></details>
 </div>
 
-<h2 id="sec-4">4. 工具调用详情（read）</h2>
+<h2 id="sec-4"><span class="sec">4</span>工具调用详情（read）</h2>
 <div class="panel">
 <div class="kpi">
 <div><div class="n">read</div><div class="t">工具名</div></div>
@@ -527,7 +630,7 @@ Output text to communicate with the user; all text you output outsi...（system 
 59:...</pre></details>
 </div>
 
-<h2 id="sec-5">5. 注入 diff（TencentDB Agent Memory 的核心价值）</h2>
+<h2 id="sec-5"><span class="sec">5</span>注入 diff（TencentDB Agent Memory 的核心价值）</h2>
 <div class="panel">
 <div class="kpi">
 <div><div class="n">9653</div><div class="t">注入前 system（字符）</div></div>
@@ -703,7 +806,7 @@ curl -sfk -X POST &lt;bridge&gt;/atomic/search \
 &lt;/memory-tools-guide&gt;</pre></details>
 </div>
 
-<h2 id="sec-6">6. 记忆沉淀（memory-core 异步 pipeline）</h2>
+<h2 id="sec-6"><span class="sec">6</span>记忆沉淀（memory-core 异步 pipeline）</h2>
 <div class="panel">
 <p style="font-size:14px;color:var(--muted);margin-bottom:10px">对话结束后，后台 pipeline 把 L0 对话逐层抽取为 L1 原子记忆 → L2 场景 → L3 画像。本次审阅任务沉淀出一个专属 L2 场景「技术研究-MemoryProxy-Opik」。</p>
 <div class="kpi">
@@ -863,7 +966,7 @@ Summary: 用户审查 MemoryProxy 项目 src/opik.ts 的 Opik 上报逻辑，聚
 </pre></details>
 </div>
 
-<h2 id="sec-7">7. 关键发现</h2>
+<h2 id="sec-7"><span class="sec">7</span>关键发现</h2>
 <div class="panel">
 <ul style="padding-left:20px;font-size:13px;line-height:2">
 <li><strong>注入可 diff</strong>：opencode 的 <code>ai.streamText</code> span 记录注入前 messages，proxy 的 llm span 记录注入后 messages，两者相减即得注入内容（+7094 字符 / 4 块），<span class="hl">零改造即可观测</span>。</li>

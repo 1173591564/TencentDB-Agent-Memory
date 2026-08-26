@@ -549,15 +549,15 @@ model:
   extra_headers:
     x-team-id: <team_id from admin panel>
     x-agent-id: <agent_id from admin panel>
-    x-task-id: <task_id from admin panel>
-    x-conversation-id: <user-defined session identifier>
+    # x-task-id is optional: omit for Agent-level memory only.
+    # x-conversation-id is optional: Proxy auto-assigns and continues the session per API key.
 ```
 
 - `base_url`: Proxy address + `/hermes/<spaceId>` path. `<spaceId>` is the memory instance ID (from the admin panel, usually `default`)
 - `api_key`: user's `user_key` (from admin panel "API Key" page)
 - `x-team-id` / `x-agent-id`: obtained from the admin panel, same as CodeBuddy / Claude Code
-- `x-task-id`: obtained from admin panel "Task Management" page. **Required in the current version** — missing this field causes session registration to fail and memory features won't work (see [Known limitation: x-task-id](#known-limitation-x-task-id))
-- `x-conversation-id`: user-defined session identifier (see [Known limitation: x-conversation-id](#known-limitation-x-conversation-id))
+- `x-task-id`: optional. From the admin panel "Task Management" page; omit to register with Agent-level memory only (see [x-task-id is optional](#x-task-id-is-optional))
+- `x-conversation-id`: optional. If omitted, the Proxy auto-assigns a session ID (see [x-conversation-id auto-management](#x-conversation-id-auto-management))
 
 ## Using Proxy with OpenClaw
 
@@ -578,9 +578,7 @@ Edit `~/.openclaw/openclaw.json`, add a provider under `models.providers`:
         "api": "openai-completions",
         "headers": {
           "x-team-id": "<team_id from admin panel>",
-          "x-agent-id": "<agent_id from admin panel>",
-          "x-task-id": "<task_id from admin panel>",
-          "x-conversation-id": "<user-defined session identifier>"
+          "x-agent-id": "<agent_id from admin panel>"
         },
         "request": {
           "allowPrivateNetwork": true
@@ -604,7 +602,7 @@ Edit `~/.openclaw/openclaw.json`, add a provider under `models.providers`:
 
 - `baseUrl`: Proxy address + `/openclaw/<spaceId>` path
 - `apiKey`: user's `user_key`
-- `headers`: must include `x-team-id`, `x-agent-id`, `x-task-id`, `x-conversation-id`. `x-task-id` is required in the current version (see [Known limitation: x-task-id](#known-limitation-x-task-id))
+- `headers`: at least `x-team-id` and `x-agent-id`. `x-task-id` / `x-conversation-id` are optional (see below)
 - `models[].id`: must match the model ID configured in the Proxy upstream
 
 ## Using Proxy with Other Platforms (Generic)
@@ -631,10 +629,10 @@ The request path is automatically appended: `/v1/chat/completions` (OpenAI proto
 | `Authorization: Bearer <user_key>` | User's API key (from admin panel "API Key" page) |
 | `x-team-id` | Team ID |
 | `x-agent-id` | Agent ID |
-| `x-task-id` | Task ID (required in current version, see [Known limitation: x-task-id](#known-limitation-x-task-id)) |
-| `x-conversation-id` | Session identifier, managed by the client |
+| `x-task-id` | Task ID (optional; omit for Agent-level memory only, see [x-task-id is optional](#x-task-id-is-optional)) |
+| `x-conversation-id` | Session identifier (optional; Proxy auto-assigns if omitted, see [x-conversation-id auto-management](#x-conversation-id-auto-management)) |
 
-All headers are required — the Proxy uses them to complete session registration directly, bypassing the interactive form. Platforms that cannot provide these headers will trigger session bypass (no memory injection or conversation recording).
+`x-team-id` + `x-agent-id` is enough to register a session directly. Platforms that cannot send those two headers still hit the interactive form; Hermes / OpenClaw cannot fill forms, so they need at least these two. An invalid `x-task-id` is handled by `headerAutoSelect.onMismatch` (default `form`; Hermes deployments should set `bypass`).
 
 ## Optional: `sessionInit.defaultTaskId` (the "no task binding" option)
 
@@ -685,6 +683,11 @@ sessionInit:
   injectAgentContext: true
   injectTaskContext: true
   defaultTaskId: "no-task"     # any stable string; not required to exist in the kernel
+  taskMissingPolicy: "skip"    # skip | default | reject — missing x-task-id
+  autoConversationId:
+    enabled: true
+    ttlMinutes: 30
+    strategy: "per-key"
   headerAutoSelect:
     enabled: true
     teamHeader: "x-team-id"
@@ -787,30 +790,29 @@ when at least one asset injector is on the pipeline.
 > `PROXY_CONFIG_DIR` at a directory holding your own hand-edited
 > `config.yaml` and skip regeneration.
 
-## Known limitation: `x-task-id`
+## `x-task-id` is optional
 
-> ⚠️ **Current version limitation**: `x-task-id` is **required** for Hermes / OpenClaw.
+> `x-task-id` is no longer a hard requirement for Hermes / OpenClaw. `x-team-id` + `x-agent-id` is enough to register a session and inject **Agent-level** memory / skills. Add a valid `x-task-id` when you need task-scoped memory.
 >
-> The Proxy's header auto-select mechanism requires all three of `x-team-id` + `x-agent-id` + `x-task-id` to complete session registration directly. Without `x-task-id`, the Proxy falls back to an interactive form flow — which Hermes / OpenClaw cannot respond to, resulting in session bypass (no memory injection or conversation recording).
+> Proxy config `sessionInit.taskMissingPolicy`:
 >
-> Inconveniences:
+> - `skip` (default): do not bind a task; Agent-level injection only, plus a `<session_context>` notice to add `x-task-id`
+> - `default`: use `defaultTaskId` as a placeholder (same as picking "don't bind a task this time")
+> - `reject`: legacy behavior — missing task bypasses session init
 >
-> 1. Users must create a Task in the admin panel beforehand and obtain the `task_id`, increasing onboarding friction.
-> 2. Switching tasks requires manually editing the config file.
->
-> In the next version, we will make `x-task-id` optional: when not provided, the Proxy will auto-select the agent's default task or skip task binding entirely.
+> An invalid `x-task-id` is not silently ignored; it follows `headerAutoSelect.onMismatch` (default `form`; Hermes / OpenClaw should set `bypass`).
 
-## Known limitation: `x-conversation-id`
+## `x-conversation-id` auto-management
 
-> ⚠️ **Current version limitation**: Hermes and OpenClaw require `x-conversation-id` to be statically specified in the config file. This differs from Claude Code / CodeBuddy (where the SDK automatically manages the session ID).
+> When the request carries no conversation / session header, the Proxy mints a UUID per API key and continues it within a 30-minute sliding TTL (including tool-call follow-ups that drop extra headers). Explicit `x-conversation-id` / `x-session-id` / `x-deepseek-harness-session-id` (and the other recognized session headers) are used as-is.
 >
-> Current limitations:
+> Default `strategy: per-key`: a payload that looks like a new chat (at most one user message, no assistant/tool) opens a new conversation; multi-turn / tool rounds continue the key's active session. For parallel windows, set `per-key-msg` or send an explicit `x-conversation-id` per window.
 >
-> 1. **All requests sharing the same conversation ID belong to the same session** — memory injection and conversation recording are bound to this ID.
-> 2. **Starting a new conversation requires manually changing the conversation ID**, otherwise the previous session state continues.
-> 3. **Some clients may not carry extra headers on tool-call follow-up requests**, causing those turns to skip memory injection and conversation recording.
+> **OpenCode**: prefer its native per-request `X-Session-Id`. Do not hard-code `x-conversation-id` in provider headers (that would collapse every OpenCode session onto one ID).
 >
-> In the next version, the Proxy will support automatic generation and management of conversation IDs, eliminating the need for clients to specify this field manually.
+> **DeepSeek Harness**: already sends `x-deepseek-harness-session-id` on every request; no extra session header is needed.
+>
+> The allocator is in-process (TTL + LRU). Each pod assigns independently; cross-node consistency is not in this release.
 
 ## Stop / cleanup
 

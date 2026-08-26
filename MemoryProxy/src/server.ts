@@ -154,6 +154,12 @@ export function createApp(config: ProxyConfig): Hono {
       createSessionForceArchiveHandler(config)(c),
     );
   });
+  // experiment/dashboard-provider: 给 dsh 原生插件用的 session 写入端点（实验，无 admin 鉴权）
+  app.post("/v3/session/native-init", (c) => {
+    return import("./routes/session-native-init.js").then(({ createSessionNativeInitHandler }) =>
+      createSessionNativeInitHandler(config)(c),
+    );
+  });
 
   // ── Whitelisted primary endpoints ────────────────────────────────────────
   // Anthropic Messages API

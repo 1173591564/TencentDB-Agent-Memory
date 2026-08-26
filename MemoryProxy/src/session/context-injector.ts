@@ -38,11 +38,16 @@ interface TextBlock {
 const CTX_OPEN = "<session_context>";
 const CTX_CLOSE = "</session_context>";
 
+/** Injected when a session has an agent but no task (toggle-前判定). */
+export const NO_TASK_NOTICE =
+  "当前会话未关联任务，仅注入 Agent 级记忆；如需任务级记忆，请在请求头添加 x-task-id。";
+
 // ── Block builder ──────────────────────────────────────────────────────────────
 
 function buildContextBlock(
   agent: AgentDetail | null | undefined,
   task: TaskDetail | null | undefined,
+  notice?: string,
 ): string | null {
   if (!agent && !task) return null;
 
@@ -69,6 +74,12 @@ function buildContextBlock(
       lines.push("goal:");
       lines.push(task.goal);
     }
+  }
+
+  if (notice) {
+    if (lines.length > 1) lines.push("");
+    lines.push("[Notice]");
+    lines.push(notice);
   }
 
   lines.push(CTX_CLOSE);
@@ -107,8 +118,9 @@ export function injectSessionContext(
   messages: RawMessage[],
   agent: AgentDetail | null | undefined,
   task: TaskDetail | null | undefined,
+  notice?: string,
 ): RawMessage[] {
-  const block = buildContextBlock(agent ?? null, task ?? null);
+  const block = buildContextBlock(agent ?? null, task ?? null, notice);
   if (!block) return messages;
 
   const sysIdx = messages.findIndex((m) => m.role === "system");
@@ -176,7 +188,8 @@ export function injectSessionContextWithToggles(
 
   const agentForCtx = injectAgent ? (agent ?? null) : null;
   const taskForCtx = injectTask ? (task ?? null) : null;
-  return injectSessionContext(messages, agentForCtx, taskForCtx);
+  const notice = agent && !task ? NO_TASK_NOTICE : undefined;
+  return injectSessionContext(messages, agentForCtx, taskForCtx, notice);
 }
 
 /** Reset the warn-once dedup set. Test-only. */
@@ -210,7 +223,8 @@ export function buildSessionContextBlockWithToggles(
 
   const agentForCtx = injectAgent ? (agent ?? null) : null;
   const taskForCtx = injectTask ? (task ?? null) : null;
-  return buildContextBlock(agentForCtx, taskForCtx);
+  const notice = agent && !task ? NO_TASK_NOTICE : undefined;
+  return buildContextBlock(agentForCtx, taskForCtx, notice);
 }
 
 // ── Anthropic system-field variant ────────────────────────────────────────────
@@ -258,7 +272,8 @@ export function injectSessionContextIntoAnthropicSystem(
 
   const agentForCtx = injectAgent ? (agent ?? null) : null;
   const taskForCtx = injectTask ? (task ?? null) : null;
-  const block = buildContextBlock(agentForCtx, taskForCtx);
+  const notice = agent && !task ? NO_TASK_NOTICE : undefined;
+  const block = buildContextBlock(agentForCtx, taskForCtx, notice);
   if (!block) return system;
   return appendBlockToAnthropicSystem(system, block);
 }

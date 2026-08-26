@@ -97,6 +97,8 @@ export const DEFAULT_CONFIG: ProxyConfig = {
       taskHeader: "x-task-id",
       onMismatch: "form",
     },
+    taskMissingPolicy: "skip",
+    autoConversationId: { enabled: true, ttlMinutes: 30, strategy: "per-key" },
     // debugForceIdentity intentionally omitted — must be explicitly set in yaml
     // to activate the bypass path.
   },
@@ -407,6 +409,17 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
       agentHeader: (yaml.sessionInit?.headerAutoSelect?.agentHeader ?? DEFAULT_CONFIG.sessionInit.headerAutoSelect!.agentHeader).toLowerCase(),
       taskHeader: (yaml.sessionInit?.headerAutoSelect?.taskHeader ?? DEFAULT_CONFIG.sessionInit.headerAutoSelect!.taskHeader).toLowerCase(),
       onMismatch: yaml.sessionInit?.headerAutoSelect?.onMismatch ?? DEFAULT_CONFIG.sessionInit.headerAutoSelect!.onMismatch,
+    },
+    taskMissingPolicy: (() => {
+      const v = yaml.sessionInit?.taskMissingPolicy;
+      if (v === "skip" || v === "default" || v === "reject") return v;
+      if (v !== undefined) console.warn(`[config] sessionInit.taskMissingPolicy=${JSON.stringify(v)} 非法，回落 "skip"`);
+      return DEFAULT_CONFIG.sessionInit.taskMissingPolicy!;
+    })(),
+    autoConversationId: {
+      enabled: yaml.sessionInit?.autoConversationId?.enabled ?? DEFAULT_CONFIG.sessionInit.autoConversationId!.enabled!,
+      ttlMinutes: yaml.sessionInit?.autoConversationId?.ttlMinutes ?? DEFAULT_CONFIG.sessionInit.autoConversationId!.ttlMinutes!,
+      strategy: yaml.sessionInit?.autoConversationId?.strategy === "per-key-msg" ? "per-key-msg" : "per-key",
     },
     debugForceIdentity: yaml.sessionInit?.debugForceIdentity
       && typeof yaml.sessionInit.debugForceIdentity === "object"

@@ -643,8 +643,8 @@ export async function handleAnthropicMessages(
 
 // ── Session key: prefer conversation header, fallback to agent profile ───────────
   const { resolveConversationId } = await import("./session/session-key.js");
-  const conversationId = resolveConversationId(c);
-  const sessionKey = conversationId ?? resolveSessionKey(config, lcHeaders, c.req.path, body, keyId);
+  let conversationId = resolveConversationId(c);
+  let sessionKey = conversationId ?? resolveSessionKey(config, lcHeaders, c.req.path, body, keyId);
 
   // ── Auth verification (user_key → user_id) ──────────────────────────────────────
   // Reuse the early verify result — it ran before body parse to decide the
@@ -665,6 +665,32 @@ export async function handleAnthropicMessages(
   if (config.redis?.enabled) {
     const { getInjectionPipeline } = await import("./injection/index.js");
     getInjectionPipeline(config);
+  }
+
+  // ── autoConversationId：无显式会话头的 main 请求，按 API key 分配/复用会话 ID ──
+  // sidequery 不分配（对齐下方 skipSessionInit 语义）。
+  {
+    const { shouldAllocateConversationId, getConversationAllocator } = await import("./session/conversation-allocator.js");
+    const allocKeyId = apiKey ? apiKeyToKeyId(apiKey) : "unknown";
+    if (
+      shouldAllocateConversationId({
+        conversationId,
+        keyId: allocKeyId,
+        enabled: config.sessionInit?.autoConversationId?.enabled,
+        skip: requestKind === "sidequery",
+      })
+    ) {
+      const alloc = getConversationAllocator(config.sessionInit);
+      const a = alloc.resolve(
+        allocKeyId,
+        (body as { messages?: Array<Record<string, unknown>> }).messages ?? [],
+      );
+      conversationId = a.id;
+      sessionKey = conversationId;
+      console.log(
+        `[auto-conv] key=${allocKeyId} conversation=${a.id} isNew=${a.isNew} strategy=${config.sessionInit.autoConversationId?.strategy ?? "per-key"}`,
+      );
+    }
   }
 
   // ── Session Init (before injection pipeline) ─────────────────────────────

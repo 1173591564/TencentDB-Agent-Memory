@@ -659,8 +659,8 @@ export async function handleChatCompletions(
 
   // ── Session key: prefer conversation header, fallback to agent profile ───────────
   const { resolveConversationId } = await import("./session/session-key.js");
-  const conversationId = resolveConversationId(c);
-  const sessionKey = conversationId ?? resolveSessionKey(config, lcHeaders, c.req.path, body, keyId);
+  let conversationId = resolveConversationId(c);
+  let sessionKey = conversationId ?? resolveSessionKey(config, lcHeaders, c.req.path, body, keyId);
 
   // ── Auth verification (user_key → user_id) ──────────────────────────────────────
   // Reuse the early verify result — it ran before body parse to decide the
@@ -723,6 +723,35 @@ export async function handleChatCompletions(
   })();
   if (_dshHeadless) {
     console.log(`[request-classify] session=${sessionKey} agent=dsh headless/no-preset (no ask_user_question tool) → bypass session-init, direct passthrough`);
+  }
+
+  // ── autoConversationId：无显式会话头的 main 请求，按 API key 分配/复用会话 ID ──
+  // 显式头（含 dsh x-deepseek-harness-session-id / OpenCode X-Session-Id）在
+  // resolveConversationId 已命中，不会走到这里；auxiliary / dsh headless 不分配，
+  // 避免 title-gen/compact 污染映射；无合法 apiKey（allocKeyId="unknown"）不分配，
+  // 防止匿名请求共享同一会话。
+  {
+    const { shouldAllocateConversationId, getConversationAllocator } = await import("./session/conversation-allocator.js");
+    const allocKeyId = apiKey ? apiKeyToKeyId(apiKey) : "unknown";
+    if (
+      shouldAllocateConversationId({
+        conversationId,
+        keyId: allocKeyId,
+        enabled: config.sessionInit?.autoConversationId?.enabled,
+        skip: isAuxiliary || _dshHeadless,
+      })
+    ) {
+      const alloc = getConversationAllocator(config.sessionInit);
+      const a = alloc.resolve(
+        allocKeyId,
+        (body as { messages?: Array<Record<string, unknown>> }).messages ?? [],
+      );
+      conversationId = a.id;
+      sessionKey = conversationId;
+      console.log(
+        `[auto-conv] key=${allocKeyId} conversation=${a.id} isNew=${a.isNew} strategy=${config.sessionInit.autoConversationId?.strategy ?? "per-key"}`,
+      );
+    }
   }
 
   // ── Session Init (before injection pipeline) ─────────────────────────────

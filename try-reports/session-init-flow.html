@@ -364,7 +364,7 @@
 <div class="wrap">
 
 <header>
-  <div class="eyebrow">TencentDB Agent Memory · 设计讨论</div>
+  <div class="eyebrow">TencentDB Agent Memory · 调研报告系列 · 第 ② 篇</div>
   <h1>Session Init 机制</h1>
   <div class="sub">MemoryProxy 在请求入口的身份引导层 — coding agent 第一次对话时如何确定 (team, agent, task) 三元组</div>
   <div class="meta">
@@ -372,9 +372,22 @@
     <span><span class="dot" style="background:var(--proxy)"></span>MemoryProxy</span>
     <span><span class="dot" style="background:var(--llm)"></span>上游模型</span>
     <span><span class="dot" style="background:var(--core)"></span>MemoryCore</span>
-    <span>独立文档 · 与 opik-trace-report.html 无关联</span>
+    <span>系列第 ② 篇 · 身份机制（前接流量观测）</span>
   </div>
 </header>
+
+<nav class="series-nav" style="margin:18px 0 4px;padding:13px 18px;background:#12151f;border:1px solid #242a3d;border-radius:12px;line-height:1.6;">
+  <div style="font-size:11px;color:#6b7490;letter-spacing:.8px;margin-bottom:7px;">TENANTDB AGENT MEMORY · 调研报告系列 · 观测 → 机制 → 例外 → 收敛</div>
+  <div style="display:flex;flex-wrap:wrap;align-items:center;gap:5px;font-size:13px;">
+    <a href="opik-trace-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">① 流量观测</a>
+    <span style="color:#6b7490;">›</span>
+    <span style="color:#e8ebf4;padding:3px 10px;border-radius:6px;border:1px solid #7c9eff;background:rgba(124,158,255,.2);font-weight:600;">② 身份机制</span>
+    <span style="color:#6b7490;">›</span>
+    <a href="dsh-native-integration-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">③ headless 例外</a>
+    <span style="color:#6b7490;">›</span>
+    <a href="sid-session-key-report.html" style="color:#7c9eff;text-decoration:none;padding:3px 10px;border-radius:6px;border:1px solid #242a3d;background:#181c29;">④ sid 收敛</a>
+  </div>
+</nav>
 
 <nav class="toc">
   <a href="#positioning"><span class="n">01</span>整体定位</a>

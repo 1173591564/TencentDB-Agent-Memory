@@ -84,6 +84,12 @@ server:
 upstream:
   url: "${PROXY_UPSTREAM_URL}"
   apiKey: "${PROXY_UPSTREAM_API_KEY}"
+  # claude-code 客户端走 Anthropic Messages 协议；上游 DeepSeek 提供
+  # Anthropic 兼容端点，单独给它指过去，其余 OpenAI 协议 agent 仍走默认 url。
+  agents:
+    claude-code:
+      url: "${PROXY_ANTHROPIC_UPSTREAM_URL:-https://api.deepseek.com/anthropic}"
+      apiKey: "${PROXY_UPSTREAM_API_KEY}"
 
 log:
   file: ""
@@ -138,6 +144,12 @@ injection:
 
 redis:
   enabled: false
+
+# Opik LLM 可观测上报（Comet ML Opik）
+opik:
+  enabled: true
+  url: "${PROXY_OPIK_URL:-http://host.docker.internal:5173}"
+  apiKey: ""
 YAML
 
 info "启动 proxy (image=$PROXY_IMAGE, port=$PROXY_PORT)"

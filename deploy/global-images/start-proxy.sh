@@ -71,6 +71,17 @@ if [[ "$PROXY_ENABLE_SESSION_INIT" == "1" && "$PROXY_ENABLE_AUTH" != "1" ]]; the
   PROXY_ENABLE_AUTH=1
 fi
 
+# FULL_STACK 时激活持久化 storage（sqlite）→ SessionStore 挂上 BindingRepo，
+# memory-bridge / skill-bridge 的 L2 拍平 binding 才会落地（L1 前缀探测 miss
+# 时的设计兜底，见 docs/design/2026-08-03-binding-flatten.md）。不开时
+# storage.enabled=false → bindingRepo=null → bridge 只能靠 L1 内存命中。
+STORAGE_BLOCK=""
+if [[ "${PROXY_FULL_STACK:-0}" == "1" ]]; then
+  STORAGE_BLOCK='storage:
+  enabled: true
+  backend: sqlite'
+fi
+
 bool() { [[ "$1" == "1" ]] && echo "true" || echo "false"; }
 
 info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI))"
@@ -135,6 +146,8 @@ injection:
     - skill
     - knowledge
     - tdai-memory
+
+${STORAGE_BLOCK}
 
 redis:
   enabled: false

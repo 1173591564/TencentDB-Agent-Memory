@@ -93,22 +93,25 @@
    `No inference provider configured`。
 4. **ProviderProfile 是 dataclass**：子类要么 `@dataclass` + 字段默认值，要么构造时传参；
    类属性赋值 + 无参实例化报 `missing 1 required positional argument: 'name'`。
-   且**无注解的类属性赋值对 dataclass 字段整体无效**——即使实例化成功，父类
-   `__init__` 写入的同名实例属性（字段默认值）也会遮蔽子类类属性：实测
-   `supports_health_check = False` 被遮蔽成 `True`（`hermes doctor` 读实例属性）。
-   覆盖字段必须重新 `@dataclass` 注解或构造参数传入（官方 xiaomi 插件即后者）。
-   另：0.20.6 的 doctor 两条健康探测路径都先按 `env_vars` 非空过滤（custom
-   profile `env_vars=()` 恒跳过），故该遮蔽在当前版本无实际触发面——修复属
-   防御未来 doctor 行为变化。
+   本插件不覆盖整个 `custom` profile 的 `supports_health_check`，以免改变
+   Ollama / vLLM / llama.cpp 等 alias 的父类行为；仅当实际 `base_url` 指向
+   MemoryProxy `/hermes/` 路径时，让 `fetch_models()` 返回 `None`，跳过该端点
+   不支持的模型列表探测。其他 custom endpoint 继续委托父类实现。
 5. **插件发现的 import 环境**：用户插件里 `from plugins.model_providers.custom import CustomProfile`
    可行——bundled 插件先于用户插件加载（`_discover_providers` 顺序保证），
    且 bundled 插件以 `plugins.model_providers.<name>` 注册进 `sys.modules`。
 6. **x-conversation-id 的来源与稳定性**：header 值 = `ses_` + hermes `agent.session_id`
    （格式 `{YYYYmmdd_HHMMSS}_{uuid6}`）。同一会话多轮恒定（表单跨轮续跑依赖它）；
-   `/new` 产生新 ID → proxy 识别为新会话重新走 session-init；**auto-compression rotation
-   同样会换 session_id**（`conversation_compression.py`）→ 压缩后下一轮会重新弹表单
-   （不沉默、不报错；如需零打扰可在 config 里静态配 `x-team-id/x-agent-id/x-task-id`
-   走 Header 预选，见 agents/hermes/README.md §3.2）。
+   `/new` 产生新 ID → proxy 识别为新会话重新走 session-init。
+   **压缩是否换 session_id 由 `compression.in_place` 配置决定**（0.20.6 实测，
+   `conversation_compression.py:2878`）：默认 `true` = 原地压缩、**session_id 不变**、
+   不重弹表单（手动 `/compact` 是 `/compress` 别名，与 auto-compact 同受此开关
+   控制，无行为差异）；显式配 `compression.in_place: false` 才走 legacy rotation
+   （`agent.session_id = new_session_id`）→ 压缩后下一轮重弹表单（不沉默、不报错；
+   如需零打扰可在 config 里静态配 `x-team-id/x-agent-id/x-task-id` 走 Header 预选，
+   见 agents/hermes/README.md §3.2）。早期版本默认 rotation，部署首测时观察到
+   的"压缩即换 ID"即源于此——对 proxy 而言两种模式都正确：ID 变 → 新 session
+   重弹表单；ID 不变 → 状态延续，均无需 proxy 感知。
 7. **DeepSeek thinking 模型的多轮约束**：带 `tool_calls` 的 assistant 消息必须回传
    `reasoning_content`（哪怕是单个空格），否则上游 400
    `"The reasoning_content in the thinking mode must be passed back to the API."`。

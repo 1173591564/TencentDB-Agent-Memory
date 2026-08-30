@@ -501,7 +501,7 @@ when at least one asset injector is on the pipeline.
 
 > ✅ **No longer a limitation for interactive clients**: hermes (CLI / gateway, with the native `clarify` tool) and all other form-capable agents pick Team → Agent → Task interactively — `task_id` can simply be skipped in the form, or bound to "本次不关联任务".
 >
-> For header-preselect agents (OpenClaw), `x-task-id` is now **optional**: `x-team-id` + `x-agent-id` are enough to complete session registration. When `x-task-id` is absent, the proxy applies `sessionInit.taskMissingPolicy` (`skip` = agent-level injection only, `default` = bind `defaultTaskId`, `reject` = bypass).
+> For header-preselect agents (OpenClaw), `x-task-id` is now **optional**: `x-team-id` + `x-agent-id` are enough to complete session registration. When `x-task-id` is absent, only Team and Agent are bound and memory recall widens across all of the agent's memories.
 >
 > A stale or unknown `x-task-id` header does not block registration either — it is dropped with a warning and recall broadens across all of the agent's memories.
 

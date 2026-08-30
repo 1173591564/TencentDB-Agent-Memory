@@ -1516,5 +1516,5 @@ export const enUS = {
   'guide.manual.note.hermes.2': 'x-conversation-id: inject dynamically with the provider plugin (see agents/hermes/README.md §6)',
   'guide.manual.note.openclaw.0': 'Header preselect: team-id / agent-id / conversation-id required, task-id optional',
   'guide.manual.note.openclaw.1': 'x-conversation-id identifies the current session — change it for each new conversation',
-  'guide.manual.note.openclaw.2': 'x-task-id is optional — when absent, the proxy applies sessionInit.taskMissingPolicy (default: skip)',
+  'guide.manual.note.openclaw.2': 'x-task-id is optional — when absent, only team and agent are bound and memory recall widens to the whole agent',
 };

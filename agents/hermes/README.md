@@ -68,7 +68,7 @@ model:
   extra_headers:            # 或 providers.<name>.extra_headers，两者等价
     x-team-id: <team_id>
     x-agent-id: <agent_id>
-    x-task-id: <task_id>    # 可选；缺省时按 proxy 的 taskMissingPolicy 处理
+    x-task-id: <task_id>    # 可选；缺省时仅绑定 Team 和 Agent，召回范围放宽到该 Agent
 ```
 
 Header 值必须命中该 user_key 在内核可见的 teams[]，否则视为 mismatch 走 fallback（bypass 或回表单）。
@@ -140,14 +140,16 @@ HERMES_AGENT_DIR=/path/to/hermes-agent python selftest.py   # 全 PASS 即插件
 **Q: 记忆注入没生效？**  
 A: 检查是否触发了表单但被 bypass（proxy 日志搜 `session-init:cb` / `bypass`）。无头形态（api-server）下请改用 §3.2 的 Header 预选。
 
-**Q: 表单不弹，直接透传了？**  
+**Q: 表单不弹，直接透传了？**
+
 A: proxy 检测到请求 tools 里没有 `clarify` → 判定为无头形态。确认 hermes 运行在 CLI / gateway 交互模式，且没有把 clarify 工具集禁用。
 
-**Q: 表单弹了但每次都重新弹？**  
+**Q: 表单弹了但每次都重新弹？**
+
 A: `x-conversation-id` 不稳定导致表单跨轮续跑失败。用 §6 的 provider 插件动态注入，或确认配置里的静态值没被中途更换。
 
 **Q: 怎么获取 team_id / agent_id / task_id？**  
 A: 登录面板 → 对应页面 → 详情里有 ID 字段。或用面板 API `team/list`、`agent/list`、`task/list` 查询。
 
 **Q: 不想绑 Task 怎么办？**  
-A: Header 预选时不带 `x-task-id` 即可（task 可选，缺省按 proxy `sessionInit.taskMissingPolicy` 处理，默认 skip = 仅 agent 级注入）。
+A: 不带 `x-task-id` 即可——会话仅绑定 Team 和 Agent，召回范围放宽到该 Agent 的全部记忆。

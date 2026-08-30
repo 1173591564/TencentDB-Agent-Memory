@@ -998,7 +998,7 @@ EOF
   echo ""
   warn "⚠️  注意事项:"
   echo -e "  • x-conversation-id 标识当前会话，${BOLD}每次新对话需手动更换${RESET}"
-  echo -e "  • x-task-id 现为可选；不带时按 proxy 的 taskMissingPolicy 处理（默认 skip）"
+  echo -e "  • x-task-id 现为可选；不带时仅绑定 Team 和 Agent，记忆召回范围放宽到整个 Agent"
   echo -e "  • 切换 Team/Agent/Task 需编辑配置文件"
 }
 
@@ -1060,7 +1060,7 @@ write_openclaw() {
   echo ""
   warn "⚠️  注意事项:"
   echo -e "  • x-conversation-id 标识当前会话，${BOLD}每次新对话需手动更换${RESET}"
-  echo -e "  • x-task-id 现为可选；不带时按 proxy 的 taskMissingPolicy 处理（默认 skip）"
+  echo -e "  • x-task-id 现为可选；不带时仅绑定 Team 和 Agent，记忆召回范围放宽到整个 Agent"
   echo -e "  • 在 OpenClaw 中选择 provider 为 ${BOLD}memory-proxy${RESET}，模型选 ${BOLD}${MODEL_ID}${RESET}"
 }
 

@@ -278,7 +278,12 @@ function isFreshCBConversation(messages: MessageArr): boolean {
   return userCount <= 1;
 }
 
-async function fetchTeamsAndAgents(
+/**
+ * Load the caller's teams with their agents/tasks — the same candidate list
+ * the interactive form renders. Shared by the CB state machine and the
+ * session-init web-link endpoints (GET candidate list / POST submit).
+ */
+export async function fetchTeamsAndAgents(
   userId: string,
   config: SessionInitConfig,
   metadataClient: MetadataClient,

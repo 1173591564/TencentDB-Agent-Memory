@@ -134,6 +134,10 @@ sessionInit:
     agentHeader: "x-agent-id"
     taskHeader: "x-task-id"
     onMismatch: "form"
+${PROXY_SESSION_INIT_HUB_ORIGIN:+  initLink:
+    hubOrigin: "${PROXY_SESSION_INIT_HUB_ORIGIN}"${PROXY_SESSION_INIT_PROXY_ORIGIN:+
+    proxyOrigin: "${PROXY_SESSION_INIT_PROXY_ORIGIN}"}${PROXY_SESSION_INIT_LINK_TTL_MINUTES:+
+    ttlMinutes: ${PROXY_SESSION_INIT_LINK_TTL_MINUTES}}}
 
 costGuard:
   enabled: false

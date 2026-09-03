@@ -157,6 +157,16 @@ describe("hermes 解包 × CB extractor 集成", () => {
     expect(extractAgentOnly(raw, [TEAM], TEAM.team_id)).toBeNull();
   });
 
+  it("task: choices_offered 含 MORE 时只匹配实际 user_response", () => {
+    const raw = JSON.stringify({
+      question: "请选择 Task（第 1/2 页）：",
+      choices_offered: ["任务一 (33333333)", "任务二 (44444444)", MORE_LABEL],
+      user_response: "任务二 (44444444)",
+    });
+    expect(extractHermesAnswers(raw)).toBe("任务二 (44444444)");
+    expect(extractTaskOnly(raw, [TEAM], TEAM.team_id)).toBe("task-44444444");
+  });
+
   it("bypass 信封在 agent/task/team 提取器里命中 BYPASS_MARKER", () => {
     expect(extractAgentOnly(HERMES_BYPASS_TEXT, [TEAM], TEAM.team_id)).toBe(BYPASS_MARKER);
     expect(extractTaskOnly(HERMES_BYPASS_TEXT, [TEAM], TEAM.team_id)).toBe(BYPASS_MARKER);

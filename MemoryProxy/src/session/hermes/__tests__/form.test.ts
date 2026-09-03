@@ -5,8 +5,7 @@
  *   - SSE 3-chunk 骨架（role+tool_call decl → arguments delta → finish）+ [DONE]
  *   - non-stream 形态
  *   - clarify arguments schema（questions[0].choices 平铺字符串、≤4、multi_select=false）
- *   - agent/task 分页（3+MORE 非末页、末页无 MORE）
- *   - team 截断（>4 截到 4，不 MORE）
+ *   - team/agent/task 分页（3+MORE 非末页、末页无 MORE）
  *   - containsFormTitle / isSessionInitToolCallId
  */
 import { describe, expect, it } from "vitest";
@@ -21,6 +20,8 @@ import {
   isSessionInitToolCallId,
   type FormData,
 } from "../form.js";
+import { handleSessionInit } from "../../index.js";
+import { SessionStore } from "../../store.js";
 import type { TeamOption } from "../../types.js";
 
 function makeTeam(overrides?: Partial<TeamOption>): TeamOption {
@@ -36,6 +37,22 @@ function makeTeam(overrides?: Partial<TeamOption>): TeamOption {
       { task_id: "task-44444444", task_name: "任务二" },
     ],
     ...overrides,
+  };
+}
+
+function clarifyResult(
+  question: string,
+  choicesOffered: string[],
+  userResponse: string,
+): Record<string, unknown> {
+  return {
+    role: "tool",
+    tool_call_id: "call_hermes_session_init_test",
+    content: JSON.stringify({
+      question,
+      choices_offered: choicesOffered,
+      user_response: userResponse,
+    }),
   };
 }
 
@@ -92,16 +109,108 @@ describe("hermes form — asset_confirm", () => {
 });
 
 describe("hermes form — team stage", () => {
-  it("truncates to 4 choices (clarify MAX_CHOICES hard limit), no MORE", () => {
+  const sixTeams = Array.from({ length: 6 }, (_, i) =>
+    makeTeam({ team_id: `team-0000000${i}`, team_name: `团队${i}` }),
+  );
+
+  it("non-last page: 3 teams + MORE", async () => {
+    const res = buildFormResponse({
+      teams: sixTeams,
+      stage: "team",
+      pageIndex: 0,
+      stream: false,
+    });
+    const body: any = await res.json();
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
+    expect(args.questions[0].choices).toHaveLength(4);
+    expect(args.questions[0].choices[3]).toBe(MORE_LABEL);
+    expect(args.questions[0].question).toContain("第 1/2 页");
+  });
+
+  it("last page: remaining teams, no MORE", async () => {
     const teams = Array.from({ length: 6 }, (_, i) =>
       makeTeam({ team_id: `team-0000000${i}`, team_name: `团队${i}` }),
     );
-    const res = buildFormResponse({ teams, stage: "team", stream: false });
-    return res.json().then((body: any) => {
-      const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
-      expect(args.questions[0].choices.length).toBe(4);
-      expect(args.questions[0].choices.some((c: string) => c.includes(MORE_LABEL))).toBe(false);
+    const res = buildFormResponse({
+      teams,
+      stage: "team",
+      pageIndex: 1,
+      stream: false,
     });
+    const body: any = await res.json();
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
+    expect(args.questions[0].choices).toHaveLength(3);
+    expect(args.questions[0].choices).not.toContain(MORE_LABEL);
+    expect(args.questions[0].question).toContain("第 2/2 页");
+  });
+
+  it("MORE advances the shared state machine to the next team page", async () => {
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-team-page";
+    await store.set(compositeKey, {
+      status: "pending_team_select",
+      keyId: "sess-team-page",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: sixTeams,
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-team-page",
+      "usr-1",
+      [clarifyResult(
+        "请选择本次会话所属的 Team：",
+        ["团队0 (00000000)", MORE_LABEL],
+        MORE_LABEL,
+      )],
+      { enabled: true, maxRetries: 3 },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(true);
+    expect(store.get(compositeKey)?.codexPageIndex?.teamPage).toBe(1);
+    const body: any = await result.response!.json();
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
+    expect(args.questions[0].question).toContain("第 2/2 页");
+    expect(args.questions[0].choices).not.toContain(MORE_LABEL);
+  });
+
+  it("a normal team choice is not mistaken for MORE echoed in choices_offered", async () => {
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-team-choice";
+    await store.set(compositeKey, {
+      status: "pending_team_select",
+      keyId: "sess-team-choice",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: sixTeams,
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-team-choice",
+      "usr-1",
+      [clarifyResult(
+        "请选择本次会话所属的 Team：",
+        ["团队0 (00000000)", "团队1 (00000001)", "团队2 (00000002)", MORE_LABEL],
+        "团队1 (00000001)",
+      )],
+      { enabled: true, maxRetries: 3 },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(true);
+    expect(result.formData?.stage).toBe("agent_select");
+    expect(result.formData?.selectedTeamId).toBe("team-00000001");
+    expect(store.get(compositeKey)?.status).toBe("pending_agent_select");
+    expect(store.get(compositeKey)?.codexPageIndex?.teamPage).toBe(0);
   });
 
   it("throws when <2 teams (caller must auto-select)", () => {
@@ -115,6 +224,10 @@ describe("hermes form — agent/task pagination", () => {
   const eightAgents = Array.from({ length: 8 }, (_, i) => ({
     agent_id: `agt-0000000${i}`,
     agent_name: `agent-${i}`,
+  }));
+  const sixTasks = Array.from({ length: 6 }, (_, i) => ({
+    task_id: `task-0000000${i}`,
+    task_name: `任务${i}`,
   }));
 
   it("non-last page: 3 real options + MORE", () => {
@@ -155,6 +268,190 @@ describe("hermes form — agent/task pagination", () => {
       expect(choices.length).toBe(4);
       expect(choices[3]).toBe(MORE_LABEL);
     });
+  });
+
+  it("a normal agent choice advances to task selection instead of the next page", async () => {
+    const team = makeTeam({ agents: eightAgents, tasks: sixTasks });
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-agent-choice";
+    await store.set(compositeKey, {
+      status: "pending_agent_select",
+      keyId: "sess-agent-choice",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: [team],
+      selectedTeamId: team.team_id,
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-agent-choice",
+      "usr-1",
+      [clarifyResult(
+        "请选择 Agent（第 1/3 页）：",
+        ["agent-0 (00000000)", "agent-1 (00000001)", "agent-2 (00000002)", MORE_LABEL],
+        "agent-1 (00000001)",
+      )],
+      { enabled: true, maxRetries: 3 },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(true);
+    expect(result.formData?.stage).toBe("task_select");
+    expect(result.formData?.selectedAgentId).toBe("agt-00000001");
+    expect(store.get(compositeKey)?.status).toBe("pending_task_select");
+    expect(store.get(compositeKey)?.codexPageIndex?.agentPage).toBe(0);
+  });
+
+  it("agent MORE still advances to the next page", async () => {
+    const team = makeTeam({ agents: eightAgents, tasks: sixTasks });
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-agent-more";
+    await store.set(compositeKey, {
+      status: "pending_agent_select",
+      keyId: "sess-agent-more",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: [team],
+      selectedTeamId: team.team_id,
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-agent-more",
+      "usr-1",
+      [clarifyResult(
+        "请选择 Agent（第 1/3 页）：",
+        ["agent-0 (00000000)", "agent-1 (00000001)", "agent-2 (00000002)", MORE_LABEL],
+        MORE_LABEL,
+      )],
+      { enabled: true, maxRetries: 3 },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(true);
+    expect(result.formData?.stage).toBe("agent_select");
+    expect(store.get(compositeKey)?.codexPageIndex?.agentPage).toBe(1);
+  });
+
+  it("a normal task choice completes registration instead of opening the next page", async () => {
+    const team = makeTeam({ agents: eightAgents, tasks: sixTasks });
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-task-choice";
+    await store.set(compositeKey, {
+      status: "pending_task_select",
+      keyId: "sess-task-choice",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: [team],
+      selectedTeamId: team.team_id,
+      selectedAgentId: "agt-00000001",
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-task-choice",
+      "usr-1",
+      [clarifyResult(
+        "请选择 Task（第 1/2 页）：",
+        ["任务0 (00000000)", "任务1 (00000001)", "任务2 (00000002)", MORE_LABEL],
+        "任务1 (00000001)",
+      )],
+      { enabled: true, maxRetries: 3 },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(false);
+    expect(result.sessionInfo?.agent_id).toBe("agt-00000001");
+    expect(result.sessionInfo?.task_id).toBe("task-00000001");
+    expect(store.get(compositeKey)?.status).toBe("initialized");
+  });
+
+  it("task MORE still advances to the next page", async () => {
+    const team = makeTeam({ agents: eightAgents, tasks: sixTasks });
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-task-more";
+    await store.set(compositeKey, {
+      status: "pending_task_select",
+      keyId: "sess-task-more",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: [team],
+      selectedTeamId: team.team_id,
+      selectedAgentId: "agt-00000001",
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-task-more",
+      "usr-1",
+      [clarifyResult(
+        "请选择 Task（第 1/2 页）：",
+        ["任务0 (00000000)", "任务1 (00000001)", "任务2 (00000002)", MORE_LABEL],
+        MORE_LABEL,
+      )],
+      { enabled: true, maxRetries: 3 },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(true);
+    expect(result.formData?.stage).toBe("task_select");
+    expect(store.get(compositeKey)?.codexPageIndex?.taskPage).toBe(1);
+  });
+
+  it("the virtual no-task choice completes the team and agent binding", async () => {
+    const noTask = {
+      task_id: "task-default",
+      task_name: "本次不关联任务",
+      isDefault: true,
+    };
+    const team = makeTeam({ agents: eightAgents, tasks: [noTask, ...sixTasks] });
+    const store = new SessionStore();
+    const compositeKey = "hermes:sess-no-task";
+    await store.set(compositeKey, {
+      status: "pending_task_select",
+      keyId: "sess-no-task",
+      startedAt: Date.now(),
+      attemptCount: 0,
+      userId: "usr-1",
+      cachedTeams: [team],
+      selectedTeamId: team.team_id,
+      selectedAgentId: "agt-00000001",
+      codexPageIndex: { teamPage: 0, agentPage: 0, taskPage: 0 },
+    });
+
+    const result = await handleSessionInit(
+      "sess-no-task",
+      "usr-1",
+      [clarifyResult(
+        "请选择 Task（第 1/3 页）：",
+        ["本次不关联任务", "任务0 (00000000)", "任务1 (00000001)", MORE_LABEL],
+        "本次不关联任务",
+      )],
+      { enabled: true, maxRetries: 3, defaultTaskId: "task-default" },
+      store,
+      { stream: false, protocol: "openai", modelId: "test-model" },
+      "hermes",
+    );
+
+    expect(result.intercepted).toBe(false);
+    expect(result.sessionInfo?.team_id).toBe(team.team_id);
+    expect(result.sessionInfo?.agent_id).toBe("agt-00000001");
+    expect(result.sessionInfo?.task_id).toBe("task-default");
+    expect(result.taskDetail).toBeNull();
+    expect(store.get(compositeKey)?.status).toBe("initialized");
   });
 });
 

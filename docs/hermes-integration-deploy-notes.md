@@ -93,6 +93,13 @@
    `No inference provider configured`。
 4. **ProviderProfile 是 dataclass**：子类要么 `@dataclass` + 字段默认值，要么构造时传参；
    类属性赋值 + 无参实例化报 `missing 1 required positional argument: 'name'`。
+   且**无注解的类属性赋值对 dataclass 字段整体无效**——即使实例化成功，父类
+   `__init__` 写入的同名实例属性（字段默认值）也会遮蔽子类类属性：实测
+   `supports_health_check = False` 被遮蔽成 `True`（`hermes doctor` 读实例属性）。
+   覆盖字段必须重新 `@dataclass` 注解或构造参数传入（官方 xiaomi 插件即后者）。
+   另：0.20.6 的 doctor 两条健康探测路径都先按 `env_vars` 非空过滤（custom
+   profile `env_vars=()` 恒跳过），故该遮蔽在当前版本无实际触发面——修复属
+   防御未来 doctor 行为变化。
 5. **插件发现的 import 环境**：用户插件里 `from plugins.model_providers.custom import CustomProfile`
    可行——bundled 插件先于用户插件加载（`_discover_providers` 顺序保证），
    且 bundled 插件以 `plugins.model_providers.<name>` 注册进 `sys.modules`。

@@ -140,12 +140,18 @@ costGuard:
 
 # 打开 skill + knowledge + tdai-memory 三个注入器；
 # knowledge 依赖 memory-hub 起来，否则 hook 内部会降级为空块。
+#
+# externalGatewayUrl：注入文本里工具回调地址的对外基准（如 http://localhost:8096
+# 或 http://<LAN-IP>:8096）。不设时 proxy 会把容器内网 IP 嵌进工具说明——宿主机
+# 客户端（hermes / CC 等）按该地址调用 memory-bridge / skill-bridge 会 502。
+# 可在 .env 设 INJECTION_EXTERNAL_GATEWAY_URL 覆盖。
 injection:
   enabled: true
   injectors:
     - skill
     - knowledge
     - tdai-memory
+${INJECTION_EXTERNAL_GATEWAY_URL:+  externalGatewayUrl: "${INJECTION_EXTERNAL_GATEWAY_URL}"}
 
 ${STORAGE_BLOCK}
 

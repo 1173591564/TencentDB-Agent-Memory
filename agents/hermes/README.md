@@ -73,9 +73,13 @@ model:
 
 Header 值必须命中该 user_key 在内核可见的 teams[]，否则视为 mismatch 走 fallback（bypass 或回表单）。
 
-### 3.3 无头形态：自动 bypass
+### 3.3 无头形态：网页链接初始化
 
-hermes 的 `api-server` / `acp` 发行版不内置 `clarify` 工具（无交互 UI）。请求 `tools` 缺失、为空或不含 `clarify` 时，proxy 将其视为 headless 并**自动 bypass session-init**（直接透传，不弹表单），与 dsh headless 同语义。
+hermes 的 `api-server` / `acp` 发行版不内置 `clarify` 工具（无交互 UI）。请求
+`tools` 缺失、为空或不含 `clarify` 时，proxy 将其视为 headless：若配置了
+`sessionInit.initLink.hubOrigin` 且请求携带稳定 conversation id，则在终态响应末尾返回
+免登录网页初始化链接；未配置链接功能时维持静默 bypass。网页绑定完成后，后续请求恢复
+memory injection、L0 与 skill pipeline。
 
 实测（0.20.6）`hermes -z`（oneshot）同样走 bypass：oneshot 无持久 session_id → 插件不注入 `x-conversation-id` → proxy 侧 `conversationId=null`，session-init 直接跳过（日志 `injectedSkipped=true`）。CLI/gateway 交互模式才会走 §3.1 的表单流。
 
@@ -138,11 +142,11 @@ HERMES_AGENT_DIR=/path/to/hermes-agent python selftest.py   # 全 PASS 即插件
 ## 7. 常见问题
 
 **Q: 记忆注入没生效？**  
-A: 检查是否触发了表单但被 bypass（proxy 日志搜 `session-init:cb` / `bypass`）。无头形态（api-server）下请改用 §3.2 的 Header 预选。
+A: 检查是否完成表单、Header 预选或 §3.3 的网页绑定（proxy 日志搜 `session-init:cb` / `session-recover` / `bypass`）。
 
 **Q: 表单不弹，直接透传了？**
 
-A: proxy 检测到请求 tools 里没有 `clarify` → 判定为无头形态。确认 hermes 运行在 CLI / gateway 交互模式，且没有把 clarify 工具集禁用。
+A: proxy 检测到请求 tools 里没有 `clarify` → 判定为无头形态。配置 `sessionInit.initLink.hubOrigin` 使用网页初始化，或确认 Hermes 运行在 CLI / gateway 交互模式且没有禁用 clarify。
 
 **Q: 表单弹了但每次都重新弹？**
 

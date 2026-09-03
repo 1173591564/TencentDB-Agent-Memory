@@ -127,3 +127,33 @@
 - Python 侧验证 sqlite 落库内容比看 API 回显更可靠（`docker cp` 出
   `metadata/tdai_metadata_default/metadata.db` 用 `sqlite3` 查 `meta_user_keys` /
   `meta_agents` 等表）。
+
+
+## 七、headless 会话的网页链接式初始化（web-link fallback）
+
+针对 api-server / acp / dsh 等"有稳定会话 id 但无交互提问工具"的 headless 形态，原版
+行为是静默 bypass——用户没有任何途径完成资产绑定。现支持在终态响应末尾追加一条网页
+初始化链接，浏览器打开免登录页面（Hub `/session-init`）选 team / agent / task 完成绑定。
+
+- **启用条件**：proxy 环境变量 `PROXY_SESSION_INIT_HUB_ORIGIN`（Hub 页面访问源，如
+  `http://<hub-host>:8125`）。未配置则全链路维持原状（零行为变化）。
+- **可选**：`PROXY_SESSION_INIT_PROXY_ORIGIN`（浏览器可达的 Proxy 地址；未配置时使用请求
+  origin）、`PROXY_SESSION_INIT_LINK_TTL_MINUTES`（token 有效期，默认 10 分钟）。
+- **注入形态**：仅 terminal assistant response 注入。非流式追加到 terminal content；
+  流式按 SSE event 边界处理，将 notice 合并进 terminal event 的 `delta.content`。
+- **token 语义**：32 位随机十六进制；同 session/purpose 在 TTL 内复用；提交按
+  `pending → processing → consumed` 原子 claim，瞬时失败释放回 pending。token 仅存单个
+  Proxy 进程内，重启全失效，当前不支持多副本共享。
+- **归属校验**：提交时 agent 必须属于调用方所在 team、task 必须属于该 team，否则 400。
+- **边界**：
+  - oneshot（`hermes -z`）无 conversationId → 维持静默 bypass（与 §5.8 一致）；
+  - 交互 TUI（有 clarify 工具）→ 不受影响，仍走就地表单；
+  - 已绑定会话 → 恢复 memory injection、L0 与 skill pipeline；
+  - 会话重置（mem:session-reset）→ force archive、删除旧绑定并返回新换绑链接。
+- **验证**：运行 `MemoryProxy` 测试套件覆盖 terminal 注入、SSE event 边界、token 并发、
+  durable binding 与 reset；Provider 插件运行
+  `agents/hermes/tdaimemory-provider-plugin/selftest.py`。仓库当前没有独立的一键 E2E
+  shell 脚本。
+- **踩坑**：非流式注入最初在 handler 里 parse 出一份新 JSON 再序列化，而 notice 追加在
+  另一份 message 引用上 → 注入"成功"但响应无变化。修复为把上游响应的 parse 结果提升
+  作用域后原地追加再序列化。

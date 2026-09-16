@@ -471,7 +471,6 @@ export async function resolveTargetCollisions(params: {
     else groups.set(k, [d]);
   }
 
-  let changed = false;
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     const merged = await mergeCollidingGroup(group, memories, vectorStore, config, logger, model, llmRunner, traceContext);
@@ -485,7 +484,6 @@ export async function resolveTargetCollisions(params: {
     if (typeof merged.merged_priority === "number") keeper.merged_priority = merged.merged_priority;
     if (merged.merged_timestamps?.length) keeper.merged_timestamps = merged.merged_timestamps;
     for (const d of group.slice(1)) d.action = "skip";
-    changed = true;
     logger?.debug?.(
       `${TAG} Target collision: ${group.length} new memories hit the same existing record(s), merged into ${keeper.record_id}`,
     );
@@ -515,8 +513,13 @@ async function mergeCollidingGroup(
     let targetItems: Array<{ record_id: string; content: string }> = [];
     const targetIds = [...new Set(group.flatMap((d) => d.target_ids))];
     if (vectorStore && targetIds.length > 0) {
+      // sqlite queryL1Records ignores `recordIds` (returns all rows) — filter
+      // by target_ids ourselves, same as writeMemory's superseded snapshot.
+      const targetSet = new Set(targetIds);
       const rows = await vectorStore.queryL1Records({ recordIds: targetIds });
-      targetItems = rows.map((r) => ({ record_id: r.record_id, content: r.content }));
+      targetItems = rows
+        .filter((r) => targetSet.has(r.record_id))
+        .map((r) => ({ record_id: r.record_id, content: r.content }));
     }
 
     const userPrompt = [

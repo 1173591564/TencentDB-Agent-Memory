@@ -792,34 +792,42 @@ export async function handleChatCompletions(
     const { isSessionResetCommand } = await import("./mem-command/pre-intercept.js");
     if (isSessionResetCommand(body as Record<string, unknown>, agentSource)) {
       const { buildMemResponse } = await import("./mem-command/response-builder.js");
-      // headless + initLink 配置 → 签发 rebind 链接（替代"不支持"文案）
+      // headless + initLink 配置 → 签发 rebind 链接（替代"不支持"文案）。
+      // 失败（token store 满 / URL 解析异常）时兜底回落到下方"不支持"文案，
+      // 与 needsInitLink 分支的 try/catch 对称，绝不向客户端抛 500。
       if (_isHeadless && conversationId && userId && apiKey && _linkConfig?.hubOrigin) {
-        const compositeKey = `${agentSource}:${sessionKey}`;
-        const { record } = createOrReusePendingToken({
-          compositeKey,
-          sessionId: sessionKey,
-          agentSource,
-          userId,
-          userKey: apiKey,
-          spaceId,
-          purpose: "rebind",
-          ttlMinutes: _linkConfig.ttlMinutes,
-        });
-        const proxyOrigin =
-          _linkConfig.proxyOrigin?.replace(/\/$/, "") ||
-          new URL(c.req.url).origin;
-        const link = buildInitLinkUrl(_linkConfig.hubOrigin, proxyOrigin, record.token);
-        console.log(
-          `[mem-command:pre] session-reset → web rebind link for session=${compositeKey}`,
-        );
-        return buildMemResponse(
-          buildInitLinkNotice(link, "rebind", _linkConfig.ttlMinutes),
-          {
-            protocol: "openai",
-            stream: isStream,
-            requestId: `mem-reset-rebind-${Date.now()}`,
-          },
-        );
+        try {
+          const compositeKey = `${agentSource}:${sessionKey}`;
+          const { record } = createOrReusePendingToken({
+            compositeKey,
+            sessionId: sessionKey,
+            agentSource,
+            userId,
+            userKey: apiKey,
+            spaceId,
+            purpose: "rebind",
+            ttlMinutes: _linkConfig.ttlMinutes,
+          });
+          const proxyOrigin =
+            _linkConfig.proxyOrigin?.replace(/\/$/, "") ||
+            new URL(c.req.url).origin;
+          const link = buildInitLinkUrl(_linkConfig.hubOrigin, proxyOrigin, record.token);
+          console.log(
+            `[mem-command:pre] session-reset → web rebind link for session=${compositeKey}`,
+          );
+          return buildMemResponse(
+            buildInitLinkNotice(link, "rebind", _linkConfig.ttlMinutes),
+            {
+              protocol: "openai",
+              stream: isStream,
+              requestId: `mem-reset-rebind-${Date.now()}`,
+            },
+          );
+        } catch (err) {
+          console.warn(
+            `[init-link] rebind token mint failed, falling back to unsupported notice: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
       console.log(`[mem-command:pre] session-reset unsupported for agent=${agentSource} dshHeadless=${_dshHeadless} hermesHeadless=${_hermesHeadless}`);
       const msg = _headerOnlyAgents.has(agentSource)

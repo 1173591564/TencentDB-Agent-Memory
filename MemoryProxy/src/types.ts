@@ -200,13 +200,20 @@ export interface SessionInitConfig {
    * Web-link fallback for headless agents (for example dsh without
    * `ask_user_question` or Hermes without `clarify`, with a stable session id).
    *
-   * When set, the proxy mints a short-lived one-shot token and appends an init
-   * link (`{hubOrigin}/#/session-init?proxy=...&token=...`) to the passthrough
-   * response; the user completes team/agent/task selection in the browser and
-   * the binding lands in SessionStore via the same registration path as the
-   * interactive form. Unset (default): headless requests keep the current
-   * silent bypass. `mem:session-reset` under headless clears the old binding
-   * and returns a rebind link when this is configured.
+   * When set, an unbound headless request is intercepted (not forwarded to
+   * the upstream) and answered with a protocol-compatible response carrying
+   * an init link (`{hubOrigin}/#/session-init?proxy=...&token=...`); the user
+   * completes team/agent/task selection in the browser and the next request
+   * recovers the binding via SessionStore (same registration path as the
+   * interactive form). Unset (default): headless requests keep the current
+   * silent bypass. `mem:session-reset` under headless returns a rebind link
+   * when this is configured.
+   *
+   * Deployment note: init-link tokens live in proxy process memory — the
+   * browser request must land on the same pod that minted the token (single
+   * pod or sticky-session routing), and a pod restart drops outstanding
+   * tokens. Cross-pod deployments need a shared token store (not in this
+   * first version).
    */
   initLink?: {
     /** Memory Hub page origin, e.g. `http://127.0.0.1:8125`. Presence enables the feature. */

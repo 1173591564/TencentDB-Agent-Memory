@@ -8,9 +8,9 @@
  * assistant tool_call SSE 让 hermes 的 agent-loop 执行 clarify → 弹原生 UI →
  * 把用户回答以 role=tool JSON 结果回填，与 dsh/workbuddy 同模式。
  *
- * # 简化版说明
- *   首版不做分页（MORE 翻页）。hermes MAX_CHOICES=4 硬限制，超过 4 个选项
- *   直接截断。后续如需分页可在此基础上加回 pageIndex + computePagination。
+ * # 分页
+ *   复用 CC 的 computePagination（每页 ≤3 实项 + MORE，末页 ≤4）——单页选项数
+ *   恒 ≤4，天然满足 hermes clarify MAX_CHOICES=4 硬限制，无需截断。
  *
  * # 传输
  *   协议 = OpenAI /v1/chat/completions（stream 或 non-stream）
@@ -43,9 +43,6 @@ export const MORE_LABEL = "更多 →";
 export const ASSET_CONFIRM_YES = "是，关联团队资产";
 export const ASSET_CONFIRM_NO = "否，本次不关联";
 export const ASSET_CONFIRM_FORM_TITLE = "会话初始化 — 是否关联团队资产";
-
-/** hermes MAX_CHOICES=4 硬限制。 */
-const MAX_CHOICES = 4;
 
 const SKIP_HINT = '（如选择"跳过"选项，本次 session init 将跳过，不注入任何团队资产）';
 

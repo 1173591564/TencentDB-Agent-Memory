@@ -37,6 +37,15 @@ export const HERMES_BYPASS_TEXT = `${ASSET_CONFIRM_NO}（用户未响应会话�
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 /**
+ * 解包 hermes clarify 结果后喂给 CB extractor 的便捷形态：
+ * 非 hermes 包裹层（extractHermesAnswers 返回 null）时原样返回 content。
+ * CB extractor 各取值入口统一走这里，避免逐处手写 `?? content`。
+ */
+export function unwrapClarifyJson(content: string): string {
+  return extractHermesAnswers(content) ?? content;
+}
+
+/**
  * 从 hermes clarify 的 role=tool 结果文本里解包出纯答案文本。
  *
  * 返回：

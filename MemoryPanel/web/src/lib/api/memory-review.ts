@@ -33,7 +33,12 @@ export interface MemoryDiffChange {
 
 export interface MemoryDiffData {
   changes: MemoryDiffChange[];
-  total: number;
+  /** 本页变更组数（分页在原始事件层，聚合在变更层，非全 session 总数）。 */
+  count: number;
+  /** 是否还有下一页事件。 */
+  has_more: boolean;
+  /** 下一页应传的 offset（事件偏移）。 */
+  next_offset: number;
 }
 
 export interface MemoryRevertData {
@@ -41,6 +46,8 @@ export interface MemoryRevertData {
   reverted: boolean;
   /** updated/merged 撤销时恢复的旧 record_id 列表。 */
   restored: string[];
+  /** 快照缺失、无法恢复的旧 record_id（superseded 事件为 best-effort 写入）。 */
+  missing?: string[];
 }
 
 const PREFIX = '/api/v1/memory';

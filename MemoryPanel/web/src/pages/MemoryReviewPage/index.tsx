@@ -88,13 +88,15 @@ export function MemoryReviewPage() {
   const [loading, setLoading] = useState(false);
   const [revertingId, setRevertingId] = useState<string | null>(null);
   const [queried, setQueried] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextOffset, setNextOffset] = useState(0);
 
   const teamOptions = useMemo(() => (teams ?? []).map((tm) => ({ value: tm.team_id, text: tm.name ?? tm.team_id })), [teams]);
   const agentOptions = useMemo(() => (agents ?? []).map((a) => ({ value: a.agent_id, text: a.name ?? a.agent_id })), [agents]);
 
   const canQuery = !!(teamId && agentId && userId && sessionId.trim());
 
-  const fetchDiff = async () => {
+  const fetchDiff = async (offset = 0) => {
     if (!canQuery) return;
     setLoading(true);
     try {
@@ -103,8 +105,13 @@ export function MemoryReviewPage() {
         team_id: teamId,
         agent_id: agentId,
         user_id: userId,
+        limit: 100,
+        offset,
       });
-      setChanges(data.changes ?? []);
+      const page = data.changes ?? [];
+      setChanges((prev) => (offset === 0 ? page : [...prev, ...page]));
+      setHasMore(data.has_more ?? false);
+      setNextOffset(data.next_offset ?? offset + page.length);
       setQueried(true);
     } catch (err) {
       tea.notification.error(t('memoryReview.loadFailed', '加载变更集失败'), err instanceof Error ? err.message : String(err));
@@ -126,8 +133,12 @@ export function MemoryReviewPage() {
         agent_id: agentId,
         user_id: userId,
       });
-      tea.notification.success(t('memoryReview.revertOk', '已撤销'), res.restored.length ? `restored: ${res.restored.join(', ')}` : undefined);
-      await fetchDiff();
+      const detail = [
+        res.restored.length ? `restored: ${res.restored.join(', ')}` : '',
+        res.missing?.length ? `missing snapshot: ${res.missing.join(', ')}` : '',
+      ].filter(Boolean).join(' · ');
+      tea.notification.success(t('memoryReview.revertOk', '已撤销'), detail || undefined);
+      await fetchDiff(0);
     } catch (err) {
       tea.notification.error(t('memoryReview.revertFailed', '撤销失败'), err instanceof Error ? err.message : String(err));
     } finally {
@@ -189,6 +200,13 @@ export function MemoryReviewPage() {
           {changes.map((ch) => (
             <ChangeCard key={`${ch.record_id}-${ch.event_ts}-${ch.op}`} change={ch} onRevert={(id) => void handleRevert(id)} reverting={revertingId === ch.record_id} />
           ))}
+          {hasMore ? (
+            <div style={{ textAlign: 'center', padding: '4px 0 12px' }}>
+              <Button type="weak" loading={loading} onClick={() => void fetchDiff(nextOffset)}>
+                {t('memoryReview.loadMore', '加载更多')}
+              </Button>
+            </div>
+          ) : null}
         </div>
       </div>
     </ResourcePage>

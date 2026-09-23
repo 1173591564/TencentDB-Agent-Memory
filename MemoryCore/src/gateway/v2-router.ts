@@ -1332,6 +1332,9 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
  * 幂等：同一 record_id 已存在 reverted 事件 → 409。
  * 撤销动作本身追加一条 reverted 事件（record_id=被撤销的新 record，
  * supersedes=本次恢复的旧 record_id 列表），保持事件流 append-only。
+ * 部分恢复失败（旧记录 upsert 抛错）时返回 500 且**不追加** reverted
+ * 事件——delete/upsert 均幂等，客户端可安全重试；否则 409 会永久挡住
+ * 那次失败的恢复。
  */
 async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = memoryDiffRevertRequestSchema.safeParse(body);
@@ -1374,13 +1377,25 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
   // updated/merged：恢复被 superseded 的旧记录。superseded 事件的 record_id
   // 是旧记录 id，用 lastWrite.supersedes（写入时存的 target_ids）定位，再按
   // superseded_by === record_id 确认归属（同一旧 record 可能被多次替代）。
+  //
+  // 失败语义：restore 抛错的目标记入 failedIds 并**不追加 reverted 事件**——
+  // 事件一旦落账，409 幂等检查会永久挡住重试，而 deleteL1 已经执行，那次失败
+  // 的旧记录就永远丢了。不记事件 → 重试合法；upsert/deleteL1 幂等，重试会
+  // 重放整个恢复（已恢复的 snapshot 内容不变，只有 updatedAt 刷新）。
+  // snapshot 缺失（superseded 事件是 best-effort 写入，可能没落上）不是
+  // 可重试的错误，记入 missingIds 随响应上报。
   const restoredIds: string[] = [];
+  const failedIds: string[] = [];
+  const missingIds: string[] = [];
   if (lastWrite.op !== "created") {
     const embedding = deps.getEmbedding();
     for (const targetId of lastWrite.supersedes ?? []) {
       const targetEvents = await store.queryMemoryEvents({ record_id: targetId, ...isoScope, limit: 100 });
       const snap = targetEvents.filter((e) => e.op === "superseded" && e.superseded_by === record_id).pop();
-      if (!snap?.snapshot_json) continue;
+      if (!snap?.snapshot_json) {
+        missingIds.push(targetId);
+        continue;
+      }
       try {
         const row = JSON.parse(snap.snapshot_json) as L1RecordRow;
         const restored: MemoryRecord = {
@@ -1414,8 +1429,16 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
         deps.logger.warn(
           `${TAG} revert restore failed for ${targetId}: ${err instanceof Error ? err.message : String(err)}`,
         );
+        failedIds.push(targetId);
       }
     }
+  }
+  if (failedIds.length > 0) {
+    return errorEnvelope(
+      500,
+      `Revert incomplete for ${record_id}: failed to restore [${failedIds.join(", ")}] — retry is allowed (no revert marker was recorded)`,
+      requestId,
+    );
   }
 
   // 追加 reverted 事件：record_id=被撤销的新 record，supersedes=恢复的旧 id 列表。
@@ -1441,7 +1464,14 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
     deps.logger.warn(`${TAG} reverted event append failed (non-fatal) for ${record_id}: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  return successEnvelope({ record_id, reverted: true, restored: restoredIds }, requestId);
+  return successEnvelope({
+    record_id,
+    reverted: true,
+    restored: restoredIds,
+    // Targets whose superseded snapshot never landed (best-effort write gap)
+    // — they could not be restored, and retrying won't change that.
+    ...(missingIds.length > 0 ? { missing: missingIds } : {}),
+  }, requestId);
 }
 
 async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

@@ -162,6 +162,16 @@ function requireNodeSqlite(): typeof import("node:sqlite") {
   return require("node:sqlite") as typeof import("node:sqlite");
 }
 
+/**
+ * Column list shared by all `l1_records` SELECT statements — the fixed
+ * prepared-statement matrix and the dynamic record_id-IN path must project
+ * the same row shape for `L1RecordRow` consumers.
+ */
+const L1_QUERY_COLS = `record_id, content, type, priority, scene_name, session_key, session_id,
+  team_id, task_id, user_id, agent_id, version,
+  timestamp_str, timestamp_start, timestamp_end,
+  created_time, updated_time, metadata_json`;
+
 // ============================
 // FTS5 / keyword helpers
 // ============================
@@ -1087,10 +1097,7 @@ export class VectorStore implements IMemoryStore {
     // L1 query statements (for l1-reader)
     // user_id / agent_id surfaced in every L1 read so callers (router /
     // candidate-pool / l1-reader) can enforce isolation downstream.
-    const l1QueryCols = `record_id, content, type, priority, scene_name, session_key, session_id,
-      team_id, task_id, user_id, agent_id, version,
-      timestamp_str, timestamp_start, timestamp_end,
-      created_time, updated_time, metadata_json`;
+    const l1QueryCols = L1_QUERY_COLS;
 
     this.stmtQueryBySessionId = this.db.prepare(`
       SELECT ${l1QueryCols} FROM l1_records
@@ -1668,9 +1675,10 @@ export class VectorStore implements IMemoryStore {
   }
 
   /**
-   * Query L1 records with optional session and time filters.
+   * Query L1 records with optional record-id, session and time filters.
    *
-   * Uses the composite index `idx_l1_session_updated(session_id, updated_time)`
+   * A non-empty `recordIds` list takes the primary-key IN path; otherwise the
+   * composite index `idx_l1_session_updated(session_id, updated_time)` is used
    * for efficient filtering. All timestamps are compared as UTC ISO 8601 strings.
    *
    * **Fault-tolerant**: returns an empty array on any error (degraded mode, DB issues).
@@ -1681,12 +1689,35 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      const { sessionKey, sessionId, taskId, updatedAfter } = filter ?? {};
+      const { sessionKey, sessionId, taskId, updatedAfter, recordIds } = filter ?? {};
 
       let raw: Record<string, unknown>[];
 
-      // Priority: sessionId > sessionKey (sessionId is more specific)
-      if (sessionId && updatedAfter) {
+      // Targeted lookup by primary key. Matches MongoDB ($in on _id) and
+      // TCVDB (documentIds) semantics: an empty/absent list falls through to
+      // the session/time statement matrix; a non-empty list narrows by
+      // record_id while the remaining predicates still apply.
+      if (recordIds && recordIds.length > 0) {
+        const conditions = [`record_id IN (${recordIds.map(() => "?").join(",")})`];
+        const params: SQLInputValue[] = [...recordIds];
+        // Priority: sessionId > sessionKey (sessionId is more specific)
+        if (sessionId) {
+          conditions.push("session_id = ?");
+          params.push(sessionId);
+        } else if (sessionKey) {
+          conditions.push("session_key = ?");
+          params.push(sessionKey);
+        }
+        if (updatedAfter) {
+          conditions.push("updated_time > ?");
+          params.push(updatedAfter);
+        }
+        raw = this.db
+          .prepare(
+            `SELECT ${L1_QUERY_COLS} FROM l1_records WHERE ${conditions.join(" AND ")} ORDER BY updated_time ASC`,
+          )
+          .all(...params) as Record<string, unknown>[];
+      } else if (sessionId && updatedAfter) {
         raw = this.stmtQueryBySessionIdSince.all(sessionId, updatedAfter) as Record<string, unknown>[];
       } else if (sessionId) {
         raw = this.stmtQueryBySessionId.all(sessionId) as Record<string, unknown>[];
@@ -1721,7 +1752,7 @@ export class VectorStore implements IMemoryStore {
       if (taskId !== undefined) rows = rows.filter((r) => r.task_id === taskId);
 
       this.logger?.info(
-        `${TAG} [L1-query] filter={sessionKey=${sessionKey ?? "(all)"}, sessionId=${sessionId ?? "(all)"}, teamId=${filter?.teamId ?? "(all)"}, userId=${filter?.userId ?? "(all)"}, agentId=${filter?.agentId ?? "(all)"}, taskId=${taskId ?? "(all)"}, updatedAfter=${updatedAfter ?? "(none)"}}, ` +
+        `${TAG} [L1-query] filter={sessionKey=${sessionKey ?? "(all)"}, sessionId=${sessionId ?? "(all)"}, teamId=${filter?.teamId ?? "(all)"}, userId=${filter?.userId ?? "(all)"}, agentId=${filter?.agentId ?? "(all)"}, taskId=${taskId ?? "(all)"}, updatedAfter=${updatedAfter ?? "(none)"}, recordIds=${recordIds?.length ?? "(none)"}}, ` +
         `returned ${rows.length} record(s)`,
       );
       return rows;

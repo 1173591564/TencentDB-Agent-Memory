@@ -1218,6 +1218,9 @@ async function handleAtomicCount(body: unknown, _auth: V2AuthContext, requestId:
  * 语义同 conversation/query：session_id 来自 body）。
  * MemoryEventFilter 在 store 层还支持 op/session_key/时间窗过滤，endpoint 只暴露
  * session_id + 分页；需要更细查询时再加参数。
+ * 响应分页字段：count=本页变更组数、has_more、next_offset —— 分页以原始事件
+ * 为单位，变更组可能被页边界拆开（拆出的 superseded 行以孤儿组形式落在它
+ * 所在的那一页）。
  */
 async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = memoryDiffRequestSchema.safeParse(body);
@@ -1230,15 +1233,22 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   }
   const iso = deps.requestIsolation;
 
-  const events = await store.queryMemoryEvents({
+  const limit = parsed.data.limit;
+  const offset = parsed.data.offset;
+  // Overfetch one row as a has_more probe. queryMemoryEvents clamps limit to
+  // 1000, so at limit=1000 the probe is absorbed and we fall back to the
+  // "a full page implies maybe more" heuristic (worst case: one empty page).
+  const fetched = await store.queryMemoryEvents({
     session_id: parsed.data.session_id,
-    limit: parsed.data.limit,
-    offset: parsed.data.offset,
+    limit: limit + 1,
+    offset,
     team_id: iso?.teamId,
     user_id: iso?.userId,
     agent_id: iso?.agentId,
     task_id: iso?.taskId,
   });
+  const hasMore = fetched.length > limit || (limit >= 1000 && fetched.length === limit);
+  const events = fetched.slice(0, limit);
 
   // Join superseded rows onto their replacing record (superseded_by → record_id).
   const supersededByNew = new Map<string, typeof events>();
@@ -1288,7 +1298,15 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     changes.push({ op: e.op, ...eventShape(e), replaced });
   }
 
-  return successEnvelope({ changes, total: changes.length }, requestId);
+  return successEnvelope({
+    changes,
+    // `count` is the change groups on this page (not a session-wide total):
+    // pagination happens at the raw-event level, aggregation at the change
+    // level, so a page boundary can split an update from its superseded rows.
+    count: changes.length,
+    has_more: hasMore,
+    next_offset: offset + events.length,
+  }, requestId);
 }
 
 async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

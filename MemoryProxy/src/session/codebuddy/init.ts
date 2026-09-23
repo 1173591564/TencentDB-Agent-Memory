@@ -41,7 +41,7 @@ import {
 import { getLastUserMessageText } from "./cleaner.js";
 import { emitSessionInitTelemetryIfCompleted } from "../init-telemetry.js";
 import { isDshRuntimeContextSnapshot } from "../../common/user-query-extractor.js";
-import { extractHermesAnswers } from "../hermes/extractor.js";
+import { unwrapClarifyJson } from "../hermes/extractor.js";
 import {
   CODEX_MORE_LABEL,
   DEFAULT_GATE_PREFIX,
@@ -245,7 +245,7 @@ function withCodexPageIndex(
  * @returns null=非 MORE；number=翻页后的 pageIndex（越界回绕 0）
  */
 function paginationAnswerText(answerText: string, agentSource: string): string {
-  return agentSource === "hermes" ? extractHermesAnswers(answerText) ?? answerText : answerText;
+  return agentSource === "hermes" ? unwrapClarifyJson(answerText) : answerText;
 }
 
 function detectWorkbuddyMorePage(

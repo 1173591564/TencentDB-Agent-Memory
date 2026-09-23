@@ -194,17 +194,15 @@ export async function writeMemory(params: {
   // targets (store action): superseded events are best-effort, the authoritative
   // write path (JSONL + vector upsert) is unaffected either way.
   //
-  // NOTE: the sqlite queryL1Records ignores `recordIds` (returns all rows), so
-  // we filter by target_ids ourselves. `existing` keeps the unfiltered rows to
-  // preserve the pre-existing maxVersion semantics; supersededTargets is the
-  // event-only narrowed view.
+  // `queryL1Records` honors `recordIds` on all backends (sqlite PK-IN lookup,
+  // MongoDB $in, TCVDB documentIds), so `existing` is already narrowed to the
+  // targeted lineage — the same rows drive both the superseded snapshots and
+  // the next-version computation.
   let supersededTargets: Awaited<ReturnType<NonNullable<typeof vectorStore>["queryL1Records"]>> = [];
   if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0 && vectorStore) {
     try {
-      const existing = await vectorStore.queryL1Records({ recordIds: decision.target_ids });
-      const targetSet = new Set(decision.target_ids);
-      supersededTargets = existing.filter((row) => targetSet.has(row.record_id));
-      const maxVersion = existing.reduce((max, row) => Math.max(max, row.version ?? 0), 0);
+      supersededTargets = await vectorStore.queryL1Records({ recordIds: decision.target_ids });
+      const maxVersion = supersededTargets.reduce((max, row) => Math.max(max, row.version ?? 0), 0);
       nextVersion = maxVersion + 1;
     } catch (err) {
       logger?.warn?.(`${TAG} Failed to read existing memory version, defaulting to v0: ${err instanceof Error ? err.message : String(err)}`);

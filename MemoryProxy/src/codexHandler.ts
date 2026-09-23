@@ -116,15 +116,27 @@ function extractLatestCodexUserMessage(input: unknown): TdaiMessage | null {
 }
 
 /**
- * Codex tool-loop continuation: every /v1/responses round after the first
- * carries function_call_output in input[] — its user message is historical,
+ * Codex tool-loop continuation: the newest input of this round is a tool
+ * result, not a user message.
+ *
+ * codex re-sends the FULL conversation history in input[] on every round
+ * (see countHumanTurnsCodex below), so "any function_call_output present"
+ * would also swallow genuinely new user turns after the first tool loop.
+ * The round is a continuation only while the last function_call_output
+ * appears AFTER the last user message — its user message is historical,
  * not new (writing it per-round duplicated L0 rows, upstream issue #1245).
  */
 export function isToolLoopContinuation(input: unknown): boolean {
   if (!Array.isArray(input)) return false;
-  return input.some(
-    (item) => (item as Record<string, unknown> | null | undefined)?.type === "function_call_output",
-  );
+  let lastUserIdx = -1;
+  let lastOutputIdx = -1;
+  for (let i = 0; i < input.length; i++) {
+    const it = input[i] as Record<string, unknown> | null | undefined;
+    if (!it || typeof it !== "object") continue;
+    if (it.type === "function_call_output") lastOutputIdx = i;
+    else if (it.type === "message" && it.role === "user") lastUserIdx = i;
+  }
+  return lastOutputIdx > lastUserIdx;
 }
 
 // ── Codex session state (exported for unit tests) ────────────────────────────

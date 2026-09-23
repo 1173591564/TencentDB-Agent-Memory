@@ -326,6 +326,7 @@ export async function extractL1Memories(params: {
       const resolvedDecisions = await resolveTargetCollisions({
         decisions,
         memories: memoriesWithIds,
+        messages,
         config,
         logger,
         model: options.model,

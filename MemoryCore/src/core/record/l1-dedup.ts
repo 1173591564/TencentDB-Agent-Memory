@@ -15,6 +15,7 @@
  */
 
 import type { MemoryPromptMode } from "../../config.js";
+import type { ConversationMessage } from "../conversation/l0-recorder.js";
 import type { ExtractedMemory, MemoryRecord, DedupDecision, MemoryType } from "./l1-writer.js";
 import { formatBatchConflictPrompt, getConflictDetectionSystemPrompt } from "../prompts/l1-dedup.js";
 import type { CandidateMatch } from "../prompts/l1-dedup.js";
@@ -435,6 +436,8 @@ function fallbackStoreAll(memories: Array<ExtractedMemory & { record_id: string 
 export async function resolveTargetCollisions(params: {
   decisions: DedupDecision[];
   memories: Array<ExtractedMemory & { record_id: string }>;
+  /** Source conversation — orders colliding memories by recency for the merge LLM. */
+  messages?: ConversationMessage[];
   config?: unknown;
   logger?: Logger;
   model?: string;
@@ -442,7 +445,7 @@ export async function resolveTargetCollisions(params: {
   vectorStore?: IMemoryStore;
   traceContext?: TraceContext;
 }): Promise<DedupDecision[]> {
-  const { decisions, memories, config, logger, model, llmRunner, vectorStore, traceContext } = params;
+  const { decisions, memories, messages, config, logger, model, llmRunner, vectorStore, traceContext } = params;
   const active = decisions.filter(
     (d) => (d.action === "update" || d.action === "merge") && d.target_ids.length > 0,
   );
@@ -473,7 +476,7 @@ export async function resolveTargetCollisions(params: {
 
   for (const group of groups.values()) {
     if (group.length < 2) continue;
-    const merged = await mergeCollidingGroup(group, memories, vectorStore, config, logger, model, llmRunner, traceContext);
+    const merged = await mergeCollidingGroup(group, memories, messages, vectorStore, config, logger, model, llmRunner, traceContext);
     if (!merged) continue;
 
     const keeper = group[0];
@@ -495,6 +498,7 @@ export async function resolveTargetCollisions(params: {
 async function mergeCollidingGroup(
   group: DedupDecision[],
   memories: Array<ExtractedMemory & { record_id: string }>,
+  messages: ConversationMessage[] | undefined,
   vectorStore: IMemoryStore | undefined,
   config: unknown,
   logger: Logger | undefined,
@@ -504,10 +508,22 @@ async function mergeCollidingGroup(
 ): Promise<Partial<DedupDecision> | null> {
   try {
     const byId = new Map(memories.map((m) => [m.record_id, m]));
+    // Order colliding memories by their latest source-message timestamp so the
+    // merge LLM can honor "later value wins". Without message context this
+    // degrades to the extraction batch order (still a reasonable proxy).
+    const tsById = new Map((messages ?? []).map((m) => [m.id, m.timestamp]));
     const newItems = group
       .map((d) => byId.get(d.record_id))
       .filter((m): m is ExtractedMemory & { record_id: string } => !!m)
-      .map((m) => ({ record_id: m.record_id, content: m.content, type: m.type, priority: m.priority }));
+      .map((m) => ({
+        m,
+        ts: m.source_message_ids.reduce((max, id) => {
+          const t = tsById.get(id);
+          return t !== undefined && t > max ? t : max;
+        }, 0),
+      }))
+      .sort((a, b) => a.ts - b.ts)
+      .map(({ m }, i) => ({ order: i, record_id: m.record_id, content: m.content, type: m.type, priority: m.priority }));
     if (newItems.length < 2) return null;
 
     let targetItems: Array<{ record_id: string; content: string }> = [];
@@ -531,7 +547,7 @@ async function mergeCollidingGroup(
       "## 相互冲突的新记忆",
       JSON.stringify(newItems, null, 2),
       "",
-      "同一事实有多个值时，以对话中出现得更晚的值为准；其余记忆中仍成立的信息保留进合并结果。输出语言与新记忆一致。",
+      "每条新记忆带 order 字段：order 越大表示其来源消息在对话中出现得越晚。同一事实有多个值时，以 order 最大的值为准；其余记忆中仍成立的信息保留进合并结果。输出语言与新记忆一致。",
       '严格输出单个 JSON 对象：{"merged_content": "...", "merged_type": "persona|episodic|instruction|work_fact|work_task|work_method|work_artifact", "merged_priority": 85, "merged_timestamps": ["..."]}',
     ].join("\n");
 

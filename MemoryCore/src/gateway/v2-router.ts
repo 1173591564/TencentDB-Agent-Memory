@@ -26,7 +26,7 @@ import type { IStateBackend } from "../core/state/types.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
-import type { MemoryRecord } from "../core/record/l1-writer.js";
+import { appendRevertTombstone, type MemoryRecord } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
 // ── Zod schemas (validated types + defaults) ──
@@ -1256,8 +1256,11 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   // Join superseded rows onto their replacing record (superseded_by → record_id).
   const supersededByNew = new Map<string, typeof events>();
   const newRecordIds = new Set(events.filter((e) => e.op !== "superseded").map((e) => e.record_id));
-  // reverted 事件的 record_id 是被撤销的新 record —— 给对应 change 打标记。
-  const revertedIds = new Set(events.filter((e) => e.op === "reverted").map((e) => e.record_id));
+  // reverted 事件的 record_id 是被撤销的新 record —— 给对应 change 打标记，
+  // 并带上驳回者身份（reviewer_id，审核操作发生时的 isolation user）。
+  const revertedBy = new Map<string, string | undefined>(
+    events.filter((e) => e.op === "reverted").map((e) => [e.record_id, e.reviewer_id]),
+  );
   for (const e of events) {
     if (e.op === "superseded" && e.superseded_by) {
       const arr = supersededByNew.get(e.superseded_by) ?? [];
@@ -1287,6 +1290,8 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     origin_session_key?: string;
     /** 该 change 已被 revert 撤销（reverted 事件 record_id 命中）。 */
     reverted?: boolean;
+    /** 驳回者身份（reverted 事件的 reviewer_id）。 */
+    reverted_by?: string;
     replaced: Array<{
       record_id: string; content: string; memory_type?: string;
       version: number; event_ts: string; origin_session_id?: string; origin_session_key?: string;
@@ -1302,11 +1307,13 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
       continue;
     }
     const replaced = (supersededByNew.get(e.record_id) ?? []).map((s) => eventShape(s));
+    const revertedById = revertedBy.get(e.record_id);
     changes.push({
       op: e.op,
       ...eventShape(e),
       replaced,
-      ...(revertedIds.has(e.record_id) ? { reverted: true } : {}),
+      ...(revertedBy.has(e.record_id) ? { reverted: true } : {}),
+      ...(revertedById ? { reverted_by: revertedById } : {}),
     });
   }
 
@@ -1459,10 +1466,23 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
       memory_type: lastWrite.memory_type,
       version: lastWrite.version,
       supersedes: restoredIds,
+      // 审核者身份（v3 isolation 的 user）——事件归属仍是原 session，
+      // 但"谁驳回的"要可查。
+      reviewer_id: iso?.userId,
     });
   } catch (err) {
     deps.logger.warn(`${TAG} reverted event append failed (non-fatal) for ${record_id}: ${err instanceof Error ? err.message : String(err)}`);
   }
+
+  // JSONL 墓碑：revert 只删了向量侧，而 JSONL 是声明的备份/恢复 source of
+  // truth——不写墓碑，回放/迁移会复活已驳回的记录。best-effort：事件流是
+  // 权威审计，墓碑失败不阻塞。
+  await appendRevertTombstone({
+    recordId: record_id,
+    reviewerId: iso?.userId,
+    storage: deps.getStorage(),
+    logger: deps.logger,
+  });
 
   return successEnvelope({
     record_id,

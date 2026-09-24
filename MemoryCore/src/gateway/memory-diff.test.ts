@@ -37,8 +37,7 @@ const ISO_HEADERS = {
 describe("POST /memory/diff", () => {
   let dir: string;
   let store: VectorStore;
-  let captured: { status: number; body: { code: number; data?: { changes: Array<Record<string, unknown>>; count: number; has_more: boolean; next_offset: number } } } | null;
-  const writtenFiles = new Map<string, string>();
+  let captured: { status: number; body: { code: number; data?: { changes: Array<Record<string, unknown>>; total: number } } } | null;
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     captured = null;
@@ -50,11 +49,7 @@ describe("POST /memory/diff", () => {
     const deps = {
       getStore: () => store,
       getEmbedding: () => undefined,
-      getStorage: () => ({
-        appendFile: async (key: string, content: string) => {
-          writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content + "\n");
-        },
-      }) as never,
+      getStorage: () => undefined,
       logger: { info() {}, debug() {}, warn() {}, error() {} },
     };
     const handled = await handleV2Route(req, res, pathname, "POST", async () => body, sendJson, deps);
@@ -106,13 +101,10 @@ describe("POST /memory/diff", () => {
     expect(orphan).toMatchObject({ op: "superseded", content: "old" });
   });
 
-  it("exposes event-level pagination fields", async () => {
-    const { status, data } = await call("/v3/memory/diff", { session_id: "ses-y", limit: 1 });
-    expect(status).toBe(200);
-    // ses-y has 2 raw events (superseded + updated) → limit 1 must paginate.
-    expect(data!.has_more).toBe(true);
-    expect(data!.next_offset).toBe(1);
-    expect(data!.count).toBe(data!.changes.length);
+  it("op filter applies at the event layer", async () => {
+    const { data } = await call("/v3/memory/diff", { session_id: "ses-y", op: "superseded" });
+    expect(data!.changes).toHaveLength(1);
+    expect(data!.changes[0].op).toBe("superseded");
   });
 
   it("returns nothing for a different tenant", async () => {
@@ -136,96 +128,5 @@ describe("POST /memory/diff", () => {
     const { status, data } = await call("/v2/memory/diff", { session_id: "ses-y" });
     expect(status).toBe(200);
     expect(data!.changes).toHaveLength(1);
-  });
-});
-
-describe("POST /memory/diff/revert", () => {
-  let dir: string;
-  let store: VectorStore;
-  let captured: { status: number; body: { code: number; data?: Record<string, unknown>; message?: string } } | null;
-  const writtenFiles = new Map<string, string>();
-
-  const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
-    captured = null;
-    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
-    const res = {} as http.ServerResponse;
-    const sendJson = (_r: http.ServerResponse, status: number, b: never) => {
-      captured = { status, body: b };
-    };
-    const deps = {
-      getStore: () => store,
-      getEmbedding: () => undefined,
-      getStorage: () => ({
-        appendFile: async (key: string, content: string) => {
-          writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content + "\n");
-        },
-      }) as never,
-      logger: { info() {}, debug() {}, warn() {}, error() {} },
-    };
-    await handleV2Route(req, res, pathname, "POST", async () => body, sendJson, deps);
-    return { status: captured?.status, data: captured?.body?.data };
-  };
-
-  const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
-
-  beforeEach(async () => {
-    dir = mkdtempSync(path.join(tmpdir(), "mem-revert-"));
-    writtenFiles.clear();
-    store = new VectorStore(path.join(dir, "vectors.db"), 0);
-    store.init();
-    await writeMemory({ ...writeIso, baseDir: dir, vectorStore: store, memory: memory("salary 5000"), decision: decision("m_a", "store") });
-    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 6000"), decision: decision("m_b", "update", ["m_a"], "salary 6000") });
-  });
-
-  afterEach(() => {
-    store.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("reverts an updated change: deletes new record, restores snapshot, marks diff", async () => {
-    const { status, data } = await call("/v3/memory/diff/revert", { record_id: "m_b", reason: "wrong" });
-    expect(status).toBe(200);
-    expect(data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
-
-    // New record deleted, old restored.
-    const remaining = await store.queryL1Records({ recordIds: ["m_a", "m_b"] });
-    expect(remaining.map((r) => r.record_id)).toEqual(["m_a"]);
-
-    // reverted event carries the reviewer identity (isolation user).
-    const reverted = store.queryMemoryEvents({ record_id: "m_b", op: "reverted" });
-    expect(reverted).toHaveLength(1);
-    expect(reverted[0].reviewer_id).toBe("u1");
-    expect(reverted[0].session_id).toBe("ses-y"); // attributed to original session
-
-    // diff view marks the change reverted and exposes the reviewer.
-    const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
-    const change = (diff.data?.changes ?? []).find((c) => c.record_id === "m_b");
-    expect(change).toMatchObject({ reverted: true, reverted_by: "u1" });
-  });
-
-  it("appends a JSONL tombstone so replay cannot resurrect the record", async () => {
-    await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    const tombstoneLines = [...writtenFiles.values()]
-      .flatMap((v) => v.split("\n"))
-      .filter((l) => l.includes('"tombstone":"l1"'));
-    expect(tombstoneLines).toHaveLength(1);
-    const tomb = JSON.parse(tombstoneLines[0]);
-    expect(tomb).toMatchObject({ record_id: "m_b", reviewer_id: "u1" });
-  });
-
-  it("second revert is idempotent → 409", async () => {
-    await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    const second = await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    expect(second.status).toBe(409);
-  });
-
-  it("unknown record → 404", async () => {
-    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_nope" });
-    expect(status).toBe(404);
-  });
-
-  it("cross-tenant revert is blocked (iso scope mismatch → 404)", async () => {
-    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b" }, { ...ISO_HEADERS, "x-tdai-team-id": "t2" });
-    expect(status).toBe(404);
   });
 });

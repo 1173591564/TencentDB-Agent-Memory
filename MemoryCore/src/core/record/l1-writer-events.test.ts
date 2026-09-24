@@ -110,4 +110,36 @@ describe("writeMemory memory events", () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ op: "updated", record_id: "m_o" });
   });
+
+  it("update actually deletes a cross-session target (agent-scope delete filter)", async () => {
+    // Regression: the delete filter used to carry the WRITER's sessionId/
+    // sessionKey, so a supersede target written by another session was
+    // silently skipped by rowMatchesIsolation — it stayed recallable even
+    // though the superseded event claimed it was replaced.
+    await writeMemory({ ...iso(), memory: memory("salary is 5000"), decision: decision("m_a", "store") });
+    await writeMemory({
+      ...iso(),
+      sessionId: "ses-y", // different session, same team/user/agent
+      memory: memory("salary is 6000"),
+      decision: decision("m_b", "update", ["m_a"], "salary is 6000"),
+    });
+
+    const remaining = await store.queryL1Records({ recordIds: ["m_a", "m_b"] });
+    expect(remaining.map((r) => r.record_id)).toEqual(["m_b"]);
+  });
+
+  it("delete filter still enforces tenant isolation", async () => {
+    // A target outside the caller's tenant must not be deleted — the filter
+    // drops session dims, not team/user/agent.
+    await writeMemory({
+      ...iso(), teamId: "t-other", userId: "u-other", agentId: "a-other",
+      memory: memory("foreign"), decision: decision("m_foreign", "store"),
+    });
+    await writeMemory({
+      ...iso(), sessionId: "ses-y",
+      memory: memory("mine"), decision: decision("m_b", "update", ["m_foreign"], "mine"),
+    });
+    const remaining = await store.queryL1Records({ recordIds: ["m_foreign"] });
+    expect(remaining).toHaveLength(1);
+  });
 });

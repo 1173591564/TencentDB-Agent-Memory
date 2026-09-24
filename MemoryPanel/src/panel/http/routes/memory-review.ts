@@ -1,9 +1,11 @@
 /**
  * Memory Review 路由 —— 记忆变更集（session diff）的查询与撤销代理。
  *
- * 两个端点都是数据面透明代理，直接转发到内核 /v3/memory/*：
- *   POST /api/v1/memory/diff        → POST /v3/memory/diff
- *   POST /api/v1/memory/diff/revert → POST /v3/memory/diff/revert
+ * 四个端点都是数据面透明代理，直接转发到内核 /v3/memory/*：
+ *   POST /api/v1/memory/diff         → POST /v3/memory/diff
+ *   POST /api/v1/memory/diff/revert  → POST /v3/memory/diff/revert（含 record_ids[] 批量）
+ *   POST /api/v1/memory/history      → POST /v3/memory/history（单条记录事件血统）
+ *   POST /api/v1/memory/review/inbox → POST /v3/memory/review/inbox（跨 session 收件箱）
  *
  * body 原样透传（session_id / record_id / reason / team_id / user_id /
  * agent_id 由调用方提供，内核侧做 v3 严格隔离校验——缺三元组直接 422）。
@@ -47,6 +49,22 @@ export function registerMemoryReviewRoutes(api: Hono, deps: PanelDeps): void {
     const body = await readJson(c);
     const cred = toKernelCredentials(ctx, { timeoutMs: 30_000 });
     const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/diff/revert', body, cred);
+    return respondEnvelope(c, envelope);
+  });
+
+  api.post('/memory/history', validatePanelMetaHeaders(deps), async (c) => {
+    const ctx = buildCtx(c);
+    const body = await readJson(c);
+    const cred = toKernelCredentials(ctx, { timeoutMs: 15_000 });
+    const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/history', body, cred);
+    return respondEnvelope(c, envelope);
+  });
+
+  api.post('/memory/review/inbox', validatePanelMetaHeaders(deps), async (c) => {
+    const ctx = buildCtx(c);
+    const body = await readJson(c);
+    const cred = toKernelCredentials(ctx, { timeoutMs: 15_000 });
+    const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/review/inbox', body, cred);
     return respondEnvelope(c, envelope);
   });
 }

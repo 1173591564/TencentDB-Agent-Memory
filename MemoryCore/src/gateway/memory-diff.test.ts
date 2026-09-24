@@ -44,10 +44,11 @@ describe("POST /memory/diff", () => {
     captured = null;
     const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
     const res = {} as http.ServerResponse;
-    const sendJson = (_r: http.ServerResponse, status: number, b: typeof captured extends null ? never : NonNullable<typeof captured>["body"]) => {
-      captured = { status, body: b };
+    const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
+      captured = { status, body: b as NonNullable<typeof captured>["body"] };
     };
     const deps = {
+      deployMode: "service",
       getStore: () => store,
       getEmbedding: () => undefined,
       getStorage: () => ({
@@ -56,9 +57,10 @@ describe("POST /memory/diff", () => {
         },
       }) as never,
       logger: { info() {}, debug() {}, warn() {}, error() {} },
-    };
-    const handled = await handleV2Route(req, res, pathname, "POST", async () => body, sendJson, deps);
-    return { handled, status: captured?.status, data: captured?.body?.data };
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    const handled = await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
+    const cap = captured as ({ status: number; body: { code: number; data?: { changes: Array<Record<string, unknown>>; count: number; has_more: boolean; next_offset: number } } } | null);
+    return { handled, status: cap?.status, data: cap?.body?.data };
   };
 
   const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
@@ -137,6 +139,26 @@ describe("POST /memory/diff", () => {
     expect(status).toBe(200);
     expect(data!.changes).toHaveLength(1);
   });
+
+  it("op filter applies at the event layer", async () => {
+    // ses-y has superseded(m_a) + updated(m_b). op=updated drops the
+    // superseded row → the updated change has no replaced[] join target.
+    const { status, data } = await call("/v3/memory/diff", { session_id: "ses-y", op: "updated" });
+    expect(status).toBe(200);
+    expect(data!.changes).toHaveLength(1);
+    expect(data!.changes[0]).toMatchObject({ op: "updated", record_id: "m_b" });
+    expect(data!.changes[0].replaced).toEqual([]);
+
+    const created = await call("/v3/memory/diff", { session_id: "ses-y", op: "created" });
+    expect(created.data!.changes).toHaveLength(0);
+  });
+
+  it("since/until bound the event window", async () => {
+    const all = await call("/v3/memory/diff", { session_id: "ses-y", since: "2000-01-01T00:00:00Z" });
+    expect(all.data!.changes.length).toBeGreaterThan(0);
+    const empty = await call("/v3/memory/diff", { session_id: "ses-y", until: "2000-01-01T00:00:00Z" });
+    expect(empty.data!.changes).toHaveLength(0);
+  });
 });
 
 describe("POST /memory/diff/revert", () => {
@@ -149,10 +171,11 @@ describe("POST /memory/diff/revert", () => {
     captured = null;
     const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
     const res = {} as http.ServerResponse;
-    const sendJson = (_r: http.ServerResponse, status: number, b: never) => {
-      captured = { status, body: b };
+    const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
+      captured = { status, body: b as NonNullable<typeof captured>["body"] };
     };
     const deps = {
+      deployMode: "service",
       getStore: () => store,
       getEmbedding: () => undefined,
       getStorage: () => ({
@@ -161,9 +184,10 @@ describe("POST /memory/diff/revert", () => {
         },
       }) as never,
       logger: { info() {}, debug() {}, warn() {}, error() {} },
-    };
-    await handleV2Route(req, res, pathname, "POST", async () => body, sendJson, deps);
-    return { status: captured?.status, data: captured?.body?.data };
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
+    const cap = captured as ({ status: number; body: { code: number; data?: Record<string, unknown> } } | null);
+    return { status: cap?.status, data: cap?.body?.data };
   };
 
   const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
@@ -199,7 +223,7 @@ describe("POST /memory/diff/revert", () => {
 
     // diff view marks the change reverted and exposes the reviewer.
     const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
-    const change = (diff.data?.changes ?? []).find((c) => c.record_id === "m_b");
+    const change = ((diff.data?.changes ?? []) as Array<Record<string, unknown>>).find((c) => c.record_id === "m_b");
     expect(change).toMatchObject({ reverted: true, reverted_by: "u1" });
   });
 
@@ -227,5 +251,184 @@ describe("POST /memory/diff/revert", () => {
   it("cross-tenant revert is blocked (iso scope mismatch → 404)", async () => {
     const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b" }, { ...ISO_HEADERS, "x-tdai-team-id": "t2" });
     expect(status).toBe(404);
+  });
+
+  it("batch revert returns per-item results; one failure does not block others", async () => {
+    const { status, data } = await call("/v3/memory/diff/revert", { record_ids: ["m_b", "m_nope"] });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ succeeded: 1, failed: 1 });
+    const results = data!.results as Array<Record<string, unknown>>;
+    expect(results).toHaveLength(2);
+    expect(results[0]).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
+    expect(results[1]).toMatchObject({ record_id: "m_nope", reverted: false, status: 404 });
+  });
+
+  it("batch revert surfaces 409 per item for already-reverted records", async () => {
+    await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    const { data } = await call("/v3/memory/diff/revert", { record_ids: ["m_b", "m_a"] });
+    const results = data!.results as Array<Record<string, unknown>>;
+    // m_b already reverted → 409; m_a was restored by the first revert → its
+    // last write event is still 'created' → can be reverted (deletes it).
+    expect(results[0]).toMatchObject({ record_id: "m_b", reverted: false, status: 409 });
+    expect(results[1]).toMatchObject({ record_id: "m_a", reverted: true });
+  });
+
+  it("rejects a batch exceeding 50 ids", async () => {
+    const ids = Array.from({ length: 51 }, (_, i) => `m_${i}`);
+    const { status } = await call("/v3/memory/diff/revert", { record_ids: ids });
+    expect(status).toBe(400);
+  });
+
+  it("rejects an empty revert request", async () => {
+    const { status } = await call("/v3/memory/diff/revert", { reason: "x" });
+    expect(status).toBe(400);
+  });
+});
+
+describe("POST /memory/history", () => {
+  let dir: string;
+  let store: VectorStore;
+  let captured: { status: number; body: { code: number; data?: Record<string, unknown> } } | null;
+
+  const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
+    captured = null;
+    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const res = {} as http.ServerResponse;
+    const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
+      captured = { status, body: b as NonNullable<typeof captured>["body"] };
+    };
+    const deps = {
+      deployMode: "service",
+      getStore: () => store,
+      getEmbedding: () => undefined,
+      getStorage: () => ({
+        appendFile: async () => {},
+      }) as never,
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
+    const cap = captured as ({ status: number; body: { code: number; data?: Record<string, unknown> } } | null);
+    return { status: cap?.status, data: cap?.body?.data };
+  };
+
+  const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), "mem-history-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    await writeMemory({ ...writeIso, baseDir: dir, vectorStore: store, memory: memory("salary 5000"), decision: decision("m_a", "store") });
+    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 6000"), decision: decision("m_b", "update", ["m_a"], "salary 6000") });
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns the full lineage of a record in time order", async () => {
+    const { status, data } = await call("/v3/memory/history", { record_id: "m_b" });
+    expect(status).toBe(200);
+    const events = data!.events as Array<Record<string, unknown>>;
+    expect(events.map((e) => e.op)).toEqual(["updated"]);
+    expect(events[0]).toMatchObject({ record_id: "m_b", session_id: "ses-y", supersedes: ["m_a"] });
+  });
+
+  it("superseded record shows who replaced it", async () => {
+    const { data } = await call("/v3/memory/history", { record_id: "m_a" });
+    const events = data!.events as Array<Record<string, unknown>>;
+    const ops = events.map((e) => e.op);
+    expect(ops).toContain("created");
+    expect(ops).toContain("superseded");
+    const sup = events.find((e) => e.op === "superseded");
+    expect(sup).toMatchObject({ superseded_by: "m_b", session_id: "ses-y", origin_session_id: "ses-x" });
+  });
+
+  it("revert appends a reverted event to the lineage", async () => {
+    await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    const { data } = await call("/v3/memory/history", { record_id: "m_b" });
+    const ops = (data!.events as Array<Record<string, unknown>>).map((e) => e.op);
+    expect(ops).toEqual(["updated", "reverted"]);
+  });
+
+  it("cross-tenant history returns empty", async () => {
+    const { data } = await call("/v3/memory/history", { record_id: "m_b" }, { ...ISO_HEADERS, "x-tdai-team-id": "t2" });
+    expect(data!.events).toHaveLength(0);
+  });
+
+  it("rejects missing record_id", async () => {
+    const { status } = await call("/v3/memory/history", {});
+    expect(status).toBe(400);
+  });
+});
+
+describe("POST /memory/review/inbox", () => {
+  let dir: string;
+  let store: VectorStore;
+  let captured: { status: number; body: { code: number; data?: Record<string, unknown> } } | null;
+
+  const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
+    captured = null;
+    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const res = {} as http.ServerResponse;
+    const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
+      captured = { status, body: b as NonNullable<typeof captured>["body"] };
+    };
+    const deps = {
+      deployMode: "service",
+      getStore: () => store,
+      getEmbedding: () => undefined,
+      getStorage: () => ({
+        appendFile: async () => {},
+      }) as never,
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
+    const cap = captured as ({ status: number; body: { code: number; data?: Record<string, unknown> } } | null);
+    return { status: cap?.status, data: cap?.body?.data };
+  };
+
+  const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), "mem-inbox-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    await writeMemory({ ...writeIso, baseDir: dir, vectorStore: store, memory: memory("salary 5000"), decision: decision("m_a", "store") });
+    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 6000"), decision: decision("m_b", "update", ["m_a"], "salary 6000") });
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("aggregates sessions across the tenant without needing a session_id", async () => {
+    const { status, data } = await call("/v3/memory/review/inbox", {});
+    expect(status).toBe(200);
+    const sessions = data!.sessions as Array<Record<string, unknown>>;
+    const bySid = new Map(sessions.map((s) => [s.session_id, s]));
+    // ses-x: 1 created; ses-y: 1 updated (its superseded row is part of the
+    // updated change, not an independent change — but counts in by_op).
+    expect(bySid.get("ses-x")).toMatchObject({ changes: 1, has_reverted: false });
+    expect(bySid.get("ses-y")).toMatchObject({ changes: 1, has_reverted: false });
+    expect((bySid.get("ses-y")!.by_op as Record<string, number>).superseded).toBe(1);
+  });
+
+  it("marks sessions containing reverted events", async () => {
+    await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    const { data } = await call("/v3/memory/review/inbox", {});
+    const sesY = (data!.sessions as Array<Record<string, unknown>>).find((s) => s.session_id === "ses-y");
+    expect(sesY).toMatchObject({ has_reverted: true });
+  });
+
+  it("scopes to the tenant — other teams see nothing", async () => {
+    const { data } = await call("/v3/memory/review/inbox", {}, { ...ISO_HEADERS, "x-tdai-team-id": "t2" });
+    expect(data!.sessions).toHaveLength(0);
+  });
+
+  it("until filter bounds the scan window", async () => {
+    const { data } = await call("/v3/memory/review/inbox", { until: "2000-01-01T00:00:00Z" });
+    expect(data!.sessions).toHaveLength(0);
   });
 });

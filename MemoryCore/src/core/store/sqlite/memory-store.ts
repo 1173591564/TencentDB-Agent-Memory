@@ -892,8 +892,7 @@ export class VectorStore implements IMemoryStore {
         version            INTEGER NOT NULL DEFAULT 0,
         supersedes         TEXT NOT NULL DEFAULT '[]',
         superseded_by      TEXT NOT NULL DEFAULT '',
-        snapshot_json      TEXT NOT NULL DEFAULT '',
-        reviewer_id        TEXT NOT NULL DEFAULT ''
+        snapshot_json      TEXT NOT NULL DEFAULT ''
       )
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
@@ -901,8 +900,6 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_session_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
-    // Existing installs: backfill the reviewer_id column added for review reverts.
-    try { this.db.exec("ALTER TABLE memory_events ADD COLUMN reviewer_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
 
     // ── Custom Memory Prompt ──
     this.db.exec(`
@@ -3487,8 +3484,8 @@ export class VectorStore implements IMemoryStore {
       INSERT INTO memory_events
         (event_ts, session_key, session_id, origin_session_id, origin_session_key,
          team_id, user_id, agent_id, task_id,
-         op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       event.event_ts,
@@ -3508,7 +3505,6 @@ export class VectorStore implements IMemoryStore {
       JSON.stringify(event.supersedes ?? []),
       event.superseded_by ?? "",
       event.snapshot_json ?? "",
-      event.reviewer_id ?? "",
     );
   }
 
@@ -3535,7 +3531,7 @@ export class VectorStore implements IMemoryStore {
     const sql = `
       SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
              team_id, user_id, agent_id, task_id,
-             op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id
+             op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json
       FROM memory_events
       ${where}
       ORDER BY seq ASC
@@ -3560,7 +3556,6 @@ export class VectorStore implements IMemoryStore {
       supersedes: string;
       superseded_by: string;
       snapshot_json: string;
-      reviewer_id: string;
     }>;
     return rows.map((r) => {
       const supersedes = JSON.parse(r.supersedes) as string[];
@@ -3582,7 +3577,6 @@ export class VectorStore implements IMemoryStore {
         supersedes: supersedes.length ? supersedes : undefined,
         superseded_by: r.superseded_by || undefined,
         snapshot_json: r.snapshot_json || undefined,
-        reviewer_id: r.reviewer_id || undefined,
       };
     });
   }

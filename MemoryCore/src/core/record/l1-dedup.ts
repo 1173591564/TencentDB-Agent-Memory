@@ -41,11 +41,8 @@ const TAG = "[memory-tdai][l1-dedup]";
  * 2. Otherwise FTS ∥ client-vector in parallel, RRF-merged (same as memory_search)
  * 3. Skip conflict detection entirely — all memories go straight to "store"
  *
- * Isolation is the caller's `filter` (agent-level, cross-session — aligned
- * with memory_search / conversation query). Memories are agent-scoped
- * assets: a correction in session B must supersede records written by
- * session A of the same agent, so the recall filter carries no session
- * dimensions; tenant isolation stays via team/user/agent/task.
+ * Isolation is the caller's `filter` (production extraction is session-scoped).
+ * Do not reuse search's cross-session isolation here.
  *
  * @param memories - Newly extracted memories (with record_id)
  * @param config - OpenClaw config (for LLM access)

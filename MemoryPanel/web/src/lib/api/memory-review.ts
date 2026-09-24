@@ -20,6 +20,8 @@ export interface MemoryDiffChange {
   origin_session_key?: string;
   /** 该变更已被 revert 撤销。 */
   reverted?: boolean;
+  /** 驳回者身份（reverted 事件的 reviewer_id，审核时的 isolation user）。 */
+  reverted_by?: string;
   replaced: Array<{
     record_id: string;
     content: string;

@@ -149,6 +149,73 @@ export function generateMemoryId(): string {
   return `m_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
 }
 
+// ── Revert tombstones (JSONL replay protection) ─────────────────────────────
+//
+// JSONL is the declared source of truth for backup/recovery, but the review
+// revert path only deletes from the vector store — a later replay/recovery
+// from JSONL would silently resurrect reverted records. A tombstone line is
+// appended to the day's shard on revert; readers (l1-reader) collect
+// tombstoned ids first and skip those records. Tombstones are shaped nothing
+// like MemoryRecord (no sessionKey/content fields), so legacy readers that
+// don't know them simply drop the line.
+
+/** Shape of a JSONL tombstone line appended by the review revert path. */
+export interface L1RevertTombstone {
+  /** Marker + layer tag; lets future L0/L3 tombstones reuse the mechanism. */
+  tombstone: "l1";
+  /** The reverted (deleted) record — replay must skip this id. */
+  record_id: string;
+  /** When the revert landed (ISO 8601). */
+  reverted_at: string;
+  /** Who rejected the change (v3 isolation user), when known. */
+  reviewer_id?: string;
+}
+
+export function buildRevertTombstoneLine(
+  recordId: string,
+  reviewerId?: string,
+  at: string = new Date().toISOString(),
+): string {
+  const tombstone: L1RevertTombstone = {
+    tombstone: "l1",
+    record_id: recordId,
+    reverted_at: at,
+    ...(reviewerId ? { reviewer_id: reviewerId } : {}),
+  };
+  return JSON.stringify(tombstone);
+}
+
+/**
+ * Append a revert tombstone to today's JSONL shard (best-effort).
+ *
+ * The gateway has no local baseDir, so no fs fallback is attempted here —
+ * when no StorageAdapter is available the tombstone is skipped with a warn.
+ * The `reverted` event in the store remains the authoritative audit trail;
+ * the JSONL tombstone only protects replay/recovery from resurrection.
+ */
+export async function appendRevertTombstone(params: {
+  recordId: string;
+  reviewerId?: string;
+  storage?: StorageAdapter;
+  logger?: Logger;
+}): Promise<boolean> {
+  const { recordId, reviewerId, storage, logger } = params;
+  if (!storage) {
+    logger?.warn?.(`${TAG} revert tombstone skipped: no storage adapter (replay protection relies on store events only)`);
+    return false;
+  }
+  const shardDate = formatLocalDate(new Date());
+  try {
+    await storage.appendFile(StoragePaths.record(shardDate), buildRevertTombstoneLine(recordId, reviewerId));
+    return true;
+  } catch (err) {
+    logger?.warn?.(
+      `${TAG} revert tombstone append failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
 /**
  * Write a memory record according to the dedup decision.
  *
@@ -288,8 +355,13 @@ export async function writeMemory(params: {
     // by memory-cleaner (which reconciles against VectorStore as source of truth).
     if (vectorStore) {
       try {
-        const deleteFilter = teamId || userId || agentId || sessionId
-          ? { teamId, userId, agentId, sessionId: sessionId || undefined, sessionKey }
+        // Delete filter mirrors the CANDIDATE RECALL scope (agent-level,
+        // cross-session — see l1-extractor's dedup filter): targets may be
+        // records written by earlier sessions of the same agent, so session
+        // dimensions must NOT narrow the delete. team/user/agent/task keep
+        // tenant isolation on destructive operations.
+        const deleteFilter = teamId || userId || agentId || taskId
+          ? { teamId, userId, agentId, taskId: taskId || undefined }
           : undefined;
         if (deleteFilter) {
           await vectorStore.deleteL1Batch(decision.target_ids, deleteFilter);

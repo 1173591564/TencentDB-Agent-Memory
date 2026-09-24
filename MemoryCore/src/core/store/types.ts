@@ -631,6 +631,8 @@ export interface MemoryEvent {
   op: "created" | "updated" | "merged" | "superseded" | "reverted";
   /** 本事件对应的 record id（superseded 时为旧 record id）。 */
   record_id: string;
+  /** 审阅者（reverted 事件 = 驳回操作的执行人，来自 v3 isolation 三元组）。 */
+  reviewer_id?: string;
   /** 内容快照（superseded 时为被替代的旧内容）。 */
   content: string;
   /** 记忆类型（persona / episodic / instruction / work_*）。 */

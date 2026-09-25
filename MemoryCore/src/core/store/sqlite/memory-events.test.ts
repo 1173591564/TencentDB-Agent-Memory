@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { MemoryEvent } from "../types.js";
+import { TcvdbMemoryStore } from "../tcvdb/memory-store.js";
 import { VectorStore } from "./memory-store.js";
 
 function makeEvent(over: Partial<MemoryEvent>): MemoryEvent {
@@ -317,5 +318,66 @@ describe("memory_events migration", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// TCVDB upsert 对相同文档 id 是整体替换：事件 id 若仅是 (event_ts,
+// record_id, op, layer) 元组，同毫秒同记录同操作的**不同**事件会互相
+// 覆盖、静默丢账。id 必须携带每次 append 独立的随机后缀。
+describe("tcvdb memory_events document id uniqueness", () => {
+  /** 内存后端，建模 VectorDB upsert 的 replace 语义：同 id 覆盖。 */
+  function makeTcvdbStore() {
+    const docs = new Map<string, Record<string, unknown>>();
+    const upsertCalls: Array<Array<Record<string, unknown>>> = [];
+    const stubClient = {
+      upsert: async (_collection: string, batch: Array<Record<string, unknown>>) => {
+        upsertCalls.push(batch);
+        for (const d of batch) docs.set(String(d.id), d);
+      },
+      query: async (_collection: string, params: Record<string, unknown>) => {
+        const all = [...docs.values()];
+        const limit = Number(params.limit ?? 100);
+        const offset = Number(params.offset ?? 0);
+        return { documents: all.slice(offset, offset + limit) };
+      },
+    };
+    // _initPromise 未设置时 _ensureInit 立即返回；直接替换 client 即可白盒注入。
+    const store = new TcvdbMemoryStore({
+      url: "http://stub", username: "u", apiKey: "k",
+      database: "db", embeddingModel: "m", timeout: 5000,
+    });
+    (store as unknown as { client: unknown }).client = stubClient;
+    return { store, docs, upsertCalls };
+  }
+
+  it("distinct same-tuple events all survive upsert replace semantics", async () => {
+    const { store, docs } = makeTcvdbStore();
+    const base = {
+      event_ts: "2026-01-01T00:00:00.000Z",
+      session_key: "sk", session_id: "ses",
+      op: "updated" as const, record_id: "m_x", layer: "l1" as const,
+    };
+    await store.appendMemoryEvent({ ...base, content: "v1", request_id: "r1", version: 1 });
+    await store.appendMemoryEvent({ ...base, content: "v2", request_id: "r2", version: 2 });
+    await Promise.all([
+      store.appendMemoryEvent({ ...base, content: "v3", request_id: "r3", version: 3 }),
+      store.appendMemoryEvent({ ...base, content: "v4", request_id: "r4", version: 4 }),
+    ]);
+    expect(docs.size).toBe(4);
+    const events = await store.queryMemoryEvents({ record_id: "m_x", limit: 10 });
+    expect(events.map((e) => e.content).sort()).toEqual(["v1", "v2", "v3", "v4"]);
+  });
+
+  it("same request body replayed stays a single document (id stable per call)", async () => {
+    const { store, docs, upsertCalls } = makeTcvdbStore();
+    await store.appendMemoryEvent({
+      event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
+      op: "updated", record_id: "m_x", layer: "l1", content: "v1",
+    });
+    const doc = upsertCalls[0]![0]!;
+    expect(String(doc.id)).toContain("2026-01-01T00:00:00.000Z__m_x__updated__l1__");
+    await (store as unknown as { client: { upsert: (c: string, b: unknown[]) => Promise<void> } })
+      .client.upsert("events", [doc]);
+    expect(docs.size).toBe(1);
   });
 });

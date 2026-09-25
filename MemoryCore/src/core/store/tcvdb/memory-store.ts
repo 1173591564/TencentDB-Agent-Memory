@@ -11,6 +11,8 @@
  * All methods are fault-tolerant: return empty/false on error, never throw.
  */
 
+import { randomUUID } from "node:crypto";
+
 import type { MemoryRecord } from "../../record/l1-writer.js";
 import type { EmbeddingProviderInfo } from "../embedding.js";
 import type {
@@ -2577,10 +2579,15 @@ export class TcvdbMemoryStore implements IMemoryStore {
     await this._ensureInit();
     if (this.degraded) return;
 
-    // id 用 event_ts + record_id + op + layer 组合（append-only 流水无自然
-    // 主键；layer 必带——recordClearAudit 同毫秒同 record_id+op 写 L1/L2/L3
-    // 三条，不带 layer 会静默覆盖丢事件）。
-    const id = `${event.event_ts}__${event.record_id}__${event.op}__${event.layer ?? "l1"}`;
+    // id = 元组前缀 + 每次 append 一个 randomUUID 后缀。
+    // 元组前缀保留可读性与 queryMemoryEvents 里 id tiebreak 的分组语义；
+    // uuid 后缀必需——TCVDB upsert 对相同 id 是整体替换：两条 (ts, record_id,
+    // op, layer) 相同但内容不同的事件（同毫秒同记录的两次 updated 镜像、
+    // 并发 append）在纯元组键下会互相覆盖、静默丢一条。
+    // uuid 在 upsert 前生成：客户端对同一请求体的内部重试复用同一 doc →
+    // 请求内幂等；跨 append 调用的去重是另一层契约，append-only 语义下
+    // 重复可见、丢失不可见，宁可重复。
+    const id = `${event.event_ts}__${event.record_id}__${event.op}__${event.layer ?? "l1"}__${randomUUID()}`;
     // dim=1 占位向量（events 不需向量检索，仅用 filter 查询）
     const doc: Record<string, unknown> = {
       id,

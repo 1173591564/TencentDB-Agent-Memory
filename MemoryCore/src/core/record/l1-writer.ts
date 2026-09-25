@@ -364,8 +364,10 @@ export async function writeMemory(params: {
   let upsertOk = false;
   if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0) {
     // Remove target records from VectorStore (real-time deletion for retrieval accuracy).
-    // JSONL is append-only — old records remain in files and are cleaned up periodically
-    // by memory-cleaner (which reconciles against VectorStore as source of truth).
+    // JSONL is append-only — old records remain in files and age out by whole
+    // shard: memory-cleaner unlinks expired shard files by filename date, and
+    // the vector-store rows expire independently via deleteL1Expired (the two
+    // sides are NOT per-record reconciled).
     if (vectorStore) {
       try {
         // Delete filter mirrors the CANDIDATE RECALL scope (agent-level,

@@ -3,8 +3,9 @@
  * memories against existing records in a single LLM call.
  *
  * Candidate recall uses the same strategy as memory_search (native hybrid, else
- * FTS ∥ client-vector + RRF). Isolation stays session-scoped via IsolationFilter;
- * search's cross-session filter is not reused.
+ * FTS ∥ client-vector + RRF). Isolation is AGENT-scoped (cross-session, the
+ * caller's filter carries no session dimensions — see batchDedup's docstring);
+ * tenant isolation stays via team/user/agent/task.
  *
  * If neither FTS, client embedding, nor native hybrid is available, conflict
  * detection is skipped — all memories go straight to store.

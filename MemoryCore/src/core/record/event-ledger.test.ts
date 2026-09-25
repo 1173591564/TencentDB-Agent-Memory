@@ -11,7 +11,7 @@ import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent } from "../store/types.js";
-import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, replayLedgerEvents, setLedgerWriterId } from "./event-ledger.js";
+import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId } from "./event-ledger.js";
 import { LocalMemoryCleaner } from "../../utils/memory-cleaner.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "./l1-writer.js";
 
@@ -229,7 +229,7 @@ describe("event ledger in-place outbox redaction", () => {
 
   it("clear rewrites historical outbox lines: plaintext gone, skeleton and markers intact", async () => {
     const snap = JSON.stringify({ content: "salary 5000" });
-    const a = await appendLedgerEvent({ store, storage, event: ev({ content: "salary 5000", snapshot_json: snap, user_id: "u1", scene_name: "work" }), logger: silent });
+    const a = await appendLedgerEvent({ store, storage, event: ev({ content: "salary 5000", snapshot_json: snap, user_id: "u1", memory_type: "work" }), logger: silent });
     await appendLedgerEvent({ store, storage, event: ev({ team_id: "t2", record_id: "m_other", content: "keep me" }), logger: silent });
     await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "2026-06-01T00:00:00.000Z" }, logger: silent });
     const first = await outboxRows();
@@ -245,7 +245,7 @@ describe("event ledger in-place outbox redaction", () => {
     const redacted = rows.find((r) => r.event_id === a.event_id)!;
     expect(redacted).toMatchObject({
       event_id: a.event_id, op: "created", event_ts: "2026-03-01T10:00:00.000Z", record_id: "m_x",
-      team_id: "t1", agent_id: "a1", user_id: "u1", session_id: "ses", session_key: "sk", scene_name: "work", content: "",
+      team_id: "t1", agent_id: "a1", user_id: "u1", session_id: "ses", session_key: "sk", memory_type: "work", content: "",
     });
     expect(redacted.snapshot_json).toBeUndefined();
     const markers = rows.filter((r) => r.redact);
@@ -387,11 +387,19 @@ describe("event ledger in-place outbox redaction", () => {
   it("TTL cleanup writes an unscoped retention marker and rewrites matching shard lines", async () => {
     vi.stubEnv("TZ", "UTC");
     const baseDir = path.join(dir, "data");
-    const cutoff = Date.UTC(2026, 5, 10);
+    // All timestamps derive from the same `now` the cleaner runs against —
+    // mixing fixed dates with wall-clock new Date() makes this test expire
+    // (the "live" shard eventually falls before the fixed cutoff).
+    const now = Date.now();
+    // retentionDays=2 keeps today + yesterday; cutoff = UTC midnight yesterday.
+    const cutoff = new Date(now);
+    cutoff.setUTCHours(0, 0, 0, 0);
+    cutoff.setUTCDate(cutoff.getUTCDate() - 1);
+    const cutoffMs = cutoff.getTime();
     // covered by the TTL (event_ts <= cutoff) but in a shard the cleaner keeps by name
-    const oldTs = new Date(cutoff).toISOString();
+    const oldTs = new Date(cutoffMs).toISOString();
     await appendLedgerEvent({ store, storage, event: ev({ event_id: "e_old", event_ts: oldTs, content: "expired secret" }), logger: silent });
-    await appendLedgerEvent({ store, storage, event: ev({ event_ts: new Date().toISOString(), team_id: "t2", record_id: "m_live", content: "live" }), logger: silent });
+    await appendLedgerEvent({ store, storage, event: ev({ event_ts: new Date(now).toISOString(), team_id: "t2", record_id: "m_live", content: "live" }), logger: silent });
 
     const ttlStore = Object.assign(Object.create(store) as IMemoryStore, {
       countL0: async () => 0,
@@ -399,17 +407,102 @@ describe("event ledger in-place outbox redaction", () => {
       deleteL1Expired: async () => 3,
     });
     const cleaner = new LocalMemoryCleaner({ baseDir, retentionDays: 2, cleanTime: "03:00", vectorStore: ttlStore, logger: { info() {}, warn() {}, error() {}, debug() {} } as never });
-    await cleaner.runOnce(Date.UTC(2026, 5, 11, 12));
+    await cleaner.runOnce(now);
     cleaner.destroy();
 
     const rows = await outboxRows();
     const marker = rows.find((r) => r.redact) as { redact: { until: string; team_id?: string } } | undefined;
-    expect(marker?.redact).toEqual({ until: new Date(cutoff).toISOString() });
+    expect(marker?.redact).toEqual({ until: new Date(cutoffMs).toISOString() });
     expect(rows.some((r) => r.record_id?.startsWith("retention-l1-"))).toBe(true);
     const raw = await rawOutbox();
     expect(raw).not.toContain("expired secret");
     expect(raw).toContain("\"live\"");
     expect(rows.find((r) => r.event_id === "e_old")).toMatchObject({ op: "created", record_id: "m_x", content: "" });
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+  });
+
+  it("an append in flight when clear runs still cannot leave plaintext in store or outbox", async () => {
+    // Gate the store write so the clear's filter-update lands before the
+    // append's insert resolves — the clear-vs-append race that used to
+    // resurrect plaintext rows.
+    const realAppend = store.appendMemoryEvent.bind(store);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    store.appendMemoryEvent = async (e: MemoryEvent) => { await gate; return realAppend(e); };
+
+    const pendingAppend = appendLedgerEvent({ store, storage, event: ev({ content: "late plaintext" }), logger: silent });
+    await redactLedgerEvents({ store, storage, filter, logger: silent });
+    release();
+    await pendingAppend;
+
+    // Store: post-append recheck re-applies the marker's filter-update.
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+    // Outbox: the line either landed before the rewrite (skeletonized) or was
+    // skeletonized inside the shard lock — plaintext never survives.
+    expect(await rawOutbox()).not.toContain("late plaintext");
+  });
+
+  it("two concurrent redactions cannot leave a sealed shard un-swept", async () => {
+    // Two overlapping filters share one shard; the second redaction's shard
+    // snapshot can go stale behind the first seal — the global rewrite lock
+    // forces a fresh listing so the sealed generation is still swept.
+    await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-01T08:00:00.000Z", content: "early secret" }), logger: silent });
+    await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-01T12:00:00.000Z", record_id: "m_late", content: "late secret" }), logger: silent });
+    await Promise.all([
+      redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "2026-03-01T10:00:00.000Z" }, logger: silent }),
+      redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "2026-03-01T23:59:59.000Z" }, logger: silent }),
+    ]);
+    const raw = await rawOutbox();
+    expect(raw).not.toContain("early secret");
+    expect(raw).not.toContain("late secret");
+    const rows = await outboxRows();
+    expect(rows.filter((r) => r.redact)).toHaveLength(2);
+  });
+
+  it("a sequential redaction still sweeps the shard sealed by an earlier one", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-01T08:00:00.000Z", content: "early secret" }), logger: silent });
+    await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-01T12:00:00.000Z", record_id: "m_late", content: "late secret" }), logger: silent });
+    await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "2026-03-01T10:00:00.000Z" }, logger: silent });
+    expect((await shardNames()).some((n) => /~/.test(n))).toBe(true);
+    await redactLedgerEvents({ store, storage, filter, logger: silent });
+    const raw = await rawOutbox();
+    expect(raw).not.toContain("early secret");
+    expect(raw).not.toContain("late secret");
+  });
+
+  it("one unreadable shard is counted as failed without aborting the replay", async () => {
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_ok" }), logger: silent });
+    await storage.appendFile("events/2026-03-02.w1.jsonl", JSON.stringify(ev({ event_ts: "2026-03-02T10:00:00.000Z", record_id: "m_late" })) + "\n");
+    const realRead = storage.readFile.bind(storage);
+    storage.readFile = async (key: string) => {
+      if (key.includes("2026-03-02")) throw new Error("io");
+      return realRead(key);
+    };
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r.failed).toBe(1);
+    expect(r.replayed).toBe(1);
+    expect(store.queryMemoryEvents({ limit: 10 }).map((e) => e.record_id)).toEqual(["m_ok"]);
+  });
+
+  it("resetLedgerHealth clears counters but never drops pending redaction work", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ content: "secret" }), logger: silent });
+    const realRedact = store.redactMemoryEvents.bind(store);
+    store.redactMemoryEvents = () => { throw new Error("db locked"); };
+    await redactLedgerEvents({ store, storage, filter, logger: silent });
+    expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: true, pending_redactions: 1 });
+
+    resetLedgerHealth(store);
+    // Failure counters clear; the pending redaction (un-landed work) survives
+    // — degraded must keep reporting it until a backfill actually lands it.
+    const h = getLedgerHealth(store, scope);
+    expect(h.store_failures).toBe(0);
+    expect(h.pending_redactions).toBe(1);
+    expect(h.degraded).toBe(true);
+
+    // The pending wipe is still retried on the next backfill.
+    store.redactMemoryEvents = realRedact;
+    await replayLedgerEvents({ store, storage, scope, logger: silent });
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+    expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: false, pending_redactions: 0 });
   });
 });

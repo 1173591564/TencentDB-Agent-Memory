@@ -14,10 +14,13 @@
  * Clear/archive/TTL append a redaction marker to the outbox, rewrite this
  * writer's shards so matching lines lose their content/snapshot, and blank the
  * same events in the store; replay applies the markers, so a backfill never
- * writes cleared content back. Shards are only ever rewritten by the writer
- * that appends to them (plus legacy unsuffixed shards), so a rewrite never
- * races another node's append; in-process appends and rewrites of a shard are
- * serialized.
+ * writes cleared content back. A filter is registered the moment a redaction
+ * is accepted: appends covered by a known marker are written as skeletons, so
+ * an in-flight append can never resurrect plaintext after the wipe. Shards
+ * are only ever rewritten by the writer that appends to them (plus legacy
+ * unsuffixed shards), so a rewrite never races another node's append;
+ * in-process appends and rewrites of a shard are serialized, and whole-scan
+ * rewrites are serialized against each other by a global rewrite lock.
  */
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -70,6 +73,8 @@ export interface LedgerReplayResult {
   outbox_redacted: number;
   /** Outbox marker appends / shard rewrites that failed again (kept pending). */
   outbox_failed: number;
+  /** Scan stopped early at the size cap — rerun with a tighter `since`. */
+  truncated?: boolean;
 }
 
 /** Tenant scope used by health, replay and redaction (unset fields match anything). */
@@ -88,6 +93,8 @@ interface RedactionMarker {
 }
 
 const MAX_PENDING_TRACKED = 10_000;
+/** Backfill reads whole shards into memory; cap the total so a huge outbox can't OOM the process. */
+const MAX_REPLAY_BYTES = 256 * 1024 * 1024;
 
 interface TenantHealth {
   team_id: string;
@@ -101,10 +108,66 @@ interface TenantHealth {
   unrecoverable: number;
 }
 
-const healthByStore = new WeakMap<object, Map<string, TenantHealth>>();
+const healthByStore = new Map<object | string, Map<string, TenantHealth>>();
+
+/**
+ * Stable ledger identity for a store object. StorePool recreates store objects
+ * on LRU eviction / config change — keyed bookkeeping must follow the logical
+ * store, not the object. Pool creation sites bind `${backend}:${instanceId}`;
+ * unbound stores fall back to object identity (standalone: one store per
+ * process, eviction cannot orphan anything).
+ */
+const ledgerKeyByStore = new WeakMap<object, string>();
+
+function storeKeyOf(store: LedgerStore | undefined): object | string {
+  if (store === undefined) return UNBOUND_STORE;
+  return ledgerKeyByStore.get(store) ?? store;
+}
+
+export function bindLedgerStoreKey(store: object, key: string): void {
+  ledgerKeyByStore.set(store, key);
+  // Migrate bookkeeping recorded under object identity before the binding
+  // existed (early init writes can race the first getStore call).
+  const pending = pendingRedactionsByStore.get(store);
+  if (pending) {
+    pendingRedactionsByStore.delete(store);
+    const target = pendingRedactionsByStore.get(key) ?? new Map<string, PendingRedaction>();
+    for (const [k, v] of pending) {
+      const cur = target.get(k);
+      if (cur) { // same filter failed under both identities — union the legs
+        cur.store ||= v.store; cur.outbox ||= v.outbox; cur.marker ??= v.marker;
+        for (const c of v.cleared) cur.cleared.add(c);
+      } else target.set(k, v);
+    }
+    pendingRedactionsByStore.set(key, target);
+  }
+  const health = healthByStore.get(store);
+  if (health) {
+    healthByStore.delete(store);
+    const target = healthByStore.get(key) ?? new Map<string, TenantHealth>();
+    for (const [k, v] of health) {
+      const cur = target.get(k);
+      if (cur) {
+        cur.store_failures += v.store_failures; cur.jsonl_failures += v.jsonl_failures;
+        cur.unrecoverable += v.unrecoverable;
+        for (const [id, rid] of v.pending) cur.pending.set(id, rid);
+        if (v.last_failure_at && (!cur.last_failure_at || v.last_failure_at > cur.last_failure_at)) cur.last_failure_at = v.last_failure_at;
+      } else target.set(k, v);
+    }
+    healthByStore.set(key, target);
+  }
+  const known = knownRedactionsByStore.get(store);
+  if (known) {
+    knownRedactionsByStore.delete(store);
+    const target = knownRedactionsByStore.get(key) ?? new Map<string, MemoryEventRedactFilter>();
+    for (const [k, v] of known) target.set(k, v);
+    knownRedactionsByStore.set(key, target);
+  }
+}
+
 interface PendingRedaction {
   filter: MemoryEventRedactFilter;
-  /** Tenants a scoped backfill already redacted (for filters not pinned to one tenant). */
+  /** Applied narrowed store-wipes ({team_id?,agent_id?} keys) for filters broader than a scoped backfill. */
   cleared: Set<string>;
   /** The store wipe has not landed. */
   store: boolean;
@@ -119,6 +182,7 @@ function markPending(
   filter: MemoryEventRedactFilter,
   part: { store?: true; outbox?: true; marker?: RedactionMarker },
 ): void {
+  tenantHealth(store, { team_id: filter.team_id ?? "", agent_id: filter.agent_id ?? "" }).last_failure_at = new Date().toISOString();
   const m = pendingRedactions(store);
   const k = redactionKey(filter);
   let p = m.get(k);
@@ -132,24 +196,68 @@ function markPending(
 }
 
 function settlePending(m: Map<string, PendingRedaction>, p: PendingRedaction): void {
-  if (!p.store && !p.outbox && !p.marker) m.delete(redactionKey(p.filter));
+  if (!p.store && !p.outbox && !p.marker && m.get(redactionKey(p.filter)) === p) m.delete(redactionKey(p.filter));
 }
 
 /** Per store: failed store redactions keyed by their canonical filter. */
-const pendingRedactionsByStore = new WeakMap<object, Map<string, PendingRedaction>>();
+const pendingRedactionsByStore = new Map<object | string, Map<string, PendingRedaction>>();
+
+/**
+ * Redaction filters this process has accepted (pending or landed). Appends
+ * covered by a known filter are written as skeletons so a redaction racing an
+ * in-flight append can never resurrect plaintext in the store or outbox
+ * (fail-closed: the filter is registered before any leg is attempted).
+ */
+const knownRedactionsByStore = new Map<object | string, Map<string, MemoryEventRedactFilter>>();
+
+function registerKnownRedaction(store: LedgerStore | undefined, filter: MemoryEventRedactFilter): void {
+  const key = storeKeyOf(store);
+  let m = knownRedactionsByStore.get(key);
+  if (!m) {
+    m = new Map();
+    knownRedactionsByStore.set(key, m);
+  }
+  if (!m.has(redactionKey(filter))) {
+    if (m.size >= MAX_PENDING_TRACKED) m.delete(m.keys().next().value!); // FIFO evict, bounded
+    m.set(redactionKey(filter), filter);
+  }
+}
+
+/** Filters (pending or applied) that cover this event — content must not be persisted. */
+function coveringRedactions(store: LedgerStore | undefined, event: MemoryEvent): MemoryEventRedactFilter[] {
+  const m = knownRedactionsByStore.get(storeKeyOf(store));
+  if (!m) return [];
+  return [...m.values()].filter((f) => markerCovers(f, event));
+}
 
 function redactionKey(f: MemoryEventRedactFilter): string {
   return JSON.stringify([f.team_id ?? null, f.agent_id ?? null, f.user_id ?? null, f.until]);
 }
 
 function pendingRedactions(store: LedgerStore | undefined): Map<string, PendingRedaction> {
-  const key = store ?? UNBOUND_STORE;
+  const key = storeKeyOf(store);
   let m = pendingRedactionsByStore.get(key);
   if (!m) {
     m = new Map();
     pendingRedactionsByStore.set(key, m);
   }
   return m;
+}
+
+/**
+ * All pending redactions reachable from `store`: its own bucket plus the
+ * UNBOUND bucket (writes attempted before a store was attached — they still
+ * need retries and must show up in health).
+ */
+function eachPendingRedaction(
+  store: LedgerStore | undefined,
+  fn: (m: Map<string, PendingRedaction>, p: PendingRedaction) => void,
+): void {
+  for (const key of [UNBOUND_STORE, storeKeyOf(store)]) {
+    const m = pendingRedactionsByStore.get(key);
+    if (!m) continue;
+    for (const p of m.values()) fn(m, p);
+  }
 }
 
 /** A redaction filter touches the scope when it is not pinned to a different team/agent. */
@@ -159,14 +267,20 @@ function redactionTouches(f: MemoryEventRedactFilter, scope?: LedgerScope): bool
     (f.user_id === undefined || scope?.user_id === undefined || f.user_id === scope.user_id);
 }
 
-function scopeTenantKey(scope?: LedgerScope): string | undefined {
-  return scope?.team_id !== undefined && scope.agent_id !== undefined ? tenantKey(scope.team_id, scope.agent_id) : undefined;
+/** Serialized {team_id?,agent_id?} pair of an applied store wipe. */
+function clearedDimsKey(teamId?: string, agentId?: string): string {
+  return JSON.stringify([teamId ?? null, agentId ?? null]);
+}
+
+/** Applied wipe `entry` covers the questioned scope iff it pins no dimension the scope leaves free. */
+function clearedCovers(entry: string, scope?: LedgerScope | MemoryEventRedactFilter): boolean {
+  const [t, a] = JSON.parse(entry) as [string | null, string | null];
+  return (t === null || scope?.team_id === t) && (a === null || scope?.agent_id === a);
 }
 
 function storeRedactionPendingFor(p: PendingRedaction, scope?: LedgerScope): boolean {
   if (!p.store || !redactionTouches(p.filter, scope)) return false;
-  const k = scopeTenantKey(scope);
-  return k === undefined || !p.cleared.has(k);
+  return ![...p.cleared].some((entry) => clearedCovers(entry, scope));
 }
 
 function outboxRedactionPendingFor(p: PendingRedaction, scope?: LedgerScope): boolean {
@@ -179,13 +293,25 @@ function tenantKey(team: string, agent: string): string {
 }
 
 function tenantsFor(store: LedgerStore | undefined): Map<string, TenantHealth> {
-  const key = store ?? UNBOUND_STORE;
+  const key = storeKeyOf(store);
   let m = healthByStore.get(key);
   if (!m) {
     m = new Map();
     healthByStore.set(key, m);
   }
   return m;
+}
+
+/** Health buckets reachable from `store`: its own plus the UNBOUND bucket. */
+function eachTenantHealth(
+  store: LedgerStore | undefined,
+  fn: (h: TenantHealth) => void,
+): void {
+  for (const key of [UNBOUND_STORE, storeKeyOf(store)]) {
+    const m = healthByStore.get(key);
+    if (!m) continue;
+    for (const h of m.values()) fn(h);
+  }
 }
 
 function tenantHealth(store: LedgerStore | undefined, event: Pick<MemoryEvent, "team_id" | "agent_id">): TenantHealth {
@@ -202,10 +328,12 @@ function tenantHealth(store: LedgerStore | undefined, event: Pick<MemoryEvent, "
 }
 
 function matchingTenants(store: LedgerStore | undefined, scope?: LedgerScope): TenantHealth[] {
-  return [...tenantsFor(store).values()].filter((h) =>
-    (scope?.team_id === undefined || h.team_id === scope.team_id) &&
-    (scope?.agent_id === undefined || h.agent_id === scope.agent_id),
-  );
+  const out: TenantHealth[] = [];
+  eachTenantHealth(store, (h) => {
+    if ((scope?.team_id === undefined || h.team_id === scope.team_id) &&
+        (scope?.agent_id === undefined || h.agent_id === scope.agent_id)) out.push(h);
+  });
+  return out;
 }
 
 function recordFailure(
@@ -250,7 +378,8 @@ export function getLedgerHealth(
     unrecoverable += h.unrecoverable;
     if (h.last_failure_at && (!last || h.last_failure_at > last)) last = h.last_failure_at;
   }
-  const pendingR = [...pendingRedactions(store).values()];
+  const pendingR: PendingRedaction[] = [];
+  eachPendingRedaction(store, (_m, p) => pendingR.push(p));
   const redactions = pendingR.filter((p) => storeRedactionPendingFor(p, scope) || outboxRedactionPendingFor(p, scope)).length;
   const outboxRewrites = pendingR.filter((p) => outboxRedactionPendingFor(p, scope)).length;
   return {
@@ -277,10 +406,16 @@ export function hasPendingLedgerEvent(store: LedgerStore | undefined, recordId: 
   return false;
 }
 
-/** Test/ops hook: clear the failure counters. */
+/**
+ * Test/ops hook: clear the failure counters (also the shared UNBOUND bucket).
+ * Pending redactions are deliberately NOT cleared — they are un-applied work,
+ * not bookkeeping. Resetting them would let a failed store wipe silently never
+ * retry while the ledger reports healthy; they clear only by actually landing
+ * (backfill) or process restart.
+ */
 export function resetLedgerHealth(store: LedgerStore | undefined): void {
-  healthByStore.delete(store ?? UNBOUND_STORE);
-  pendingRedactionsByStore.delete(store ?? UNBOUND_STORE);
+  healthByStore.delete(storeKeyOf(store));
+  if (store !== undefined) healthByStore.delete(UNBOUND_STORE);
 }
 
 function shardDateOf(ts: string): string {
@@ -441,10 +576,24 @@ function redactOutboxContent(content: string, filters: readonly MemoryEventRedac
 }
 
 /**
+ * Serializes whole-scan rewrites against each other. Two concurrent
+ * `redactLedgerEvents` must not both snapshot the shard list: the loser would
+ * read null on the freshly-sealed-away live shard and report success while
+ * the sealed copy still holds its plaintext. The key can never collide with a
+ * shard key (shard names match SHARD_RE).
+ */
+const REWRITE_LOCK_KEY = `${StoragePaths.eventsDir}#rewrite-all`;
+
+/**
  * Rewrite the owned shards that may hold events covered by `filters`
- * (shard date ≤ the latest `until`). Each rewrite runs under the shard lock:
- * re-read, create a sealed copy atomically, delete the original. Throws after
- * trying every shard if any rewrite failed.
+ * (shard date ≤ the latest `until`). The shard list is re-read under the
+ * global rewrite lock so sealed generations produced by a just-finished
+ * redaction are visible. `only` limits the scan to shard families
+ * ("date\0writer" keys) rather than names, so a shard sealed between listing
+ * and rewriting is still swept via its newest generation.
+ * Each shard rewrite runs under its own lock: re-read, create a sealed copy
+ * atomically, delete the original. Throws after trying every shard if any
+ * rewrite failed.
  */
 async function rewriteOutboxShards(
   storage: StorageAdapter,
@@ -452,28 +601,31 @@ async function rewriteOutboxShards(
   only?: ReadonlySet<string>,
 ): Promise<number> {
   if (filters.length === 0) return 0;
-  const maxDate = filters.map((f) => shardDateOf(f.until)).sort().at(-1)!;
-  const shards = (await listShards(storage)).filter((s) => ownsShard(s) && s.date <= maxDate && (!only || only.has(s.name)));
-  let lines = 0;
-  let firstErr: unknown;
-  for (const s of shards) {
-    const key = `${StoragePaths.eventsDir}${s.name}`;
-    try {
-      lines += await withShardLock(key, async () => {
-        const content = await storage.readFile(key);
-        if (content === null) return 0;
-        const r = redactOutboxContent(content, filters);
-        if (r.lines === 0) return 0;
-        await storage.createFileAtomic(sealedShardKey(s), r.content);
-        await storage.unlink(key);
-        return r.lines;
-      });
-    } catch (err) {
-      firstErr ??= err;
+  return withShardLock(REWRITE_LOCK_KEY, async () => {
+    const maxDate = filters.map((f) => shardDateOf(f.until)).sort().at(-1)!;
+    const shards = (await listShards(storage)).filter((s) =>
+      ownsShard(s) && s.date <= maxDate && (!only || only.has(`${s.date}\u0000${s.writer ?? ""}`)));
+    let lines = 0;
+    let firstErr: unknown;
+    for (const s of shards) {
+      const key = `${StoragePaths.eventsDir}${s.name}`;
+      try {
+        lines += await withShardLock(key, async () => {
+          const content = await storage.readFile(key);
+          if (content === null) return 0;
+          const r = redactOutboxContent(content, filters);
+          if (r.lines === 0) return 0;
+          await storage.createFileAtomic(sealedShardKey(s), r.content);
+          await storage.unlink(key);
+          return r.lines;
+        });
+      } catch (err) {
+        firstErr ??= err;
+      }
     }
-  }
-  if (firstErr !== undefined) throw firstErr;
-  return lines;
+    if (firstErr !== undefined) throw firstErr;
+    return lines;
+  });
 }
 
 export async function appendLedgerEvent(params: {
@@ -483,12 +635,30 @@ export async function appendLedgerEvent(params: {
   logger?: LedgerLogger;
 }): Promise<LedgerAppendResult> {
   const { store, storage, logger } = params;
-  const event = withMemoryEventId(params.event);
+  let event = withMemoryEventId(params.event);
+  // Redaction race guard: an append that lands after a clear/TTL must never
+  // persist plaintext — not in the outbox (a rewrite may have already swept
+  // that shard) and not in the store (its wipe already ran). Events covered by
+  // any known marker are appended as content-less skeletons instead.
+  if (coveringRedactions(store, event).length > 0) {
+    event = { ...event, content: "", snapshot_json: undefined };
+  }
   const result: LedgerAppendResult = { event_id: event.event_id, jsonl: false, store: false };
 
   if (storage) {
     try {
-      await appendToLiveShard(storage, event.event_ts, JSON.stringify(event) + "\n");
+      // Re-check coverage *inside* the shard lock: a redaction that registered
+      // after the top-of-function check but before this append's slot in the
+      // queue must not leave plaintext on disk either. Both orderings converge:
+      // append-then-rewrite → the rewrite skeletonizes the line; rewrite-then-
+      // append → the locked re-check skeletonizes the event before it lands.
+      const key = StoragePaths.eventShard(shardDateOf(event.event_ts), ledgerWriterId);
+      await withShardLock(key, async () => {
+        if (coveringRedactions(store, event).length > 0) {
+          event = { ...event, content: "", snapshot_json: undefined };
+        }
+        await storage.appendFile(key, JSON.stringify(event) + "\n");
+      });
       result.jsonl = true;
     } catch (err) {
       recordFailure(store, "jsonl", event, false);
@@ -501,14 +671,37 @@ export async function appendLedgerEvent(params: {
   }
 
   if (store?.appendMemoryEvent) {
+    let storeErr: unknown;
     try {
       await store.appendMemoryEvent(event);
       result.store = true;
     } catch (err) {
+      storeErr = err;
+    }
+    // Late-marker convergence: a clear/TTL may have registered while our
+    // insert was in flight, letting the row slip past its filter-update. The
+    // outbox side is already sealed (per-writer shard lock), so a covered
+    // append reaching this point with plaintext means the store leg missed it
+    // — re-apply the covering markers' filter-update ourselves. Idempotent,
+    // and failures are tracked as pending store redactions.
+    if (storeErr === undefined && event.content !== "") {
+      for (const m of coveringRedactions(store, event)) {
+        try {
+          await store.redactMemoryEvents?.(m);
+        } catch (err) {
+          storeErr = err;
+          markPending(store, m, { store: true });
+          logger?.warn?.(
+            `${TAG} post-append redact retry failed event_id=${event.event_id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
+    if (storeErr !== undefined) {
       recordFailure(store, "store", event, result.jsonl);
       logger?.warn?.(
         `${TAG} store append failed (non-fatal${result.jsonl ? ", recoverable via backfill" : ""}) ` +
-        `event_id=${event.event_id} record_id=${event.record_id} op=${event.op}: ${err instanceof Error ? err.message : String(err)}`,
+        `event_id=${event.event_id} record_id=${event.record_id} op=${event.op}: ${storeErr instanceof Error ? storeErr.message : String(storeErr)}`,
       );
     }
   }
@@ -530,6 +723,9 @@ export async function redactLedgerEvents(params: {
 }): Promise<{ jsonl: boolean; rewritten?: number; redacted?: number }> {
   const { store, storage, filter, logger } = params;
   const out: { jsonl: boolean; rewritten?: number; redacted?: number } = { jsonl: false };
+  // Register before any leg runs: appends covered by this filter must
+  // skeletonize even while (or if) the marker/rewrite/store legs below fail.
+  registerKnownRedaction(store, filter);
   if (storage) {
     const marker: RedactionMarker = { redact: filter, marker_ts: new Date().toISOString() };
     try {
@@ -566,8 +762,9 @@ async function retryPendingOutbox(
   out: LedgerReplayResult,
   logger?: LedgerLogger,
 ): Promise<void> {
-  const pendingR = pendingRedactions(store);
-  for (const p of [...pendingR.values()]) {
+  const pending: Array<{ m: Map<string, PendingRedaction>; p: PendingRedaction }> = [];
+  eachPendingRedaction(store, (m, p) => pending.push({ m, p }));
+  for (const { m, p } of pending) {
     if (p.marker) {
       try {
         await appendToLiveShard(storage, p.marker.marker_ts, JSON.stringify(p.marker) + "\n");
@@ -586,7 +783,7 @@ async function retryPendingOutbox(
         logger?.warn?.(`${TAG} replay: outbox shard rewrite retry failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    settlePending(pendingR, p);
+    settlePending(m, p);
   }
 }
 
@@ -599,6 +796,21 @@ function isReplayableEvent(e: Partial<Record<keyof MemoryEvent, unknown>>): e is
     typeof e.record_id === "string" && e.record_id !== "" &&
     typeof e.op === "string" && MEMORY_EVENT_OPS.has(e.op) &&
     typeof e.event_ts === "string" && !Number.isNaN(Date.parse(e.event_ts));
+}
+
+/**
+ * A marker line is trusted to drive store wipes — only accept plain
+ * {team_id?,agent_id?,user_id?,until} string fields with a parseable `until`.
+ * Anything else is malformed (defense-in-depth: a forged/garbage marker could
+ * otherwise widen a store wipe across tenants).
+ */
+function isValidMarkerFilter(f: unknown): f is MemoryEventRedactFilter {
+  if (typeof f !== "object" || f === null || Array.isArray(f)) return false;
+  const r = f as Record<string, unknown>;
+  for (const k of ["team_id", "agent_id", "user_id", "task_id"]) {
+    if (r[k] !== undefined && typeof r[k] !== "string") return false;
+  }
+  return typeof r.until === "string" && !Number.isNaN(Date.parse(r.until));
 }
 
 function markerCovers(m: MemoryEventRedactFilter, e: MemoryEvent): boolean {
@@ -642,12 +854,28 @@ export async function replayLedgerEvents(params: {
   const shards = (await listShards(storage)).filter((s) => !sinceDate || s.date >= sinceDate);
 
   const events: MemoryEvent[] = [];
-  const markers: MemoryEventRedactFilter[] = [];
+  const markersByKey = new Map<string, MemoryEventRedactFilter>();
   const ownedContent = new Map<string, string>();
+  let scanBytes = 0;
   for (const shard of shards) {
-    const content = await storage.readFile(`${StoragePaths.eventsDir}${shard.name}`);
+    let content: string | null = null;
+    try {
+      content = await storage.readFile(`${StoragePaths.eventsDir}${shard.name}`);
+    } catch (err) {
+      // A single unreadable shard must not abort the whole backfill — count it
+      // as a failure and keep scanning the rest.
+      out.failed += 1;
+      logger?.warn?.(`${TAG} replay: shard ${shard.name} read failed: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
     if (content === null) continue;
     out.files += 1;
+    scanBytes += content.length;
+    if (scanBytes > MAX_REPLAY_BYTES) {
+      out.truncated = true;
+      logger?.warn?.(`${TAG} replay: scan truncated at ${MAX_REPLAY_BYTES} bytes — rerun with a tighter 'since'`);
+      break;
+    }
     if (ownsShard(shard)) ownedContent.set(shard.name, content);
     for (const line of content.split("\n")) {
       if (!line.trim()) continue;
@@ -664,8 +892,14 @@ export async function replayLedgerEvents(params: {
         continue;
       }
       const parsed = value as MemoryEvent & Partial<RedactionMarker>;
-      if (parsed.redact && typeof parsed.redact.until === "string") {
-        markers.push(parsed.redact);
+      if (parsed.redact !== undefined) {
+        // A redact object that fails validation must not silently act as an
+        // event; it is not replayable either way — count it malformed.
+        if (!isValidMarkerFilter(parsed.redact)) {
+          out.malformed += 1;
+          continue;
+        }
+        markersByKey.set(redactionKey(parsed.redact), parsed.redact);
         continue;
       }
       if (!isReplayableEvent(parsed)) {
@@ -675,23 +909,32 @@ export async function replayLedgerEvents(params: {
       events.push(parsed);
     }
   }
+  const markers = [...markersByKey.values()];
+  // Markers seen in the outbox also guard subsequent appends (this or other
+  // writers' shards may still carry plaintext; new covered appends skeletonize).
+  for (const m of markers) registerKnownRedaction(store, m);
 
   // Re-apply clear/TTL redactions to the store first (idempotent): a redaction
   // the store missed when it ran must not leave cleared content behind.
   // Markers are narrowed to the requested scope so a tenant backfill never
-  // touches other tenants' events.
-  const pendingR = pendingRedactions(store);
-  const markerKeys = new Set(markers.map(redactionKey));
-  for (const p of pendingR.values()) {
-    if (p.store && !markerKeys.has(redactionKey(p.filter))) {
+  // touches other tenants' events. In-process pending filters merge in even
+  // when their marker's shard is outside the `since` window.
+  const pendingMarkers: Array<{ m: Map<string, PendingRedaction>; p: PendingRedaction }> = [];
+  eachPendingRedaction(store, (m, p) => pendingMarkers.push({ m, p }));
+  for (const { p } of pendingMarkers) {
+    if (p.store && !markersByKey.has(redactionKey(p.filter))) {
+      markersByKey.set(redactionKey(p.filter), p.filter);
       markers.push(p.filter);
-      markerKeys.add(redactionKey(p.filter));
     }
   }
 
   // Sweep this writer's scanned shards against every marker seen (markers may
   // come from other writers), so their plaintext converges out of the outbox.
-  const dirty = new Set([...ownedContent].filter(([, c]) => redactOutboxContent(c, markers).lines > 0).map(([n]) => n));
+  const dirty = new Set(
+    [...ownedContent]
+      .filter(([, c]) => redactOutboxContent(c, markers).lines > 0)
+      .map(([n]) => { const s = parseLedgerShardName(n)!; return `${s.date}\u0000${s.writer ?? ""}`; }),
+  );
   if (dirty.size > 0) {
     try {
       out.outbox_redacted += await rewriteOutboxShards(storage, markers, dirty);
@@ -713,12 +956,18 @@ export async function replayLedgerEvents(params: {
       try {
         await store.redactMemoryEvents(narrowed);
         out.redactions_applied += 1;
-        const pending = pendingR.get(redactionKey(m));
-        const tenant = scopeTenantKey(scope);
-        if (pending?.store && redactionKey(narrowed) === redactionKey(m)) {
-          pending.store = false;
-          settlePending(pendingR, pending);
-        } else if (pending?.store && tenant !== undefined) pending.cleared.add(tenant);
+        // Record the applied wipe by its narrowed team/agent dims: the pending
+        // settles when some applied wipe covers the whole filter; scopes fully
+        // inside an applied wipe stop reporting pending for the store leg.
+        const appliedKey = clearedDimsKey(narrowed.team_id, narrowed.agent_id);
+        for (const { m: pm, p } of pendingMarkers) {
+          if (redactionKey(p.filter) !== redactionKey(m) || !p.store) continue;
+          p.cleared.add(appliedKey);
+          if (clearedCovers(appliedKey, p.filter)) {
+            p.store = false;
+            settlePending(pm, p);
+          }
+        }
       } catch (err) {
         out.failed += 1;
         logger?.warn?.(`${TAG} replay redaction failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -727,7 +976,7 @@ export async function replayLedgerEvents(params: {
   }
 
   const pendingByTenant = new Map<string, TenantHealth>();
-  for (const h of tenantsFor(store).values()) pendingByTenant.set(tenantKey(h.team_id, h.agent_id), h);
+  eachTenantHealth(store, (h) => pendingByTenant.set(tenantKey(h.team_id, h.agent_id), h));
 
   // Rewrites move lines into sealed shards, so file order is not event order.
   events.sort((a, b) => (a.event_ts < b.event_ts ? -1 : a.event_ts > b.event_ts ? 1 : 0));
@@ -755,9 +1004,20 @@ export async function replayLedgerEvents(params: {
   return out;
 }
 
-/** Delete outbox shards dated strictly before `beforeDate` (YYYY-MM-DD). Returns deleted shard count. */
+/**
+ * Delete outbox shards dated strictly before `beforeDate` (YYYY-MM-DD, UTC —
+ * shard names are UTC-dated). Each unlink holds the shard lock so a pruned
+ * file can't eat an in-flight append in this process. Returns deleted count.
+ */
 export async function pruneLedgerOutbox(storage: StorageAdapter, beforeDate: string): Promise<number> {
   const names = (await listShards(storage)).filter((s) => s.date < beforeDate).map((s) => s.name);
-  for (const name of names) await storage.unlink(`${StoragePaths.eventsDir}${name}`);
-  return names.length;
+  let deleted = 0;
+  for (const name of names) {
+    const key = `${StoragePaths.eventsDir}${name}`;
+    try {
+      await withShardLock(key, () => storage.unlink(key));
+      deleted += 1;
+    } catch { /* already gone / backend hiccup — prune is best-effort */ }
+  }
+  return deleted;
 }

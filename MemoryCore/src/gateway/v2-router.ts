@@ -27,7 +27,7 @@ import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import { appendRevertTombstone, type MemoryRecord } from "../core/record/l1-writer.js";
-import { appendLedgerEvent, getLedgerHealth, hasPendingLedgerEvent, replayLedgerEvents } from "../core/record/event-ledger.js";
+import { appendLedgerEvent, getLedgerHealth, hasPendingLedgerEvent, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
 // ── Zod schemas (validated types + defaults) ──
@@ -509,8 +509,8 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/memory/diff/revert": withLedgerQueryGuard(handleMemoryDiffRevert),
   "/memory/history": withLedgerQueryGuard(handleMemoryHistory),
   "/memory/review/inbox": withLedgerQueryGuard(handleMemoryReviewInbox),
-  "/memory/ledger/status": handleMemoryLedgerStatus,
-  "/memory/ledger/backfill": handleMemoryLedgerBackfill,
+  "/memory/ledger/status": withLedgerQueryGuard(handleMemoryLedgerStatus),
+  "/memory/ledger/backfill": withLedgerQueryGuard(handleMemoryLedgerBackfill),
 };
 
 const routeTable: Record<string, RouteHandler> = {
@@ -1203,8 +1203,9 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
 
-  // Read existing record by primary key
-  const existing = await store.queryL1Records({ recordIds: [id] });
+  // Read existing record by primary key — strict: a failed query returning []
+  // would misreport a degraded backend as "not found".
+  const existing = await store.queryL1Records({ recordIds: [id] }, { strict: true });
   if (!existing || existing.length === 0) {
     return errorEnvelope(404, `Atomic note not found: ${id}`, requestId);
   }
@@ -1217,11 +1218,17 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
   // re-derive them. If the caller supplied an isolation triple that does NOT
   // match the existing row, we treat it as a permission denial.
   const iso = deps.requestIsolation;
+  if (iso?.teamId && record.team_id && record.team_id !== iso.teamId) {
+    return errorEnvelope(403, `Atomic note ${id} belongs to a different team`, requestId);
+  }
   if (iso?.userId && record.user_id && record.user_id !== iso.userId) {
     return errorEnvelope(403, `Atomic note ${id} belongs to a different user`, requestId);
   }
   if (iso?.agentId && record.agent_id && record.agent_id !== iso.agentId) {
     return errorEnvelope(403, `Atomic note ${id} belongs to a different agent`, requestId);
+  }
+  if (iso?.taskId && record.task_id && record.task_id !== iso.taskId) {
+    return errorEnvelope(403, `Atomic note ${id} belongs to a different task`, requestId);
   }
   const updatedVersion = (record.version ?? 0) + 1;
   const updated: MemoryRecord = {
@@ -1248,7 +1255,11 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
   let emb: Float32Array | undefined;
   if (embedding) { try { emb = await embedding.embed(content); } catch (e) { console.warn(`[v2-router] L1 embedding failed:`, e); } }
 
-  await store.upsertL1(updated, emb);
+  // upsertL1 返回 false（不抛异常）表示后端拒绝/降级——不能把失败写成
+  // 事实：返回 503 且不写审计镜像事件，否则账本会记录一次从未落地的变更。
+  if (!(await store.upsertL1(updated, emb))) {
+    return errorEnvelope(503, `Atomic note ${id} update failed — store rejected the write (degraded?)`, requestId);
+  }
 
   // 审计：L1 update — 用外部请求的 IdFields 而非 record 原值（per user 决策）
   await recordAudit(store, {
@@ -1380,6 +1391,15 @@ async function handleMemoryLedgerStatus(body: unknown, _auth: V2AuthContext, req
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
+  // {reset:true} clears this process's failure/pending bookkeeping — the ops
+  // remediation for unrecoverable counters (outbox-pruned events can never
+  // drain). Same operator gate as backfill; data itself is never touched.
+  if (parsed.data.reset) {
+    if (!deps.ledgerBackfillEnabled) {
+      return errorEnvelope(403, "Ledger reset requires TDAI_LEDGER_BACKFILL_ENABLED", requestId);
+    }
+    resetLedgerHealth(store);
+  }
   const h = getLedgerHealth(store, ledgerScope(deps.requestIsolation));
   return successEnvelope({
     supported: Boolean(store.appendMemoryEvent && store.queryMemoryEvents),
@@ -1417,7 +1437,7 @@ async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, r
     scope: ledgerScope(iso),
     logger: deps.logger,
   });
-  return successEnvelope(result, requestId);
+  return successEnvelope({ ...result, health: getLedgerHealth(store, ledgerScope(iso)) }, requestId);
 }
 
 /**
@@ -1487,8 +1507,8 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     user_id: iso?.userId,
     agent_id: iso?.agentId,
     task_id: iso?.taskId,
-    ...(parsed.data.since ? { since: parsed.data.since } : {}),
-    ...(parsed.data.until ? { until: parsed.data.until } : {}),
+    // 不带 since/until：撤销状态是"当前是否已驳回"的时点事实，窗口外的
+    // reverted 事件同样有效——窗口过滤会让卡片显示未撤销 → UI 放按钮 → 409。
   });
   // 新版 reverted 事件用 target_event_id 精确指向被撤销的那次写入（同一
   // record 的人工编辑可单独撤销）；旧版事件无此字段，按 record_id 命中。
@@ -1549,7 +1569,11 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
       }
       continue;
     }
-    const replaced = (supersededByNew.get(e.record_id) ?? []).map((s) => eventShape(s));
+    // replaced 只挂在写入类 op 上——reverted/deleted 事件的 record_id 恰好
+    // 命中 superseded_by 时会错继承别人的快照列表，显示成重复变更卡。
+    const replaced = (e.op === "created" || e.op === "updated" || e.op === "merged"
+      ? (supersededByNew.get(e.record_id) ?? [])
+      : []).map((s) => eventShape(s));
     const revert = e.op !== "reverted" ? revertOf(e) : undefined;
     changes.push({
       op: e.op,
@@ -1675,7 +1699,7 @@ async function upsertSnapshot(store: RevertStore, snapshotJson: string, deps: V2
   return restored.id;
 }
 
-/** 返回 ids 中当前仍有存活行的记录。查询失败直接抛出——守卫必须 fail-closed。 */
+/** 返回 ids 中当前仍有存活行的记录。strict: 后端把查询失败吞成 [] 时重抛——守卫必须 fail-closed。 */
 async function liveRecordIds(
   store: RevertStore,
   ids: string[],
@@ -1683,7 +1707,7 @@ async function liveRecordIds(
 ): Promise<string[]> {
   const out: string[] = [];
   for (let i = 0; i < ids.length; i += 20) { // TCVDB documentIds 单查上限 20
-    const rows = await store.queryL1Records({ recordIds: ids.slice(i, i + 20), ...rowFilter });
+    const rows = await store.queryL1Records({ recordIds: ids.slice(i, i + 20), ...rowFilter }, { strict: true });
     out.push(...rows.map((r) => r.record_id));
   }
   return out;
@@ -1816,12 +1840,46 @@ async function planRevert(
 }
 
 /**
+ * Per-record FIFO mutex: revert is plan-then-act (guards read, then
+ * restore/delete/marker) — two concurrent reverts of the same record must not
+ * interleave or both pass the guards (the loser would 500 on the second
+ * delete, or resurrect a record racing an in-flight write).
+ */
+const revertLocks = new Map<string, Promise<void>>();
+
+async function withRevertLock<T>(recordId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = revertLocks.get(recordId) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((r) => { release = r; });
+  const tail = prev.then(() => mine);
+  revertLocks.set(recordId, tail);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (revertLocks.get(recordId) === tail) revertLocks.delete(recordId);
+  }
+}
+
+/**
  * 撤销单条记录的一次写入（只读守卫 → 恢复旧记录 → 删新记录 → reverted 事件 + JSONL 墓碑）。
  *
  * 先恢复再删除：恢复失败时新记录仍在，重试走同一条路径；删除失败时已恢复
  * 的行 upsert 幂等，重试同样安全。任一步失败都不追加 reverted 事件。
  */
 async function revertOneL1Record(
+  recordId: string,
+  opts: RevertOptions,
+  ledgerStore: IMemoryStore,
+  store: RevertStore,
+  iso: V2RouterDeps["requestIsolation"],
+  deps: V2RouterDeps,
+): Promise<RevertOutcome> {
+  return withRevertLock(recordId, () => revertOneL1RecordInner(recordId, opts, ledgerStore, store, iso, deps));
+}
+
+async function revertOneL1RecordInner(
   recordId: string,
   opts: RevertOptions,
   ledgerStore: IMemoryStore,
@@ -1840,7 +1898,9 @@ async function revertOneL1Record(
   try {
     plan = await planRevert(recordId, opts, store, iso);
   } catch (err) {
-    return fail(503, `Revert aborted for ${recordId}: store query failed (${err instanceof Error ? err.message : String(err)}) — nothing was changed, retry later`);
+    // Raw backend errors carry DSN/topology — log, never echo to the client.
+    deps.logger.warn(`${TAG} revert guard query failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+    return fail(503, `Revert aborted for ${recordId}: store query failed — nothing was changed, retry later`);
   }
   if (!plan.ok) return fail(plan.status, plan.error);
   const { target, restores } = plan;
@@ -1853,7 +1913,8 @@ async function revertOneL1Record(
     try {
       await upsertSnapshot(store, target.snapshot_json!, deps);
     } catch (err) {
-      return fail(500, `Failed to restore pre-edit snapshot of ${recordId}: ${err instanceof Error ? err.message : String(err)} — retry is allowed`);
+      deps.logger.warn(`${TAG} revert restore failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+      return fail(500, `Failed to restore pre-edit snapshot of ${recordId} — retry is allowed`);
     }
   } else {
     for (const { targetId, snap } of restores) {
@@ -1879,7 +1940,8 @@ async function revertOneL1Record(
       const deleted = await store.deleteL1(recordId, deleteFilter);
       if (!deleted) return fail(500, `Failed to delete record ${recordId}: store returned false — retry is allowed`);
     } catch (err) {
-      return fail(500, `Failed to delete record ${recordId}: ${err instanceof Error ? err.message : String(err)} — retry is allowed`);
+      deps.logger.warn(`${TAG} revert delete failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+      return fail(500, `Failed to delete record ${recordId} — retry is allowed`);
     }
   }
 
@@ -2018,6 +2080,7 @@ async function handleMemoryHistory(body: unknown, _auth: V2AuthContext, requestI
     count: events.length,
     has_more: hasMore,
     next_offset: offset + events.length,
+    ...ledgerStatusField(store, iso),
   }, requestId);
 }
 
@@ -2056,7 +2119,7 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
     ...(parsed.data.since ? { since: parsed.data.since } : {}),
     ...(parsed.data.until ? { until: parsed.data.until } : {}),
   });
-  const truncated = fetched.length > limit || (limit >= 1000 && fetched.length === limit);
+  let truncated = fetched.length > limit || (limit >= 1000 && fetched.length === limit);
   const events = fetched.slice(0, limit);
 
   // 管理面补充查询：clear/archive 是 agent 级管理操作，事件无 user_id（内核
@@ -2074,6 +2137,9 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
       ...(parsed.data.since ? { since: parsed.data.since } : {}),
       ...(parsed.data.until ? { until: parsed.data.until } : {}),
     });
+  // 管理面侧查的是"前 limit+1 行再 JS 过滤无 user_id"——若先截断后过滤，
+  // 真正的 clear/archive 事件可能被切掉而无人知晓：把截断信号并进 truncated。
+  if (adminFetched.length > limit) truncated = true;
   const adminEvents = adminFetched.slice(0, limit).filter((e) => !e.user_id);
 
   // 按 session_id 聚合。superseded/reverted 事件不计入"变更数"（它们分别

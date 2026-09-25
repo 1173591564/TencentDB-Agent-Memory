@@ -31,25 +31,34 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
   足以重建 `memory_events`。
 - 写入顺序（`src/core/record/event-ledger.ts` 的 `appendLedgerEvent`）：
   1. 分配 `event_id`；
-  2. 追加 JSONL outbox；
-  3. 追加到当前 store；
+  2. 追加 JSONL outbox（分片锁内复查已知擦除标记，被覆盖的事件直接以骨架行落盘）；
+  3. 追加到当前 store；若写入期间有新的擦除标记注册，落库后按该标记的 filter 补一次
+     定向擦除（`store.redactMemoryEvents`），失败记 `pending_redactions`；
   4. 任一步失败只记 warn 与健康度计数，**不阻塞主写路径**。
+- 已知擦除标记集合（进程内）：本进程接受过的所有 clear/TTL filter + 回放时在 outbox
+  扫到的标记。被任一标记覆盖的追加永不携带明文——无论 append 与 redact 的相对时序如何，
+  outbox 与 store 两条腿上都不会复活明文（跨进程时依赖对方节点回放后收敛）。
 - 接入点：L1 writer（created / superseded / updated / merged）、管理面 `recordAudit` 镜像、
   chat_memory clear 的 L1/L2/L3 deleted、`/memory/diff/revert` 的 reverted。
 - 未配置 storage 时只写 store（行为与之前一致，但无法回放）。
 
 ## 健康度与降级提示
 
-- 按 store 对象 × 租户（team/agent，进程内）统计 `store_failures` / `jsonl_failures` / `last_failure_at`
+- 按逻辑 store（StorePool 建店时绑定 `backend:instanceId`，对象被 LRU 驱逐重建后记账延续）
+  × 租户（team/agent，进程内）统计 `store_failures` / `jsonl_failures` / `last_failure_at`
   （不对外暴露后端原始错误文本），
   以及 `pending_store_events`：已进 outbox、但尚未写入 store 的事件数。计数是进程级、重启清零，
   多实例部署下各实例独立。
-- `degraded` 只在 `pending_store_events > 0` 时为真。backfill 成功回放后对应事件出队，
-  补齐完成即自动解除降级。store 与 outbox 同时失败（或待补事件超过 10000 条上限）的事件
-  无法回放，只能重启清零。仅 outbox 失败时 store 中的数据完整，不算降级，只计入 `jsonl_failures`。
-- `POST /v3/memory/ledger/status` 返回 `{ supported, jsonl_outbox, health }`。
-- 出现过追加失败时，`/memory/diff` 与 `/memory/review/inbox` 响应附带
-  `ledger: { degraded: true, store_failures, jsonl_failures, pending_store_events, last_failure_at }`，
+- `degraded` 在 `pending_store_events > 0`、`pending_redactions > 0` 或出现不可恢复失败时为真。
+  backfill 成功回放后对应事件出队，补齐完成即自动解除降级。store 与 outbox 同时失败
+  （或待补事件超过 10000 条上限）的事件无法回放，只能重启清零或 `reset`。
+  仅 outbox 失败时 store 中的数据完整，不算降级，只计入 `jsonl_failures`。
+- `POST /v3/memory/ledger/status` 返回 `{ supported, jsonl_outbox, backfill_enabled, health }`，
+  `health` 含 `pending_redactions` / `pending_outbox_rewrites`。`{"reset": true}` 清零失败计数
+  （运维手段，需 `TDAI_LEDGER_BACKFILL_ENABLED`）；**pending 擦除是未落地的工作项，不在 reset
+  范围内**——只能由 backfill 真正落地或进程重启清除。
+- 出现过追加失败时，`/memory/diff`、`/memory/history` 与 `/memory/review/inbox` 响应附带
+  `ledger: { degraded: true, store_failures, jsonl_failures, pending_store_events, pending_redactions, last_failure_at }`，
   MemoryPanel 审阅页据此显示“变更账降级”提示。
 - SQLite / TCVDB 的 `appendMemoryEvent` 在后端降级或写入失败时抛出，由 `appendLedgerEvent` 记为 pending，
   不影响主写路径。审阅路径（diff/history/inbox/revert）的查询失败一律 fail-closed，返回 503。
@@ -79,6 +88,11 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
    不覆盖 appendable 对象），再删除原分片。读者只会看到完整的旧分片或完整的新分片；删除前的短暂窗口两者并存，
    回放按 `event_id` 幂等去重。
 3. **store 擦除**：`content` / `snapshot_json` 置空，保留元数据骨架。
+
+入口先把 filter 登记进本进程的已知标记集（fail-closed：即使三步全失败也生效）——
+本进程内被覆盖的追加写骨架（分片锁内复查保证时序无关），store 落库后按标记补定向擦除。
+并发的两次擦除由全局改写锁串行，后到者对"已被封存的分片"按 (日期, writer) 族键重新列举，
+不会对着已消失的文件名报成功。
 
 - chat_memory clear 的 filter 为 `{ team_id, agent_id, until }`，并写 `scope=agent` 的 deleted 事件。
 - TTL 清理（L1 实际执行时）写一条 `source=retention`、`scope=retention`、`until=cutoff`、`record_id=retention-l1-<cutoff>`
@@ -161,8 +175,15 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 回放只使用扫描范围内（`since` 之后分片里）的标记；早于 `since` 的标记不参与回放，其覆盖的事件在原 store 中已擦除，
   但若用于重建新 store，需让 `since` 覆盖相应标记所在分片。
 - 封存分片与原分片短暂并存时（崩溃于 rename 与删除之间）可能留下含明文的原分片；它仍属本 writer，下次 backfill 会改写。
+- 擦除改写只扫日期 ≤ `until` 的分片：极端情况下一条迟到的带旧 `event_ts` 的事件若落进更晚日期的
+  分片，那行明文不会被本次改写扫到（标记仍保证其不会进 store）。
+- `resetLedgerHealth` / `status {"reset":true}` 只清失败计数，不清 pending 擦除——后者是未完成的
+  工作，丢弃它会让失败的 store 擦除永远不重试而账本却报健康。
+- 已知标记集是进程内状态且上限 10000 条（FIFO 淘汰）；另一进程的 in-flight 明文追加收敛于
+  该进程的下次 backfill，与本节“其它 writer 分片”语义一致。
 
 ## 保留期
 
-outbox 分片目前不自动清理。可按日期删除早于保留期的 `events/*.jsonl`；删除后对应时间段的事件
-将无法再回放，但不影响 store 中已存在的事件。
+memory-cleaner 按保留期删除过期 `events/*.jsonl`：分片按 **UTC** 日期命名，清理也按 UTC 日界
+（`pruneLedgerOutbox`，经 StorageAdapter 与分片锁，rowfs/COS 部署下走同一 adapter）。
+删除后对应时间段的事件无法再回放，但不影响 store 中已存在的事件。

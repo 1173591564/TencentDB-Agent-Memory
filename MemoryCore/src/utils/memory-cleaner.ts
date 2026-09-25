@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { IMemoryStore } from "../core/store/types.js";
-import { appendLedgerEvent, redactLedgerEvents } from "../core/record/event-ledger.js";
+import { appendLedgerEvent, pruneLedgerOutbox, redactLedgerEvents } from "../core/record/event-ledger.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 import { createLocalStorageBackend } from "../core/storage/factory.js";
 import { ManagedTimer } from "./managed-timer.js";
@@ -14,6 +14,12 @@ export interface MemoryCleanerOptions {
   cleanTime: string;
   logger?: Logger;
   vectorStore?: IMemoryStore;
+  /**
+   * The storage adapter the ledger actually writes through (inject from core).
+   * Falls back to a plain local-fs adapter under baseDir — correct for
+   * standalone local storage; wrong for rowfs/COS deployments if not injected.
+   */
+  getOutboxStorage?: () => StorageAdapter | undefined;
 }
 
 interface CleanupStats {
@@ -27,7 +33,6 @@ const TAG = "[memory-tdai][cleaner]";
 const L0_DIR_NAME = "conversations";
 const L1_DIR_NAME = "records";
 /** Change-ledger outbox (events/YYYY-MM-DD[.<writerId>][~<gen>].jsonl) ages out with the same retention. */
-const EVENTS_DIR_NAME = "events";
 
 /** Minimum records to retain — skip deletion if total is at or below this threshold. */
 const MIN_RETAIN_L0 = 50;
@@ -37,13 +42,18 @@ export class LocalMemoryCleaner {
   private readonly timer: ManagedTimer;
   private destroyed = false;
   private vectorStore?: IMemoryStore;
-  /** Local outbox under baseDir (events/*.jsonl), for retention events and redaction markers. */
-  private readonly outbox: StorageAdapter;
+  /** Local outbox under baseDir — fallback when no adapter is injected. */
+  private readonly localOutbox: StorageAdapter;
 
   constructor(private readonly opts: MemoryCleanerOptions) {
     this.timer = new ManagedTimer("memory-tdai-cleaner", () => this.destroyed);
     this.vectorStore = opts.vectorStore;
-    this.outbox = new StorageAdapter(createLocalStorageBackend(opts.baseDir));
+    this.localOutbox = new StorageAdapter(createLocalStorageBackend(opts.baseDir));
+  }
+
+  /** The adapter the ledger writes through — injected from core, else the local fallback. */
+  private outbox(): StorageAdapter {
+    return this.opts.getOutboxStorage?.() ?? this.localOutbox;
   }
 
   setVectorStore(vectorStore: IMemoryStore | undefined): void {
@@ -92,10 +102,10 @@ export class LocalMemoryCleaner {
       this.opts.logger?.error(`${TAG} ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
+    // records/ + conversations/ 分片用本地日期命名 → 本地日界删除（fs 路径）。
     const targetDirs = [
       path.join(this.opts.baseDir, L0_DIR_NAME),
       path.join(this.opts.baseDir, L1_DIR_NAME),
-      path.join(this.opts.baseDir, EVENTS_DIR_NAME),
     ];
 
     const total: CleanupStats = {
@@ -111,6 +121,17 @@ export class LocalMemoryCleaner {
       total.changedFiles += stats.changedFiles;
       total.skippedNonShardFiles += stats.skippedNonShardFiles;
       total.deleteFailedFiles += stats.deleteFailedFiles;
+    }
+
+    // events/ 分片用 UTC 日期命名（shardDateOf → toISOString）——必须按 UTC
+    // 日界评估过期，否则 UTC+N 时区会提前删掉最多 ~N 小时的保留期数据。
+    // 经 StorageAdapter + per-shard 锁删除，与账本追加/改写同一条串行通道。
+    try {
+      const cutoffUtcDate = new Date(cutoffMs).toISOString().slice(0, 10);
+      total.changedFiles += await pruneLedgerOutbox(this.outbox(), cutoffUtcDate);
+    } catch (err) {
+      total.deleteFailedFiles += 1;
+      this.opts.logger?.warn(`${TAG} Failed to prune expired events shards: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (this.vectorStore) {
@@ -177,7 +198,7 @@ export class LocalMemoryCleaner {
       //    resurrect expired rows) and expired content must not outlive the
       //    rows in memory_events. Metadata skeletons are kept. ──
       if (removedL1 > 0) {
-        await appendLedgerEvent({ store: vectorStore, storage: this.outbox, logger: this.opts.logger, event: {
+        await appendLedgerEvent({ store: vectorStore, storage: this.outbox(), logger: this.opts.logger, event: {
           event_ts: new Date().toISOString(),
           session_key: "",
           session_id: "",
@@ -191,7 +212,7 @@ export class LocalMemoryCleaner {
         } });
       }
       if (!skippedL1 && !failedL1DbCleanup) {
-        await redactLedgerEvents({ store: vectorStore, storage: this.outbox, logger: this.opts.logger, filter: { until: cutoffIso } });
+        await redactLedgerEvents({ store: vectorStore, storage: this.outbox(), logger: this.opts.logger, filter: { until: cutoffIso } });
       }
 
       // ── Post-delete: audit summary ──

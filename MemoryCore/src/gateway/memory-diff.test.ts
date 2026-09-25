@@ -45,7 +45,7 @@ describe("POST /memory/diff", () => {
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     captured = null;
-    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const req = { headers, method: "POST", url: pathname } as unknown as http.IncomingMessage;
     const res = {} as http.ServerResponse;
     const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
       captured = { status, body: b as NonNullable<typeof captured>["body"] };
@@ -176,15 +176,17 @@ describe("POST /memory/diff", () => {
 describe("POST /memory/diff/revert", () => {
   let dir: string;
   let store: VectorStore;
-  let captured: { status: number; body: { code: number; data?: Record<string, unknown>; message?: string } } | null;
   const writtenFiles = new Map<string, string>();
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
-    captured = null;
-    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    // Local capture, not a shared `captured` — concurrent calls (the revert
+    // race test) must not read each other's response. Held in an object
+    // property so TS control-flow doesn't narrow the closure write away.
+    const cap: { res?: { status: number; body: { code: number; data?: Record<string, unknown>; message?: string } } } = {};
+    const req = { headers, method: "POST", url: pathname } as unknown as http.IncomingMessage;
     const res = {} as http.ServerResponse;
     const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
-      captured = { status, body: b as NonNullable<typeof captured>["body"] };
+      cap.res = { status, body: b as { code: number; data?: Record<string, unknown>; message?: string } };
     };
     const deps = {
       deployMode: "service",
@@ -198,8 +200,7 @@ describe("POST /memory/diff/revert", () => {
       logger: { info() {}, debug() {}, warn() {}, error() {} },
     } as unknown as Parameters<typeof handleV2Route>[6];
     await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
-    const cap = captured as ({ status: number; body: { code: number; data?: Record<string, unknown> } } | null);
-    return { status: cap?.status, data: cap?.body?.data };
+    return { status: cap.res?.status, data: cap.res?.body?.data };
   };
 
   const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
@@ -475,6 +476,19 @@ describe("POST /memory/diff/revert", () => {
     const { status } = await call("/v3/memory/diff/revert", { record_id: "m_a" });
     expect(status).toBe(200);
   });
+
+  it("two concurrent reverts of the same record serialize — exactly one wins", async () => {
+    // Revert is plan-then-act; without the per-record lock both callers can
+    // pass the guards and interleave restore/delete/event-append.
+    const [a, b] = await Promise.all([
+      call("/v3/memory/diff/revert", { record_id: "m_b" }),
+      call("/v3/memory/diff/revert", { record_id: "m_b" }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    // Exactly one reverted event, exactly one restore — no double-acted plan.
+    expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })).toHaveLength(1);
+    expect((await store.queryL1Records({ recordIds: ["m_a", "m_b"] })).map((r) => r.record_id)).toEqual(["m_a"]);
+  });
 });
 
 describe("POST /memory/history", () => {
@@ -484,7 +498,7 @@ describe("POST /memory/history", () => {
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     captured = null;
-    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const req = { headers, method: "POST", url: pathname } as unknown as http.IncomingMessage;
     const res = {} as http.ServerResponse;
     const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
       captured = { status, body: b as NonNullable<typeof captured>["body"] };
@@ -568,7 +582,7 @@ describe("POST /memory/review/inbox", () => {
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     captured = null;
-    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const req = { headers, method: "POST", url: pathname } as unknown as http.IncomingMessage;
     const res = {} as http.ServerResponse;
     const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
       captured = { status, body: b as NonNullable<typeof captured>["body"] };
@@ -679,7 +693,7 @@ describe("mutation → memory_events mirror (unified change ledger)", () => {
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     captured = null;
-    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const req = { headers, method: "POST", url: pathname } as unknown as http.IncomingMessage;
     const res = {} as http.ServerResponse;
     const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
       captured = { status, body: b as { code: number; data?: Record<string, unknown> } };
@@ -738,6 +752,31 @@ describe("mutation → memory_events mirror (unified change ledger)", () => {
     const l2Only = store.queryMemoryEvents({ layer: "l2" });
     expect(l2Only).toHaveLength(0);
   });
+
+  it("atomic/update returning false → 503 and no phantom updated event", async () => {
+    const realUpsert = store.upsertL1.bind(store);
+    store.upsertL1 = async () => false; // degraded backend rejects the write
+    const { status } = await call("/v3/atomic/update", { id: "m_a", content: "hacked" });
+    expect(status).toBe(503);
+    // The ledger must not record a change that never landed.
+    expect(store.queryMemoryEvents({ record_id: "m_a", op: "updated" })).toHaveLength(0);
+    expect(store.queryMemoryEvents({ record_id: "m_a", source: "api_mutation" })).toHaveLength(0);
+    store.upsertL1 = realUpsert;
+    const ok = await call("/v3/atomic/update", { id: "m_a", content: "fixed" });
+    expect(ok.status).toBe(200);
+    expect(store.queryMemoryEvents({ record_id: "m_a", op: "updated" })).toHaveLength(1);
+  });
+
+  it("atomic/update refuses to write a record owned by another tenant", async () => {
+    // m_a belongs to t1 — a caller asserting t2 must not reach the write.
+    const { status } = await call("/v3/atomic/update", { id: "m_a", content: "hijack" }, {
+      ...ISO_HEADERS, "x-tdai-team-id": "t2",
+    });
+    expect(status).toBe(403);
+    const row = (await store.queryL1Records({ recordIds: ["m_a"] }))[0]!;
+    expect(row.content).not.toBe("hijack");
+    expect(store.queryMemoryEvents({ record_id: "m_a", op: "updated" })).toHaveLength(0);
+  });
 });
 
 const SINCE = "2000-01-01T00:00:00.000Z";
@@ -751,7 +790,7 @@ describe("change-ledger outbox endpoints", () => {
 
   const call = async (pathname: string, body: unknown) => {
     captured = null;
-    const req = { headers: ISO_HEADERS, method: "POST", url: pathname } as http.IncomingMessage;
+    const req = { headers: ISO_HEADERS, method: "POST", url: pathname } as unknown as http.IncomingMessage;
     const res = {} as http.ServerResponse;
     const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
       captured = { status, body: b as NonNullable<typeof captured>["body"] };
@@ -888,7 +927,7 @@ describe("conversation/add idempotency", () => {
 
   const call = async (body: unknown, headers: Record<string, string> = {}) => {
     let captured: { status: number; body: { data?: { accepted_ids: string[] } } } | null = null;
-    const req = { headers: { ...ISO_HEADERS, ...headers }, method: "POST", url: "/v3/conversation/add" } as http.IncomingMessage;
+    const req = { headers: { ...ISO_HEADERS, ...headers }, method: "POST", url: "/v3/conversation/add" } as unknown as http.IncomingMessage;
     const deps = {
       deployMode: "service",
       getStore: () => store,

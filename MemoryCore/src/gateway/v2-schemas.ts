@@ -442,9 +442,13 @@ export type V2AuthContext = z.infer<typeof v2AuthContextSchema>;
 // since/until 必须是可解析的时间——store 层是裸字符串比较，垃圾值不会报错
 // 只会静默错过滤。注意这挡不住语义坑：date-only 的 until:"2026-01-15" 合法
 // 但会排掉当天全部事件（字典序 < "2026-01-15T…"）——调用方应传完整时间戳。
-const isoDateString = z.string().refine((v) => !Number.isNaN(Date.parse(v)), {
-  message: "must be a parseable ISO 8601 timestamp",
-});
+const isoDateString = z.string().refine(
+  // Date.parse alone accepts "March 5, 2026" / "01/02/2026" / "2026" — all
+  // garbage under the stores' lexicographic event_ts compare. Require the ISO
+  // shape (date-only still legal; documented edge) AND parseability.
+  (v) => /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(v) && !Number.isNaN(Date.parse(v)),
+  { message: "must be an ISO 8601 timestamp (YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±HH:mm]])" },
+);
 
 export const memoryDiffRequestSchema = z.object({
   /** 必填：查询哪个 session 的变更集。 */
@@ -469,7 +473,7 @@ export const memoryDiffRevertRequestSchema = z.object({
   /** 批量撤销（上限 50/次）。与 record_id 二选一或并用。 */
   record_ids: z.array(z.string().min(1)).min(1).max(50).optional(),
   /** 可选：撤销理由，记入 reverted 事件的 reason（兼容：同时写入 content）。 */
-  reason: z.string().optional(),
+  reason: z.string().max(2000).optional(),
   /** 可选：记录在提取写入后被人工编辑时，显式丢弃人工编辑继续撤销。默认 false（409）。 */
   force: z.boolean().optional(),
   /** 可选：要撤销的写入事件 event_id（逐层回退人工编辑）。仅可与单个 record_id 同用。 */
@@ -504,7 +508,11 @@ export const memoryReviewInboxRequestSchema = z.object({
 export type MemoryReviewInboxRequest = z.infer<typeof memoryReviewInboxRequestSchema>;
 
 // POST /v2|v3/memory/ledger/status — 变更账健康度（本进程见到的 store/outbox 追加失败）。
-export const memoryLedgerStatusRequestSchema = z.object({}).passthrough();
+// reset:true 清失败计数；pending 擦除是未落地的工作项，不在 reset 范围内——
+// 只能由 backfill 真正落地或重启清除（需开 backfill flag）。
+export const memoryLedgerStatusRequestSchema = z.object({
+  reset: z.boolean().optional(),
+}).passthrough();
 export type MemoryLedgerStatusRequest = z.infer<typeof memoryLedgerStatusRequestSchema>;
 
 // POST /v2|v3/memory/ledger/backfill — 从 events/*.jsonl outbox 幂等回放缺失事件到 store。

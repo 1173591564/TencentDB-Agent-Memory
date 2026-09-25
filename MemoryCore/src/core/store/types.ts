@@ -743,7 +743,11 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   // ── L1 Read ──────────────────────────────────────────────
 
   countL1(filter?: L1CountFilter): MaybePromise<number>;
-  queryL1Records(filter?: L1QueryFilter): MaybePromise<L1RecordRow[]>;
+  /**
+   * `opts.strict`: rethrow backend errors instead of returning [] — required by
+   * callers (e.g. revert guards) that must not read a failed query as "no rows".
+   */
+  queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean }): MaybePromise<L1RecordRow[]>;
   getAllL1Texts(): MaybePromise<Array<{ record_id: string; content: string; updated_time: string }>>;
 
   // ── L1 Search ────────────────────────────────────────────

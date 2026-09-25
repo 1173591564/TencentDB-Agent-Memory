@@ -808,12 +808,17 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async deleteL1(recordId: string): Promise<boolean> {
+  async deleteL1(recordId: string, filter?: IsolationFilter): Promise<boolean> {
     try {
       await this._ensureInit();
       if (this.degraded) return false;
+      // Same as deleteL0: the isolation filter must reach the backend — a bare
+      // documentIds delete would let one tenant remove another's row.
+      const filterExpr = joinFilter(buildIsolationConditions(filter));
+      const query: Record<string, unknown> = { documentIds: [recordId] };
+      if (filterExpr) query.filter = filterExpr;
       const affected = await this.client.deleteDoc(this.l1Collection, {
-        query: { documentIds: [recordId] },
+        query,
       });
       return affected > 0;
     } catch (err) {
@@ -822,13 +827,16 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async deleteL1Batch(recordIds: string[]): Promise<boolean> {
+  async deleteL1Batch(recordIds: string[], filter?: IsolationFilter): Promise<boolean> {
     if (recordIds.length === 0) return true;
     try {
       await this._ensureInit();
       if (this.degraded) return false;
+      const filterExpr = joinFilter(buildIsolationConditions(filter));
+      const query: Record<string, unknown> = { documentIds: recordIds };
+      if (filterExpr) query.filter = filterExpr;
       await this.client.deleteDoc(this.l1Collection, {
-        query: { documentIds: recordIds },
+        query,
       });
       return true;
     } catch (err) {
@@ -902,10 +910,13 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async queryL1Records(filter?: L1QueryFilter): Promise<L1RecordRow[]> {
+  async queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean }): Promise<L1RecordRow[]> {
     try {
       await this._ensureInit();
-      if (this.degraded) return [];
+      if (this.degraded) {
+        if (opts?.strict) throw new Error("L1 query rejected: tcvdb store is degraded");
+        return [];
+      }
 
       // Build filter expression
       const conditions = buildIsolationConditions(filter);
@@ -978,7 +989,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
         metadata_json: String(doc.metadata_json ?? "{}"),
       }));
     } catch (err) {
-      this.logger?.warn(`${TAG} [L1-query] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      this.logger?.warn(`${TAG} [L1-query] FAILED${opts?.strict ? " (strict, rethrowing)" : ""}: ${err instanceof Error ? err.message : String(err)}`);
+      if (opts?.strict) throw err;
       return [];
     }
   }
@@ -2585,7 +2597,10 @@ export class TcvdbMemoryStore implements IMemoryStore {
     // id = event_id：写入点生成的稳定身份（36 字符，远低于 TCVDB 文档 id
     // 上限 128）。不能拼 record_id 等业务字段——管理面 asset_id 之类的长
     // record_id 会把 id 撑过上限、upsert 被拒、事件静默丢失。upsert 对同 id
-    // 整体替换，正好让同一事件的重放/重试幂等，而不同事件 id 必不相同。
+    // 整体替换是安全的：回放写进来的一定是已被 marker 骨架化的事件
+    // （replayLedgerEvents 先应用 redact 标记再落库），ledger 侧的
+    // appendLedgerEvent 也对已知 marker 覆盖的事件写骨架 + 补定向擦除，
+    // 不存在"明文事件覆盖已擦骨架"的路径。
     const id = event.event_id || newMemoryEventId();
     // dim=1 占位向量（events 不需向量检索，仅用 filter 查询）
     const doc: Record<string, unknown> = {

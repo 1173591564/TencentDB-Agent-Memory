@@ -1787,11 +1787,14 @@ export class VectorStore implements IMemoryStore {
    * composite index `idx_l1_session_updated(session_id, updated_time)` is used
    * for efficient filtering. All timestamps are compared as UTC ISO 8601 strings.
    *
-   * **Fault-tolerant**: returns an empty array on any error (degraded mode, DB issues).
+   * **Fault-tolerant**: returns an empty array on any error (degraded mode, DB issues)
+   * — unless `opts.strict` is set, which rethrows so revert-style guards can't
+   *   read a failed query as "no live rows".
    */
-  queryL1Records(filter?: L1QueryFilter): L1RecordRow[] {
+  queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean }): L1RecordRow[] {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L1-query] SKIPPED (degraded mode)`);
+      if (opts?.strict) throw new Error("L1 query rejected: sqlite store is degraded");
       return [];
     }
     try {
@@ -1864,8 +1867,9 @@ export class VectorStore implements IMemoryStore {
       return rows;
     } catch (err) {
       this.logger?.warn(
-        `${TAG} [L1-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`
+        `${TAG} [L1-query] FAILED${opts?.strict ? " (strict, rethrowing)" : " (non-fatal, returning empty)"}: ${err instanceof Error ? err.message : String(err)}`
       );
+      if (opts?.strict) throw err;
       return [];
     }
   }

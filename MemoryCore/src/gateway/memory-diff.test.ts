@@ -342,6 +342,40 @@ describe("POST /memory/diff/revert", () => {
     const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b", record_ids: ids });
     expect(status).toBe(400);
   });
+
+  it("failed restore is retryable — delete of an already-deleted record must not deadlock", async () => {
+    // 第一次 revert：restore 阶段 upsertL1 全部失败 → 500 且不落 reverted 标记。
+    const real = store;
+    store = new Proxy(real, {
+      get(t, p) {
+        if (p === "upsertL1") return async () => false;
+        const v = Reflect.get(t, p);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    }) as VectorStore;
+    const first = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    store = real;
+    expect(first.status).toBe(500);
+    // 重试：m_b 行已不在（上次已删）→ 跳过 delete 直接恢复 → 200。
+    // 若 deleteL1 的 false 被当成故障，这里会永久 500。
+    const retry = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(retry.status).toBe(200);
+    expect(retry.data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
+  });
+
+  it("mid-chain guard walks by row existence — a dead chain tail does not block", async () => {
+    // 先 revert m_b：m_a 复活（m_b 行已删）。再补一条指向幽灵 id 的 superseded
+    // 事件（无行、无事件）——链尾视为已死亡，事件丢失不能造成永久死锁。
+    await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-x",
+      team_id: "t1", user_id: "u1", agent_id: "a1",
+      op: "superseded", record_id: "m_a", content: "old", version: 0,
+      superseded_by: "m_ghost", snapshot_json: "",
+    });
+    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_a" });
+    expect(status).toBe(200);
+  });
 });
 
 describe("POST /memory/history", () => {

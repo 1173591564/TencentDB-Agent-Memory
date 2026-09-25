@@ -451,11 +451,14 @@ export async function writeMemory(params: {
   // - update/merge → 1 × superseded per target (old-content snapshot, when the
   //                  version query above succeeded) + 1 × updated/merged
   // - skip         → no event (nothing was written)
-  // Events describe committed outcomes only: skip entirely when the upsert
-  // failed; when the supersede-delete failed the new record was written but
-  // nothing was replaced, so it is recorded as `created` (no superseded
-  // events, no supersedes claim) — the ledger stays restorable-truthful.
-  if (vectorStore?.appendMemoryEvent && upsertOk) {
+  // Events describe committed outcomes. The JSONL line is already written by
+  // this point, so the creation itself is a fact regardless of whether the
+  // vector upsert succeeded — skipping events on upsertOk would erase a
+  // destructive outcome (deleted targets) from the ledger and destroy the
+  // only restore path (superseded snapshots). Only the supersede-delete
+  // outcome gates the supersession claims: when it failed nothing was
+  // actually replaced, so the write is recorded as `created`.
+  if (vectorStore?.appendMemoryEvent) {
     try {
       const base = {
         event_ts: now,

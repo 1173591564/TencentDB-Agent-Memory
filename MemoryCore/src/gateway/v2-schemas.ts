@@ -435,7 +435,8 @@ export type V2AuthContext = z.infer<typeof v2AuthContextSchema>;
 // 旧记录快照。原始事件行由 store.queryMemoryEvents 返回，聚合在 handler 完成。
 
 // since/until 必须是可解析的时间——store 层是裸字符串比较，垃圾值不会报错
-// 只会静默错过滤（如 until:"2026-01-15" 把当天事件全部排掉）。
+// 只会静默错过滤。注意这挡不住语义坑：date-only 的 until:"2026-01-15" 合法
+// 但会排掉当天全部事件（字典序 < "2026-01-15T…"）——调用方应传完整时间戳。
 const isoDateString = z.string().refine((v) => !Number.isNaN(Date.parse(v)), {
   message: "must be a parseable ISO 8601 timestamp",
 });

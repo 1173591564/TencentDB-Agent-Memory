@@ -10,7 +10,7 @@ import type { MetaEnvelope } from './types';
 
 /** diff 里单条变更。replaced 是被 superseded 的旧记录快照。 */
 export interface MemoryDiffChange {
-  op: 'created' | 'updated' | 'merged' | 'superseded' | 'reverted';
+  op: 'created' | 'updated' | 'merged' | 'superseded' | 'reverted' | 'deleted';
   record_id: string;
   content: string;
   memory_type?: string;
@@ -18,6 +18,8 @@ export interface MemoryDiffChange {
   event_ts: string;
   origin_session_id?: string;
   origin_session_key?: string;
+  /** updated/merged/reverted 事件：被替代/被恢复的旧 record_id 列表。 */
+  supersedes?: string[];
   /** 该变更已被 revert 撤销。 */
   reverted?: boolean;
   /** 驳回者身份（reverted 事件的 reviewer_id，审核时的 isolation user）。 */

@@ -25,6 +25,7 @@ const OP_TAG: Record<MemoryDiffChange['op'], { theme: 'success' | 'primary' | 'w
   merged: { theme: 'warning' },
   superseded: { theme: 'default' },
   reverted: { theme: 'error' },
+  deleted: { theme: 'error' },
 };
 
 function ChangeCard({

@@ -1302,6 +1302,9 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   const revertedEvents = await store.queryMemoryEvents({
     session_id: parsed.data.session_id,
     op: "reverted",
+    // 倒序取最新标记：>1000 条 reverted 时最新的才是当前状态，最旧的截掉无妨
+    //（升序会漏掉最新标记，复刻"Revert 按钮还在 → 核心 409"的老问题）。
+    order: "desc",
     limit: 1000,
     team_id: iso?.teamId,
     user_id: iso?.userId,
@@ -1445,27 +1448,43 @@ async function revertOneL1Record(
   if (recordEvents.some((e) => e.op === "reverted")) {
     return { ok: false, record_id: recordId, status: 409, error: `Record ${recordId} has already been reverted` };
   }
-  // 中链驳回守卫：该记录自身已被更新的记录替代（superseded）或被管理面删除
-  // （deleted）时，驳回它会让祖先记录复活并与仍存活的替代者重复共存。
-  // 正确操作是驳回链上最新那条记录。
-  // 注意"当前仍被替代"≠"历史上有 superseded 事件"——若替代者已被 revert
-  // 恢复，本记录重新处于存活态，驳回它（撤销其写入）是合法操作。
+  // 中链驳回守卫：该记录被管理面删除（deleted）后驳回会复活已删数据 → 永久阻断。
   if (recordEvents.some((e) => e.op === "deleted")) {
     return { ok: false, record_id: recordId, status: 409, error: `Record ${recordId} was deleted by an administrative operation — reverting would resurrect deleted data` };
   }
-  const supersededByIds = [
+  // 中链驳回守卫：沿 superseded_by 链向下走，任一后代记录的**行仍存在**（=
+  // 链上有存活的新记录）时，驳回本记录会让祖先复活并与存活者重复共存 → 409，
+  // 正确操作是驳回链上最新那条。
+  // 判定用行存在性而非"替代者有无 reverted 事件"：事件是 best-effort 写入，
+  // degraded 时会静默丢失，行才是当前状态的 ground truth——替代者事件全丢但
+  // 行还在 → 依然阻断；行不在（已被 revert/再替代删掉）→ 链继续向下走。
+  // 链尾（无事件且无行）视为已死亡 → 放行（宁可冒重复共存的风险也不死锁）。
+  // 上限 5 跳防环/防爆炸。
+  const isoRowFilter = iso ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId } : {};
+  const frontier = [
     ...new Set(recordEvents.filter((e) => e.op === "superseded" && e.superseded_by).map((e) => e.superseded_by!)),
   ];
-  for (const supId of supersededByIds) {
-    let supEvents: MemoryEvent[];
-    try {
-      supEvents = await store.queryMemoryEvents({ record_id: supId, ...isoScope, limit: 100 });
-    } catch (err) {
-      return { ok: false, record_id: recordId, status: 500, error: `Failed to read events for superseder ${supId}: ${err instanceof Error ? err.message : String(err)}` };
+  const visited = new Set<string>([recordId]);
+  for (let hop = 0; hop < 5 && frontier.length > 0; hop++) {
+    const chunk = frontier.splice(0, 20); // TCVDB documentIds 单查上限 20
+    const rows = await Promise.resolve(
+      store.queryL1Records({ recordIds: chunk, ...isoRowFilter }),
+    ).catch(() => []);
+    if (rows.length > 0) {
+      return { ok: false, record_id: recordId, status: 409, error: `Record ${recordId} is currently superseded by ${rows.map((r) => r.record_id).join(", ")} — revert the newest record in the chain instead` };
     }
-    if (!supEvents.some((e) => e.op === "reverted")) {
-      return { ok: false, record_id: recordId, status: 409, error: `Record ${recordId} is currently superseded by ${supId} — revert the newest record in the chain instead` };
+    const next: string[] = [];
+    for (const id of chunk) {
+      if (visited.has(id)) continue;
+      visited.add(id);
+      try {
+        const evs = await store.queryMemoryEvents({ record_id: id, ...isoScope, limit: 100 });
+        for (const e of evs) {
+          if (e.op === "superseded" && e.superseded_by && !visited.has(e.superseded_by)) next.push(e.superseded_by);
+        }
+      } catch { /* 链追溯失败按已死亡处理（放行）——事件是 best-effort 的 */ }
     }
+    frontier.push(...next);
   }
 
   // 撤销新记录（无论 created 还是 updated/merged 都要删）。
@@ -1475,15 +1494,25 @@ async function revertOneL1Record(
   const deleteFilter = iso
     ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId }
     : undefined;
+  // deleteL1 的 false 同时表示"store 故障"和"0 rows（记录已不在）"——后者是
+  // 上次 revert 删完但 restore 失败后的合法重试态，必须放行而不是 500 死锁。
+  // 所以先查行：行存在才删，行不存在（上次已删）直接进入恢复阶段。
+  let recordExists: boolean;
   try {
-    const deleted = await store.deleteL1(recordId, deleteFilter);
-    // deleteL1 以 false 而非抛错表示失败（degraded store / 0 rows）——不检查
-    // 会继续写 reverted 标记并假成功，之后每次重试都被 409 永久挡住。
-    if (!deleted) {
-      return { ok: false, record_id: recordId, status: 500, error: `Failed to delete record ${recordId}: store returned false` };
-    }
+    const rows = await store.queryL1Records({ recordIds: [recordId], ...isoRowFilter });
+    recordExists = rows.length > 0;
   } catch (err) {
-    return { ok: false, record_id: recordId, status: 500, error: `Failed to delete record ${recordId}: ${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, record_id: recordId, status: 500, error: `Failed to read record ${recordId}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (recordExists) {
+    try {
+      const deleted = await store.deleteL1(recordId, deleteFilter);
+      if (!deleted) {
+        return { ok: false, record_id: recordId, status: 500, error: `Failed to delete record ${recordId}: store returned false` };
+      }
+    } catch (err) {
+      return { ok: false, record_id: recordId, status: 500, error: `Failed to delete record ${recordId}: ${err instanceof Error ? err.message : String(err)}` };
+    }
   }
 
   // updated/merged：恢复被 superseded 的旧记录。superseded 事件的 record_id

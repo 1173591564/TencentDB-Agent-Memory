@@ -14,6 +14,7 @@ export interface MemoryLedgerDegraded {
   store_failures: number;
   jsonl_failures: number;
   pending_store_events: number;
+  pending_redactions?: number;
   last_failure_at?: string;
 }
 
@@ -90,7 +91,8 @@ export interface MemoryLedgerBackfillData {
   malformed: number;
   failed: number;
   redacted: number;
-  health?: { degraded: boolean; pending_store_events: number };
+  redactions_applied: number;
+  health?: { degraded: boolean; pending_store_events: number; pending_redactions?: number };
 }
 
 /** memory/history 返回的单条事件（record 血统）。 */

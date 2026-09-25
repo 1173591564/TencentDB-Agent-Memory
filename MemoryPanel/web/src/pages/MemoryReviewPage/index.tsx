@@ -158,7 +158,7 @@ export function MemoryReviewPage() {
   const [historyLoadingId, setHistoryLoadingId] = useState<string | null>(null);
   const [inbox, setInbox] = useState<MemoryReviewInboxSession[] | null>(null);
   const [inboxTruncated, setInboxTruncated] = useState(false);
-  const [ledgerDegraded, setLedgerDegraded] = useState<{ store_failures: number; jsonl_failures: number; pending_store_events: number; last_failure_at?: string } | null>(null);
+  const [ledgerDegraded, setLedgerDegraded] = useState<{ store_failures: number; jsonl_failures: number; pending_store_events: number; pending_redactions?: number; last_failure_at?: string } | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
   const [backfilling, setBackfilling] = useState(false);
 
@@ -434,6 +434,9 @@ export function MemoryReviewPage() {
               '变更账降级：当前租户有 {{pending}} 条事件尚未写入存储，以下变更可能不完整——填写起始时间后可从 outbox 补齐（补齐后提示自动消失）',
               { pending: ledgerDegraded.pending_store_events },
             )}
+            {ledgerDegraded.pending_redactions
+              ? t('memoryReview.ledgerRedactionsPending', '；另有 {{n}} 次清空/过期擦除未落到存储，补齐时会重新执行', { n: ledgerDegraded.pending_redactions })
+              : null}
             {ledgerDegraded.last_failure_at ? `（${ledgerDegraded.last_failure_at}）` : null}
             <Button
               type="link"

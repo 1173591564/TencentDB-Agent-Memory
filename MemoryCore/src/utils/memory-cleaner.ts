@@ -3,6 +3,8 @@ import path from "node:path";
 
 import type { IMemoryStore } from "../core/store/types.js";
 import { appendLedgerEvent, redactLedgerEvents } from "../core/record/event-ledger.js";
+import { StorageAdapter } from "../core/storage/adapter.js";
+import { createLocalStorageBackend } from "../core/storage/factory.js";
 import { ManagedTimer } from "./managed-timer.js";
 import type { Logger } from "../core/types.js";
 
@@ -35,10 +37,13 @@ export class LocalMemoryCleaner {
   private readonly timer: ManagedTimer;
   private destroyed = false;
   private vectorStore?: IMemoryStore;
+  /** Local outbox under baseDir (events/*.jsonl), for retention events and redaction markers. */
+  private readonly outbox: StorageAdapter;
 
   constructor(private readonly opts: MemoryCleanerOptions) {
     this.timer = new ManagedTimer("memory-tdai-cleaner", () => this.destroyed);
     this.vectorStore = opts.vectorStore;
+    this.outbox = new StorageAdapter(createLocalStorageBackend(opts.baseDir));
   }
 
   setVectorStore(vectorStore: IMemoryStore | undefined): void {
@@ -172,7 +177,7 @@ export class LocalMemoryCleaner {
       //    resurrect expired rows) and expired content must not outlive the
       //    rows in memory_events. Metadata skeletons are kept. ──
       if (removedL1 > 0) {
-        await appendLedgerEvent({ store: vectorStore, logger: this.opts.logger, event: {
+        await appendLedgerEvent({ store: vectorStore, storage: this.outbox, logger: this.opts.logger, event: {
           event_ts: new Date().toISOString(),
           session_key: "",
           session_id: "",
@@ -186,7 +191,7 @@ export class LocalMemoryCleaner {
         } });
       }
       if (!skippedL1 && !failedL1DbCleanup) {
-        await redactLedgerEvents({ store: vectorStore, logger: this.opts.logger, filter: { until: cutoffIso } });
+        await redactLedgerEvents({ store: vectorStore, storage: this.outbox, logger: this.opts.logger, filter: { until: cutoffIso } });
       }
 
       // ── Post-delete: audit summary ──

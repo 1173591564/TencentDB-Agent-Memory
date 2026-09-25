@@ -30,6 +30,8 @@ export interface LedgerHealth {
   last_failure_at?: string;
   /** Events that reached the outbox but not the store and have not been replayed yet. */
   pending_store_events: number;
+  /** Clear/TTL redactions the store failed to apply (backfill re-applies them from the outbox). */
+  pending_redactions: number;
 }
 
 export interface LedgerAppendResult {
@@ -47,6 +49,8 @@ export interface LedgerReplayResult {
   failed: number;
   /** Replayed events whose content was blanked by a later clear/TTL marker. */
   redacted: number;
+  /** Clear/TTL markers re-applied to the store. */
+  redactions_applied: number;
 }
 
 /** Tenant scope used by health, replay and redaction (unset fields match anything). */
@@ -79,6 +83,44 @@ interface TenantHealth {
 }
 
 const healthByStore = new WeakMap<object, Map<string, TenantHealth>>();
+interface PendingRedaction {
+  filter: MemoryEventRedactFilter;
+  /** Tenants a scoped backfill already redacted (for filters not pinned to one tenant). */
+  cleared: Set<string>;
+}
+
+/** Per store: failed store redactions keyed by their canonical filter. */
+const pendingRedactionsByStore = new WeakMap<object, Map<string, PendingRedaction>>();
+
+function redactionKey(f: MemoryEventRedactFilter): string {
+  return JSON.stringify([f.team_id ?? null, f.agent_id ?? null, f.user_id ?? null, f.until]);
+}
+
+function pendingRedactions(store: LedgerStore | undefined): Map<string, PendingRedaction> {
+  const key = store ?? UNBOUND_STORE;
+  let m = pendingRedactionsByStore.get(key);
+  if (!m) {
+    m = new Map();
+    pendingRedactionsByStore.set(key, m);
+  }
+  return m;
+}
+
+/** A redaction filter touches the scope when it is not pinned to a different team/agent. */
+function redactionTouches(f: MemoryEventRedactFilter, scope?: LedgerScope): boolean {
+  return (f.team_id === undefined || scope?.team_id === undefined || f.team_id === scope.team_id) &&
+    (f.agent_id === undefined || scope?.agent_id === undefined || f.agent_id === scope.agent_id);
+}
+
+function scopeTenantKey(scope?: LedgerScope): string | undefined {
+  return scope?.team_id !== undefined && scope.agent_id !== undefined ? tenantKey(scope.team_id, scope.agent_id) : undefined;
+}
+
+function redactionPendingFor(p: PendingRedaction, scope?: LedgerScope): boolean {
+  if (!redactionTouches(p.filter, scope)) return false;
+  const k = scopeTenantKey(scope);
+  return k === undefined || !p.cleared.has(k);
+}
 const UNBOUND_STORE = {};
 
 function tenantKey(team: string, agent: string): string {
@@ -157,12 +199,14 @@ export function getLedgerHealth(
     unrecoverable += h.unrecoverable;
     if (h.last_failure_at && (!last || h.last_failure_at > last)) last = h.last_failure_at;
   }
+  const redactions = [...pendingRedactions(store).values()].filter((p) => redactionPendingFor(p, scope)).length;
   return {
     store_failures,
     jsonl_failures,
     ...(last ? { last_failure_at: last } : {}),
     pending_store_events: pending + unrecoverable,
-    degraded: pending > 0 || unrecoverable > 0,
+    pending_redactions: redactions,
+    degraded: pending > 0 || unrecoverable > 0 || redactions > 0,
   };
 }
 
@@ -182,6 +226,7 @@ export function hasPendingLedgerEvent(store: LedgerStore | undefined, recordId: 
 /** Test/ops hook: clear the failure counters. */
 export function resetLedgerHealth(store: LedgerStore | undefined): void {
   healthByStore.delete(store ?? UNBOUND_STORE);
+  pendingRedactionsByStore.delete(store ?? UNBOUND_STORE);
 }
 
 function shardDateOf(ts: string): string {
@@ -254,10 +299,24 @@ export async function redactLedgerEvents(params: {
     try {
       out.redacted = await store.redactMemoryEvents(filter);
     } catch (err) {
-      logger?.warn?.(`${TAG} store redaction failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      pendingRedactions(store).set(redactionKey(filter), { filter, cleared: new Set() });
+      logger?.warn?.(
+        `${TAG} store redaction failed (non-fatal${out.jsonl ? ", re-applied by backfill" : ""}): ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
   return out;
+}
+
+const MEMORY_EVENT_OPS: ReadonlySet<string> = new Set<MemoryEvent["op"]>(
+  ["created", "updated", "merged", "superseded", "reverted", "deleted"],
+);
+
+function isReplayableEvent(e: Partial<Record<keyof MemoryEvent, unknown>>): e is MemoryEvent {
+  return typeof e.event_id === "string" && e.event_id !== "" &&
+    typeof e.record_id === "string" && e.record_id !== "" &&
+    typeof e.op === "string" && MEMORY_EVENT_OPS.has(e.op) &&
+    typeof e.event_ts === "string" && !Number.isNaN(Date.parse(e.event_ts));
 }
 
 function markerCovers(m: MemoryEventRedactFilter, e: MemoryEvent): boolean {
@@ -288,7 +347,7 @@ export async function replayLedgerEvents(params: {
   logger?: LedgerLogger;
 }): Promise<LedgerReplayResult> {
   const { store, storage, since, scope, logger } = params;
-  const out: LedgerReplayResult = { files: 0, scanned: 0, replayed: 0, skipped: 0, malformed: 0, failed: 0, redacted: 0 };
+  const out: LedgerReplayResult = { files: 0, scanned: 0, replayed: 0, skipped: 0, malformed: 0, failed: 0, redacted: 0, redactions_applied: 0 };
   if (!store.appendMemoryEvent) return out;
 
   const sinceDate = since ? new Date(since).toISOString().slice(0, 10) : undefined;
@@ -306,22 +365,54 @@ export async function replayLedgerEvents(params: {
     for (const line of content.split("\n")) {
       if (!line.trim()) continue;
       out.scanned += 1;
-      let parsed: MemoryEvent & Partial<RedactionMarker>;
+      let value: unknown;
       try {
-        parsed = JSON.parse(line) as MemoryEvent & Partial<RedactionMarker>;
+        value = JSON.parse(line);
       } catch {
         out.malformed += 1;
         continue;
       }
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        out.malformed += 1;
+        continue;
+      }
+      const parsed = value as MemoryEvent & Partial<RedactionMarker>;
       if (parsed.redact && typeof parsed.redact.until === "string") {
         markers.push(parsed.redact);
         continue;
       }
-      if (!parsed.event_id || !parsed.op || !parsed.record_id || !parsed.event_ts) {
+      if (!isReplayableEvent(parsed)) {
         out.malformed += 1;
         continue;
       }
       events.push(parsed);
+    }
+  }
+
+  // Re-apply clear/TTL redactions to the store first (idempotent): a redaction
+  // the store missed when it ran must not leave cleared content behind.
+  // Markers are narrowed to the requested scope so a tenant backfill never
+  // touches other tenants' events.
+  if (store.redactMemoryEvents) {
+    const pendingR = pendingRedactions(store);
+    for (const m of markers) {
+      if (!redactionTouches(m, scope)) continue;
+      const narrowed: MemoryEventRedactFilter = {
+        ...m,
+        ...(m.team_id === undefined && scope?.team_id !== undefined ? { team_id: scope.team_id } : {}),
+        ...(m.agent_id === undefined && scope?.agent_id !== undefined ? { agent_id: scope.agent_id } : {}),
+      };
+      try {
+        await store.redactMemoryEvents(narrowed);
+        out.redactions_applied += 1;
+        const pending = pendingR.get(redactionKey(m));
+        const tenant = scopeTenantKey(scope);
+        if (pending && redactionKey(narrowed) === redactionKey(m)) pendingR.delete(redactionKey(m));
+        else if (pending && tenant !== undefined) pending.cleared.add(tenant);
+      } catch (err) {
+        out.failed += 1;
+        logger?.warn?.(`${TAG} replay redaction failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 

@@ -54,6 +54,7 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - 目标写入之后同 team/agent 有 `deleted`（clear/archive，`scope=agent`）或记录已不存在（含 TTL 清理）；
 - 提取写入之后有 `source=api_mutation` 的人工编辑：先按 `event_id` 撤销该人工编辑层，或 `force:true` 覆盖；
 - 被恢复的旧记录还有其它存活后继（并发 session 分叉）；
+- 被恢复的旧记录没有可用快照（写入缺口或已被 clear/TTL 擦除）：默认 409，`force:true` 接受只删不恢复（响应带 `missing`）；
 - 该记录的 `reverted` 事件仍在 pending（未进 store）时返回 503，补齐后再判断。
 
 管理面 update 事件带修改前的 `snapshot_json`，可按 `event_id` 逐层回退。`reviewer_id` 只取
@@ -65,7 +66,7 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
   `content` / `snapshot_json`（保留 op/时间/id 元数据骨架）；同时向 outbox 追加擦除标记，
   backfill 回放时先应用标记，不会恢复已擦除内容。
 - TTL 清理（L1 实际执行时）写一条 `source=retention`、`scope=retention`、`until=cutoff` 的批次 deleted 事件，
-  并擦除 cutoff 之前的事件内容；过期的 outbox 分片按日期整体删除。批次事件不含逐条 record_id
+  并擦除 cutoff 之前的事件内容（批次事件与擦除标记都写入本地 outbox）；过期的 outbox 分片按日期整体删除。批次事件不含逐条 record_id
   （`deleteL1Expired` 只返回数量），revert 依靠目标行不存在来拒绝。
 
 ## 回放 / 补齐（runbook）
@@ -83,7 +84,13 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 运维操作：需部署设置 `TDAI_LEDGER_BACKFILL_ENABLED=1`（否则 403）；`since` 必填（否则 400）。
   MemoryPanel 降级横幅提供“从 outbox 补齐”按钮（经面板代理 `/memory/ledger/backfill`）。
 - 回放范围限定在请求 isolation 的 team/agent，按文件日期与 `event_ts` 过滤。
-- 依赖 `event_id` 幂等，可安全重复执行；无 `event_id` 的畸形行计入 `malformed` 并跳过。
+- 依赖 `event_id` 幂等，可安全重复执行；非 JSON、非对象（如 `null`、数组）或缺 `event_id` 的畸形行计入 `malformed` 并跳过，不影响后续行与分片。
+- store 拒绝写入（含降级状态）时回放计入 `failed`，事件保持 pending，直到真正写入成功。
+- 未知 `op`、非字符串 `event_id`/`record_id`、无法解析的 `event_ts` 同样计入 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
+- 回放会先把扫描到的 clear/TTL 擦除标记重新应用到 store（收窄到请求的 team/agent，幂等，计入 `redactions_applied`）。
+  store 擦除失败时健康度记 `pending_redactions` 并置 `degraded`，直到覆盖该标记所在分片的 backfill 成功；
+  TTL 标记不带租户：按租户 backfill 只擦该租户，并只清除该租户视角下的 `pending_redactions`。
+- TCVDB 在 init 失败后保持降级直到进程重启，期间 backfill 只会计入 `failed`，不会误清 pending。
 - `failed > 0` 说明 store 仍不可用，恢复后重跑即可。
 - `replayed` 统计的是向 store 发起追加的次数，已存在的 `event_id` 在 store 侧为 no-op，
   因此重复执行时 `replayed` 不会变成 0。

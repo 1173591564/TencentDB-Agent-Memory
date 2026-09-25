@@ -317,6 +317,17 @@ describe("POST /memory/diff/revert", () => {
     expect(tip.data).toMatchObject({ record_id: "m_c", reverted: true, restored: ["m_b"] });
   });
 
+  it("a predecessor without a restorable snapshot blocks the revert unless force is passed", async () => {
+    store.redactMemoryEvents({ team_id: "t1", agent_id: "a1", until: new Date().toISOString() });
+    const blocked = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(blocked.status).toBe(409);
+    expect((await store.queryL1Records({ recordIds: ["m_b"] })).map((r) => r.record_id)).toEqual(["m_b"]);
+
+    const forced = await call("/v3/memory/diff/revert", { record_id: "m_b", force: true });
+    expect(forced.status).toBe(200);
+    expect(forced.data).toMatchObject({ record_id: "m_b", reverted: true, restored: [], missing: ["m_a"] });
+  });
+
   it("a manual edit after extraction blocks the revert unless force is passed", async () => {
     // 模拟管理面镜像事件落在提取写入之后：它无 supersedes/快照/session，
     // 若被当作 lastWrite，revert 会恢复 0 条且 reverted 事件挂空 session。

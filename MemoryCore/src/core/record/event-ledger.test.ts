@@ -11,7 +11,7 @@ import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent } from "../store/types.js";
-import { appendLedgerEvent, getLedgerHealth, replayLedgerEvents } from "./event-ledger.js";
+import { appendLedgerEvent, getLedgerHealth, redactLedgerEvents, replayLedgerEvents } from "./event-ledger.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "./l1-writer.js";
 
 const silent = { warn() {}, debug() {} };
@@ -97,6 +97,82 @@ describe("event ledger outbox", () => {
     const r = await replayLedgerEvents({ store, storage, since: "2026-03-01T00:00:00.000Z", scope: { team_id: "t1" }, logger: silent });
     expect(r).toMatchObject({ files: 1, replayed: 1, skipped: 1, malformed: 1 });
     expect(store.queryMemoryEvents({ limit: 10 }).map((e) => e.record_id)).toEqual(["m_new"]);
+  });
+
+  it("non-object outbox rows count as malformed without stopping later rows or shards", async () => {
+    await storage.appendFile(StoragePaths.event("2026-03-01"), "null\n42\n\"str\"\n[1,2]\n");
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_a" }), logger: silent });
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_b", event_ts: "2026-03-02T00:00:00.000Z" }), logger: silent });
+
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r).toMatchObject({ files: 2, scanned: 6, replayed: 2, malformed: 4, failed: 0 });
+    expect(store.queryMemoryEvents({ limit: 10 }).map((e) => e.record_id)).toEqual(["m_a", "m_b"]);
+  });
+
+  it("rows with an unknown op or unparseable fields are malformed, not store failures", async () => {
+    const good = ev({ event_id: "evt-good" });
+    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+      JSON.stringify({ ...good, event_id: "evt-badop", op: "exploded" }),
+      JSON.stringify({ ...good, event_id: "evt-badts", event_ts: "yesterday" }),
+      JSON.stringify({ ...good, event_id: 7 }),
+      JSON.stringify(good),
+    ].join("\n") + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r).toMatchObject({ scanned: 4, replayed: 1, malformed: 3, failed: 0 });
+  });
+
+  it("a failed store redaction degrades the ledger until backfill re-applies the marker", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ content: "secret", snapshot_json: "{\"content\":\"secret\"}" }), logger: silent });
+    const realRedact = store.redactMemoryEvents.bind(store);
+    store.redactMemoryEvents = () => { throw new Error("db locked"); };
+    const filter = { team_id: "t1", agent_id: "a1", until: "2026-12-31T00:00:00.000Z" };
+    await redactLedgerEvents({ store, storage, filter, logger: silent });
+    const scope = { team_id: "t1", agent_id: "a1" };
+    expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: true, pending_redactions: 1 });
+    expect(getLedgerHealth(store, { team_id: "t2", agent_id: "a1" })).toMatchObject({ degraded: false, pending_redactions: 0 });
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("secret");
+
+    store.redactMemoryEvents = realRedact;
+    const r = await replayLedgerEvents({ store, storage, scope, logger: silent });
+    expect(r).toMatchObject({ redactions_applied: 1, failed: 0 });
+    const [row] = store.queryMemoryEvents({ record_id: "m_x" });
+    expect(row!.content).toBe("");
+    expect(row!.snapshot_json).toBeUndefined();
+    expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: false, pending_redactions: 0 });
+  });
+
+  it("a failed unscoped (TTL) redaction clears per tenant as each tenant backfills", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ content: "a" }), logger: silent });
+    await appendLedgerEvent({ store, storage, event: ev({ team_id: "t2", record_id: "m_y", content: "b" }), logger: silent });
+    const realRedact = store.redactMemoryEvents.bind(store);
+    store.redactMemoryEvents = () => { throw new Error("db locked"); };
+    await redactLedgerEvents({ store, storage, filter: { until: "2026-12-31T00:00:00.000Z" }, logger: silent });
+    store.redactMemoryEvents = realRedact;
+    const t1 = { team_id: "t1", agent_id: "a1" };
+    const t2 = { team_id: "t2", agent_id: "a1" };
+    expect(getLedgerHealth(store, t1).pending_redactions).toBe(1);
+    expect(getLedgerHealth(store, t2).pending_redactions).toBe(1);
+
+    await replayLedgerEvents({ store, storage, scope: t1, logger: silent });
+    expect(getLedgerHealth(store, t1)).toMatchObject({ degraded: false, pending_redactions: 0 });
+    expect(getLedgerHealth(store, t2).pending_redactions).toBe(1);
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+    expect(store.queryMemoryEvents({ record_id: "m_y" })[0]!.content).toBe("b");
+
+    await replayLedgerEvents({ store, storage, logger: silent });
+    expect(getLedgerHealth(store, t2).pending_redactions).toBe(0);
+  });
+
+  it("replay into a store that rejects appends keeps the event pending until a real write succeeds", async () => {
+    const rejecting = {
+      appendMemoryEvent: async () => { throw new Error("memory_events append rejected: store is degraded"); },
+    } as unknown as IMemoryStore;
+    await appendLedgerEvent({ store: rejecting, storage, event: ev(), logger: silent });
+    expect(getLedgerHealth(rejecting, { team_id: "t1", agent_id: "a1" })).toMatchObject({ degraded: true, pending_store_events: 1 });
+
+    const r = await replayLedgerEvents({ store: rejecting, storage, logger: silent });
+    expect(r).toMatchObject({ replayed: 0, failed: 1 });
+    expect(getLedgerHealth(rejecting, { team_id: "t1", agent_id: "a1" })).toMatchObject({ degraded: true, pending_store_events: 1 });
   });
 
   it("rebuilding a store from the outbox reproduces writeMemory's events exactly", async () => {

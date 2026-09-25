@@ -1357,7 +1357,7 @@ function ledgerScope(iso: V2RouterDeps["requestIsolation"]): { team_id?: string;
   };
 }
 
-function ledgerStatusField(store: IMemoryStore, iso: V2RouterDeps["requestIsolation"]): { ledger?: { degraded: true; store_failures: number; jsonl_failures: number; pending_store_events: number; last_failure_at?: string } } {
+function ledgerStatusField(store: IMemoryStore, iso: V2RouterDeps["requestIsolation"]): { ledger?: { degraded: true; store_failures: number; jsonl_failures: number; pending_store_events: number; pending_redactions: number; last_failure_at?: string } } {
   const h = getLedgerHealth(store, ledgerScope(iso));
   if (!h.degraded) return {};
   return {
@@ -1366,6 +1366,7 @@ function ledgerStatusField(store: IMemoryStore, iso: V2RouterDeps["requestIsolat
       store_failures: h.store_failures,
       jsonl_failures: h.jsonl_failures,
       pending_store_events: h.pending_store_events,
+      pending_redactions: h.pending_redactions,
       ...(h.last_failure_at ? { last_failure_at: h.last_failure_at } : {}),
     },
   };
@@ -1804,6 +1805,12 @@ async function planRevert(
       }
       restores.push({ targetId, snap: superseded.filter((e) => e.superseded_by === recordId).pop() });
     }
+  }
+  // 快照守卫：旧记录没有可恢复的快照（写入缺口 / 已被 clear/TTL 擦除）时，
+  // 撤销等于直接删掉新记录 → 默认拒绝，force 显式接受只删不恢复。
+  const unrestorable = restores.filter((r) => !r.snap?.snapshot_json).map((r) => r.targetId);
+  if (unrestorable.length > 0 && !opts.force) {
+    return fail(409, `No restorable snapshot for [${unrestorable.join(", ")}] superseded by ${recordId} — reverting would delete ${recordId} without restoring them; pass force:true to accept`);
   }
   return { ok: true, target, restores };
 }

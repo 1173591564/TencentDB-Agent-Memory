@@ -294,8 +294,11 @@ describe("event ledger in-place outbox redaction", () => {
 
   it("a failed shard rewrite degrades the ledger until backfill retries it", async () => {
     await appendLedgerEvent({ store, storage, event: ev({ content: "secret", snapshot_json: "{\"content\":\"secret\"}" }), logger: silent });
-    const realCreate = storage.createFileAtomic.bind(storage);
-    storage.createFileAtomic = async () => { throw new Error("cos 503"); };
+    const realAppend = storage.appendFile.bind(storage);
+    storage.appendFile = async (k: string, c: string) => {
+      if (k.includes("~")) throw new Error("cos 503");
+      return realAppend(k, c);
+    };
     const res = await redactLedgerEvents({ store, storage, filter, logger: silent });
     expect(res.jsonl).toBe(true);
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
@@ -316,7 +319,7 @@ describe("event ledger in-place outbox redaction", () => {
       fresh.close();
     }
 
-    storage.createFileAtomic = realCreate;
+    storage.appendFile = realAppend;
     const r = await replayLedgerEvents({ store, storage, scope, logger: silent });
     expect(r.outbox_redacted).toBe(1);
     expect(r.outbox_failed).toBe(0);
@@ -326,9 +329,12 @@ describe("event ledger in-place outbox redaction", () => {
 
   it("degraded stays on until both the store wipe and the outbox rewrite land", async () => {
     await appendLedgerEvent({ store, storage, event: ev({ content: "secret" }), logger: silent });
-    const realCreate = storage.createFileAtomic.bind(storage);
+    const realAppend = storage.appendFile.bind(storage);
     const realRedact = store.redactMemoryEvents.bind(store);
-    storage.createFileAtomic = async () => { throw new Error("cos 503"); };
+    storage.appendFile = async (k: string, c: string) => {
+      if (k.includes("~")) throw new Error("cos 503");
+      return realAppend(k, c);
+    };
     store.redactMemoryEvents = () => { throw new Error("db locked"); };
     await redactLedgerEvents({ store, storage, filter, logger: silent });
     expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: true, pending_redactions: 1, pending_outbox_rewrites: 1 });
@@ -338,7 +344,7 @@ describe("event ledger in-place outbox redaction", () => {
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
     expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: true, pending_redactions: 1, pending_outbox_rewrites: 1 });
 
-    storage.createFileAtomic = realCreate;
+    storage.appendFile = realAppend;
     await replayLedgerEvents({ store, storage, scope, logger: silent });
     expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: false, pending_redactions: 0 });
   });
@@ -346,7 +352,10 @@ describe("event ledger in-place outbox redaction", () => {
   it("a failed marker append is retried by backfill", async () => {
     await appendLedgerEvent({ store, storage, event: ev({ content: "secret" }), logger: silent });
     const realAppend = storage.appendFile.bind(storage);
-    storage.appendFile = async () => { throw new Error("disk full"); };
+    storage.appendFile = async (k: string, c: string) => {
+      if (c.includes('"redact"')) throw new Error("disk full");
+      return realAppend(k, c);
+    };
     const res = await redactLedgerEvents({ store, storage, filter, logger: silent });
     storage.appendFile = realAppend;
     expect(res.jsonl).toBe(false);

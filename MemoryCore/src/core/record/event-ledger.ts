@@ -591,9 +591,14 @@ const REWRITE_LOCK_KEY = `${StoragePaths.eventsDir}#rewrite-all`;
  * redaction are visible. `only` limits the scan to shard families
  * ("date\0writer" keys) rather than names, so a shard sealed between listing
  * and rewriting is still swept via its newest generation.
- * Each shard rewrite runs under its own lock: re-read, create a sealed copy
- * atomically, delete the original. Throws after trying every shard if any
- * rewrite failed.
+ * Each shard rewrite runs under its own lock: re-read, append the sealed
+ * copy to a fresh ~gen key, delete the original. Sealed shards are written
+ * via appendObject (not putObject) so every object under events/ stays
+ * append-created — a uniform access pattern that COS APPENDABLE_KEY_PREFIXES
+ * guards can never reject. The sealed copy is never the sole copy until the
+ * append resolves (unlink is strictly after), so a reader seeing it
+ * mid-append loses nothing. Throws after trying every shard if any rewrite
+ * failed.
  */
 async function rewriteOutboxShards(
   storage: StorageAdapter,
@@ -615,7 +620,7 @@ async function rewriteOutboxShards(
           if (content === null) return 0;
           const r = redactOutboxContent(content, filters);
           if (r.lines === 0) return 0;
-          await storage.createFileAtomic(sealedShardKey(s), r.content);
+          await storage.appendFile(sealedShardKey(s), r.content);
           await storage.unlink(key);
           return r.lines;
         });

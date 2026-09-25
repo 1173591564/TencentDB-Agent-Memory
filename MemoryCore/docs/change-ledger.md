@@ -84,9 +84,10 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 2. **outbox 行改写**：对本 writer 拥有的分片（本 writer 后缀，含其封存分片；以及旧版无后缀分片）中日期 ≤ `until` 的分片，
    将匹配事件行的 `content` 置空、删除 `snapshot_json`；`event_id`、`op`、`event_ts`、record/scope 元数据原样保留，
    与 `store.redactMemoryEvents` 的骨架语义一致。标记行、畸形行、不匹配的行逐字节保留。
-   替换是原子的：先整体写出新的封存分片（本地为临时文件 + rename；COS 为对新 key 的一次完整 `putObject`，
-   不覆盖 appendable 对象），再删除原分片。读者只会看到完整的旧分片或完整的新分片；删除前的短暂窗口两者并存，
-   回放按 `event_id` 幂等去重。
+   封存分片通过 `appendObject` 写到全新的 `~<gen>` key（单次 append 落完整内容），随后才删除原分片——
+   `events/` 下所有对象保持 append-created 的单一访问模式，COS `APPENDABLE_KEY_PREFIXES` 前缀守卫不会拒绝；
+   删除原分片严格发生在封存 append 完成之后，所以封存分片在写完前永远不是唯一副本，
+   读到半途分片的回放不会丢事件（重复按 `event_id` 幂等去重，截断尾行计 malformed）。
 3. **store 擦除**：`content` / `snapshot_json` 置空，保留元数据骨架。
 
 入口先把 filter 登记进本进程的已知标记集（fail-closed：即使三步全失败也生效）——

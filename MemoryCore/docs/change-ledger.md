@@ -154,7 +154,9 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 ## 顺序与时钟假设
 
 - 事件按 `event_ts` 排序（SQLite 为 `ORDER BY event_ts, seq`），同一时间戳内按各后端的插入序（SQLite rowid、
-  Mongo ObjectId）作为稳定次序；TCVDB 同毫秒事件无插入序保证。
+  Mongo ObjectId）作为稳定次序；TCVDB 由客户端按 `(event_ts, id)` 内存重排、跨页按文档 id 去重。
+  残余：服务端对同值排序键次序不稳定时，单窗口 >100 条同毫秒事件可能欠数（去重防重复、不防位移丢失），
+  完整收敛待真实例验证多列 sort 决胜键（`id` 作次级 sort 是否被服务端接受）。
 - `event_ts` 取写入实例的本机时钟；多实例部署需 NTP 同步，时钟漂移会影响跨实例事件的相对顺序
   与 `since` 过滤，但不会导致事件丢失或重复（身份由 `event_id` 决定）。
 - 回放写入的事件保留原 `event_ts`，diff/history 中的顺序与原始写入一致。

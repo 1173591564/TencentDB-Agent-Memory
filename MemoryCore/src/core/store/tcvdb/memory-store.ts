@@ -269,6 +269,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private readonly memoryPromptSettingLogsCollection: string;
   private readonly memoryGenerationRefsCollection: string;
   private degraded = false;
+  private _warnedNoInit = false;
 
   /** Promise that resolves when async init completes. */
   private _initPromise: Promise<void> | undefined;
@@ -323,6 +324,13 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private async _ensureInit(): Promise<void> {
     if (this._initPromise) {
       await this._initPromise;
+      return;
+    }
+    // init() 只能由 store-pool 显式调用；直接 new 的 store 会跳过建表裸写。
+    // 真实例上写路径会 API 报错、吞错读路径会静默空——warn 一次让误用现形。
+    if (!this._warnedNoInit) {
+      this._warnedNoInit = true;
+      this.logger?.warn(`${TAG} store used before init() — collections were never created`);
     }
   }
 

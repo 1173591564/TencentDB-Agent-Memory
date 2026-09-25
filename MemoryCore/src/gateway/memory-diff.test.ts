@@ -840,6 +840,12 @@ describe("change-ledger outbox endpoints", () => {
     const until = new Date(Date.now() + 1).toISOString();
     await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until } });
     expect(store.queryMemoryEvents({ record_id: "m_a" })[0].content).toBe("");
+    const names = await storage.readdirNames("events/", ".jsonl");
+    const raw = (await Promise.all(names.map((n) => storage.readFile(`events/${n}`)))).join("");
+    expect(raw).not.toContain("salary 5000");
+    const rows = raw.split("\n").filter(Boolean).map((l) => JSON.parse(l) as { redact?: unknown; op?: string; record_id?: string; content?: string });
+    expect(rows.filter((r) => r.redact)).toEqual([expect.objectContaining({ redact: { team_id: "t1", agent_id: "a1", until } })]);
+    expect(rows.find((r) => r.record_id === "m_a")).toMatchObject({ op: "created", content: "" });
     // rebuild a fresh store from the outbox: cleared content must stay cleared
     const fresh = new VectorStore(path.join(dir, "fresh.db"), 0);
     fresh.init();

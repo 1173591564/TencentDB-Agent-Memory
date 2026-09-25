@@ -20,8 +20,14 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 
 ## JSONL outbox
 
-- 路径：`events/YYYY-MM-DD.jsonl`（按 `event_ts` 的 UTC 日期分片），经 `StorageAdapter.appendFile`
-  写入，本地文件系统与 COS 后端均适用。每行一条完整 `MemoryEvent`（含 `event_id`、`snapshot_json`），
+- 路径：按 `event_ts` 的 UTC 日期、按写入进程（writer）分片，经 `StorageAdapter.appendFile` 写入，本地文件系统与 COS 后端均适用：
+  - `events/YYYY-MM-DD.<writerId>.jsonl`：本 writer 追加的活动分片；
+  - `events/YYYY-MM-DD[.<writerId>]~<gen>.jsonl`：擦除改写生成的封存分片（内容已脱敏，此后不再追加，再次改写时换新 `<gen>`）；
+  - `events/YYYY-MM-DD.jsonl`：旧版无后缀分片（本改动之前写入），继续可回放、可改写。
+- `writerId` = `<hostname>-<8 hex>`，首次启动时生成并持久化到 `<dataDir>/.metadata/ledger_writer_id`，
+  同一数据目录重启后沿用（因此仍“拥有”并能改写重启前的分片）；每个数据目录只应有一个写入进程。
+  未经 TdaiCore 初始化（如单测、脚本）时使用进程级随机 id。
+- 回放、TTL 删除、`pruneLedgerOutbox` 都按日期前缀枚举 `events/` 下全部 `.jsonl`，与 writer 后缀无关。每行一条完整 `MemoryEvent`（含 `event_id`、`snapshot_json`），
   足以重建 `memory_events`。
 - 写入顺序（`src/core/record/event-ledger.ts` 的 `appendLedgerEvent`）：
   1. 分配 `event_id`；
@@ -62,12 +68,40 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 
 ## clear / TTL 擦除
 
-- chat_memory clear 写 `scope=agent`、`until` 的 deleted 事件，并擦除该 team/agent 在 `until` 前事件的
-  `content` / `snapshot_json`（保留 op/时间/id 元数据骨架）；同时向 outbox 追加擦除标记，
-  backfill 回放时先应用标记，不会恢复已擦除内容。
-- TTL 清理（L1 实际执行时）写一条 `source=retention`、`scope=retention`、`until=cutoff` 的批次 deleted 事件，
-  并擦除 cutoff 之前的事件内容（批次事件与擦除标记都写入本地 outbox）；过期的 outbox 分片按日期整体删除。批次事件不含逐条 record_id
-  （`deleteL1Expired` 只返回数量），revert 依靠目标行不存在来拒绝。
+`redactLedgerEvents(filter)` 覆盖 `event_ts <= until` 且 team/agent/user（设置时）匹配的事件，依次做三件事：
+
+1. **擦除标记**：向本 writer 活动分片追加 `{"redact": filter, "marker_ts": ...}`。标记行永不修改、永不删除，
+   只随所在分片按日期整体删除。
+2. **outbox 行改写**：对本 writer 拥有的分片（本 writer 后缀，含其封存分片；以及旧版无后缀分片）中日期 ≤ `until` 的分片，
+   将匹配事件行的 `content` 置空、删除 `snapshot_json`；`event_id`、`op`、`event_ts`、record/scope 元数据原样保留，
+   与 `store.redactMemoryEvents` 的骨架语义一致。标记行、畸形行、不匹配的行逐字节保留。
+   替换是原子的：先整体写出新的封存分片（本地为临时文件 + rename；COS 为对新 key 的一次完整 `putObject`，
+   不覆盖 appendable 对象），再删除原分片。读者只会看到完整的旧分片或完整的新分片；删除前的短暂窗口两者并存，
+   回放按 `event_id` 幂等去重。
+3. **store 擦除**：`content` / `snapshot_json` 置空，保留元数据骨架。
+
+- chat_memory clear 的 filter 为 `{ team_id, agent_id, until }`，并写 `scope=agent` 的 deleted 事件。
+- TTL 清理（L1 实际执行时）写一条 `source=retention`、`scope=retention`、`until=cutoff`、`record_id=retention-l1-<cutoff>`
+  的批次 deleted 事件，然后走同一路径，filter 为不带租户的 `{ until: cutoff }`，覆盖所有租户的匹配行；
+  过期的 outbox 分片按日期整体删除。批次事件不含逐条 record_id（`deleteL1Expired` 只返回数量），revert 依靠目标行不存在来拒绝。
+
+### 明文何时真正消失
+
+store 擦除成功，且所有含匹配行的分片都已改写之后：
+
+- 本 writer 的分片与旧版无后缀分片：`redactLedgerEvents` 返回时（改写成功的前提下）即已消失。
+- 其它 writer（其它节点 / 数据目录）的分片：本进程**不会**改写——改写是读-改-写，不能与对方的追加竞争。
+  对方下一次 backfill 读到标记后，会改写自己分片中被覆盖的行；在此之前明文仍留在对方分片里，最迟随分片 TTL 删除。
+  writer 已永久下线（如 pod 重建且数据目录未持久化）时，其分片没有 owner，只能靠 TTL 删除。
+- 旧版无后缀分片视为任何进程都可改写的共享文件，属尽力而为：若仍有旧版进程向其追加，改写可能丢失并发追加的行。
+- 同一进程内，同一分片的追加与改写经 per-shard 队列串行，改写期间到达的追加不会丢失。
+
+### 失败处理
+
+- 三步各自失败都不影响 clear/TTL 本身（不抛错）。失败部分记入 `pending_redactions`，
+  其中标记追加或分片改写未完成的另计 `pending_outbox_rewrites`；`degraded` 保持为真，直到 store 擦除与 outbox 改写都已完成。
+- backfill 在回放事件**之前**重试未完成的标记追加与分片改写。
+- 回放时擦除标记（以及仍 pending 的 filter）总是先于事件应用，因此即使改写始终失败，被擦除内容也不会被回放进 store。
 
 ## 回放 / 补齐（runbook）
 
@@ -78,7 +112,7 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -H "x-tdai-team-id: $TEAM" -H "x-tdai-agent-id: $AGENT" -H "x-tdai-user-id: $USER" \
   -d '{"since":"2026-09-01T00:00:00.000Z"}'
-# => { files, scanned, replayed, skipped, malformed, failed, redacted }
+# => { files, scanned, replayed, skipped, malformed, failed, redacted, redactions_applied, outbox_redacted, outbox_failed }
 ```
 
 - 运维操作：需部署设置 `TDAI_LEDGER_BACKFILL_ENABLED=1`（否则 403）；`since` 必填（否则 400）。
@@ -87,6 +121,8 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 依赖 `event_id` 幂等，可安全重复执行；非 JSON、非对象（如 `null`、数组）或缺 `event_id` 的畸形行计入 `malformed` 并跳过，不影响后续行与分片。
 - store 拒绝写入（含降级状态）时回放计入 `failed`，事件保持 pending，直到真正写入成功。
 - 未知 `op`、非字符串 `event_id`/`record_id`、无法解析的 `event_ts` 同样计入 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
+- 回放先重试 pending 的标记追加 / 分片改写，再用扫描到的全部标记（含其它 writer 写的）改写本 writer 拥有的分片
+  （计入 `outbox_redacted`；失败计入 `outbox_failed` 并保持 pending）。`redacted` 统计被标记覆盖、以骨架形式回放的事件数。
 - 回放会先把扫描到的 clear/TTL 擦除标记重新应用到 store（收窄到请求的 team/agent，幂等，计入 `redactions_applied`）。
   store 擦除失败时健康度记 `pending_redactions` 并置 `degraded`，直到覆盖该标记所在分片的 backfill 成功；
   TTL 标记不带租户：按租户 backfill 只擦该租户，并只清除该租户视角下的 `pending_redactions`。
@@ -114,6 +150,17 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 缓存未命中（跨实例 / 进程重启）时 L0 id 由作用域与消息序号确定性派生，并走 upsert 路径，
   L0 不会重复；但 pipeline 通知与 quota 上报可能再发生一次。需要跨实例严格幂等时，
   应在网关前置层按 key 做粘性路由或外部去重。
+
+## 进程内状态与已知限制
+
+- 健康度与 `pending_redactions` 是进程内状态：重启后清零，未完成的改写不再自动重试，
+  直到下一次 backfill 用 outbox 中的标记重新扫一遍本 writer 分片；期间标记保证不会回放进 store。
+- 多实例各自统计，状态接口只反映收到请求的那个实例。
+- 每次 clear 会读取本 writer 所有日期 ≤ `until` 的分片，开销与 outbox 大小成正比。
+- 回放一次性把 `since` 之后的分片读入内存，超大 outbox 需按 `since` 分段执行。
+- 回放只使用扫描范围内（`since` 之后分片里）的标记；早于 `since` 的标记不参与回放，其覆盖的事件在原 store 中已擦除，
+  但若用于重建新 store，需让 `since` 覆盖相应标记所在分片。
+- 封存分片与原分片短暂并存时（崩溃于 rename 与删除之间）可能留下含明文的原分片；它仍属本 writer，下次 backfill 会改写。
 
 ## 保留期
 

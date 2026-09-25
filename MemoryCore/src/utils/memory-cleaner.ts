@@ -26,7 +26,7 @@ interface CleanupStats {
 const TAG = "[memory-tdai][cleaner]";
 const L0_DIR_NAME = "conversations";
 const L1_DIR_NAME = "records";
-/** Change-ledger outbox (events/YYYY-MM-DD.jsonl) ages out with the same retention. */
+/** Change-ledger outbox (events/YYYY-MM-DD[.<writerId>][~<gen>].jsonl) ages out with the same retention. */
 const EVENTS_DIR_NAME = "events";
 
 /** Minimum records to retain — skip deletion if total is at or below this threshold. */
@@ -278,7 +278,7 @@ export class LocalMemoryCleaner {
       const filePath = path.join(dirPath, entry.name);
       stats.scannedFiles += 1;
 
-      // 仅支持日期分片文件：YYYY-MM-DD(.jsonl/.json)
+      // 仅支持日期分片文件：YYYY-MM-DD[.<writerId>][~<gen>](.jsonl/.json)
       const shard = extractShardDateFromFileName(entry.name);
       if (!shard) {
         stats.skippedNonShardFiles += 1;
@@ -315,8 +315,8 @@ function extractShardDateFromFileName(
   fileName: string,
 ): { year: number; month: number; day: number } | undefined {
 
-  // Supported format: YYYY-MM-DD.jsonl | YYYY-MM-DD.json
-  const m = /^(\d{4})-(\d{2})-(\d{2})\.(?:jsonl|json)$/.exec(fileName);
+  // Supported format: YYYY-MM-DD[.<writerId>][~<gen>].jsonl | .json
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:\.[A-Za-z0-9_-]{1,64})?(?:~[a-z0-9]{1,32})?\.(?:jsonl|json)$/.exec(fileName);
   if (!m) return undefined;
 
   const year = Number(m[1]);

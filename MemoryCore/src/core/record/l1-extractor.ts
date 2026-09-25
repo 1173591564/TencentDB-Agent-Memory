@@ -405,13 +405,15 @@ export async function extractL1Memories(params: {
     logger,
     writeLog: () => generationLogStore.write(generationLog, generationIdentity.key),
     writeRefs: options.vectorStore?.upsertMemoryGenerationRefs && storedRecords.length > 0
-      ? () => options.vectorStore!.upsertMemoryGenerationRefs!(storedRecords.map((record) => ({
-          generation_ref_id: buildMemoryGenerationRefId("l1", record.id),
-          layer: "l1" as const,
-          memory_id: record.id,
-          ...generation,
-          created_at_ms: generationFinishedAt,
-        })))
+      ? async () => {
+          await options.vectorStore!.upsertMemoryGenerationRefs!(storedRecords.map((record) => ({
+            generation_ref_id: buildMemoryGenerationRefId("l1", record.id),
+            layer: "l1" as const,
+            memory_id: record.id,
+            ...generation,
+            created_at_ms: generationFinishedAt,
+          })));
+        }
       : undefined,
   });
 

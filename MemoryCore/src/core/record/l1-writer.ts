@@ -457,6 +457,7 @@ export async function writeMemory(params: {
           content: record.content,
           memory_type: record.type,
           version: record.version ?? 0,
+          source: "extraction",
         });
       } else {
         for (const old of supersededTargets) {
@@ -472,6 +473,7 @@ export async function writeMemory(params: {
             superseded_by: record.id,
             // 完整旧记录快照：revert 时按它重建（content/type/version 不够恢复）。
             snapshot_json: JSON.stringify(old),
+            source: "extraction",
           });
         }
         await vectorStore.appendMemoryEvent({
@@ -482,6 +484,7 @@ export async function writeMemory(params: {
           memory_type: record.type,
           version: record.version ?? 0,
           supersedes: decision.target_ids,
+          source: "extraction",
         });
       }
     } catch (err) {

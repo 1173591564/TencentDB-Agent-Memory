@@ -610,13 +610,23 @@ export interface AuditQueryFilter {
  *                  snapshot_json 存旧记录完整 JSON（revert 恢复用）。
  *   - reverted   : 已生效变更被撤销（review 驳回）。record_id 是被撤销的
  *                  新记录；supersedes 列出本次恢复的旧 record_id。
+ *   - deleted    : 记录被显式删除（管理面 mutation API：atomic/delete、
+ *                  chat-memory/clear 等）。content 为空（删除无新内容）。
+ *
+ * source 语义（变更来源；未填时按 op 推断：reverted → review，其余 → extraction）：
+ *   - extraction  : writeMemory 自动提取路径（dedup 决策）
+ *   - api_mutation: 显式管理 API（atomic/*、scenario/*、core/write、chat-memory/clear）
+ *   - review      : 审阅驳回（revert）
+ *
+ * layer 语义：事件所属记忆层（l1/l2/l3）。自动提取路径恒为 l1；管理面
+ * mutation 按 handler 实际操作的层填充。未填时按 l1 处理（老数据全部为 l1）。
  */
 export interface MemoryEvent {
   /** 事件发生时间（ISO 8601）。 */
   event_ts: string;
-  /** 执行写入的 session key（conversation channel）。 */
+  /** 执行写入的 session key（conversation channel）。管理面 mutation 无 session 语义，为空串。 */
   session_key: string;
-  /** 执行写入的 session id。superseded 事件记执行淘汰的 session。 */
+  /** 执行写入的 session id。superseded 事件记执行淘汰的 session。管理面 mutation 为空串。 */
   session_id: string;
   /** 被替代记录原本的归属 session（仅 superseded 事件填充）。 */
   origin_session_id?: string;
@@ -628,12 +638,12 @@ export interface MemoryEvent {
   agent_id?: string;
   task_id?: string;
   /** 变更类型。 */
-  op: "created" | "updated" | "merged" | "superseded" | "reverted";
+  op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted";
   /** 本事件对应的 record id（superseded 时为旧 record id）。 */
   record_id: string;
   /** 审阅者（reverted 事件 = 驳回操作的执行人，来自 v3 isolation 三元组）。 */
   reviewer_id?: string;
-  /** 内容快照（superseded 时为被替代的旧内容）。 */
+  /** 内容快照（superseded 时为被替代的旧内容；deleted 事件为空串）。 */
   content: string;
   /** 记忆类型（persona / episodic / instruction / work_*）。 */
   memory_type?: string;
@@ -645,6 +655,12 @@ export interface MemoryEvent {
   superseded_by?: string;
   /** superseded 事件：旧记录完整 JSON 序列化（revert 恢复用）。 */
   snapshot_json?: string;
+  /** 事件所属记忆层（l1/l2/l3）。未填按 l1 处理。 */
+  layer?: "l1" | "l2" | "l3";
+  /** 变更来源（extraction / api_mutation / review）。未填按 op 推断。 */
+  source?: "extraction" | "api_mutation" | "review";
+  /** Gateway request_id（api_mutation 来源时由调用方透传，便于与 audit 表对账）。 */
+  request_id?: string;
 }
 
 /** queryMemoryEvents 过滤条件，全部可选。 */
@@ -655,6 +671,9 @@ export interface MemoryEventFilter {
   origin_session_key?: string;
   record_id?: string;
   op?: MemoryEvent["op"];
+  layer?: MemoryEvent["layer"];
+  source?: MemoryEvent["source"];
+  request_id?: string;
   team_id?: string;
   agent_id?: string;
   user_id?: string;

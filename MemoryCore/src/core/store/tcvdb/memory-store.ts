@@ -39,6 +39,8 @@ import type {
   L0Record,
   AuditEntry,
   AuditQueryFilter,
+  MemoryEvent,
+  MemoryEventFilter,
   KnowledgeEntity,
   KnowledgeType,
   KnowledgeListResult,
@@ -91,6 +93,7 @@ const L1_COLLECTION_SUFFIX = "l1_memories";
 const L0_COLLECTION_SUFFIX = "l0_conversations";
 const PROFILES_COLLECTION_SUFFIX = "profiles";
 const AUDIT_COLLECTION_SUFFIX = "memory_audit";
+const MEMORY_EVENTS_COLLECTION_SUFFIX = "memory_events";
 /** entity_knowledge 明细注册表（见 docs/design/vdb-knowledge-collection.md）。 */
 const KNOWLEDGE_COLLECTION_SUFFIX = "knowledge";
 const MEMORY_PROMPTS_COLLECTION_SUFFIX = "memory_prompts";
@@ -158,6 +161,15 @@ const AUDIT_OUTPUT_FIELDS = [
   "id", "record_id", "layer", "action",
   "team_id", "agent_id", "user_id", "task_id",
   "version", "updated_at_ms", "request_id",
+];
+
+/** memory_events 字段：统一变更账。content/supersedes/snapshot_json 体积可能大，不建 filter 索引但可输出。 */
+const MEMORY_EVENTS_OUTPUT_FIELDS = [
+  "id", "event_ts", "session_key", "session_id", "origin_session_id", "origin_session_key",
+  "team_id", "agent_id", "user_id", "task_id",
+  "op", "record_id", "content", "memory_type", "version",
+  "supersedes", "superseded_by", "snapshot_json", "reviewer_id",
+  "layer", "source", "request_id",
 ];
 
 // ============================
@@ -245,6 +257,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private readonly l0Collection: string;
   private readonly profilesCollection: string;
   private readonly auditCollection: string;
+  private readonly eventsCollection: string;
   private readonly knowledgeCollection: string;
   private readonly memoryPromptsCollection: string;
   private readonly memoryPromptSettingsCollection: string;
@@ -275,6 +288,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     this.l0Collection = `${config.database}_${L0_COLLECTION_SUFFIX}`;
     this.profilesCollection = `${config.database}_${PROFILES_COLLECTION_SUFFIX}`;
     this.auditCollection = `${config.database}_${AUDIT_COLLECTION_SUFFIX}`;
+    this.eventsCollection = `${config.database}_${MEMORY_EVENTS_COLLECTION_SUFFIX}`;
     this.knowledgeCollection = `${config.database}_${KNOWLEDGE_COLLECTION_SUFFIX}`;
     this.memoryPromptsCollection = `${config.database}_${MEMORY_PROMPTS_COLLECTION_SUFFIX}`;
     this.memoryPromptSettingsCollection = `${config.database}_${MEMORY_PROMPT_SETTINGS_COLLECTION_SUFFIX}`;
@@ -493,6 +507,36 @@ export class TcvdbMemoryStore implements IMemoryStore {
           { fieldName: "task_id",       fieldType: "string", indexType: "filter" },
           { fieldName: "version",       fieldType: "uint64", indexType: "filter" },
           { fieldName: "updated_at_ms", fieldType: "uint64", indexType: "filter" },
+        ],
+      });
+
+      // memory_events collection — 统一变更账（extraction / api_mutation / review）
+      // dim=1 占位（不需向量检索）；过滤字段建 filter 索引。
+      // content/supersedes/snapshot_json 体积可能大，存普通字段不建索引。
+      await this.client.createCollection({
+        collection: this.eventsCollection,
+        shardNum: 1,
+        replicaNum: 2,
+        description: "Memory 统一变更事件流（含 session diff / 审阅驳回 / 管理 mutation）",
+        embedding: { status: "disabled" },
+        indexes: [
+          { fieldName: "id",                 fieldType: "string", indexType: "primaryKey" },
+          { fieldName: "vector",             fieldType: "vector", indexType: "FLAT",
+            dimension: 1, metricType: "COSINE" },
+          { fieldName: "event_ts",           fieldType: "string", indexType: "filter" },
+          { fieldName: "session_id",         fieldType: "string", indexType: "filter" },
+          { fieldName: "session_key",        fieldType: "string", indexType: "filter" },
+          { fieldName: "origin_session_id",  fieldType: "string", indexType: "filter" },
+          { fieldName: "origin_session_key", fieldType: "string", indexType: "filter" },
+          { fieldName: "team_id",            fieldType: "string", indexType: "filter" },
+          { fieldName: "agent_id",           fieldType: "string", indexType: "filter" },
+          { fieldName: "user_id",            fieldType: "string", indexType: "filter" },
+          { fieldName: "task_id",            fieldType: "string", indexType: "filter" },
+          { fieldName: "op",                 fieldType: "string", indexType: "filter" },
+          { fieldName: "record_id",          fieldType: "string", indexType: "filter" },
+          { fieldName: "layer",              fieldType: "string", indexType: "filter" },
+          { fieldName: "source",             fieldType: "string", indexType: "filter" },
+          { fieldName: "request_id",         fieldType: "string", indexType: "filter" },
         ],
       });
 
@@ -2520,6 +2564,125 @@ export class TcvdbMemoryStore implements IMemoryStore {
     } catch (err) {
       this.logger?.warn?.(
         `${TAG} [audit-query] FAILED: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Memory events（统一变更账：extraction / api_mutation / review）
+  // ─────────────────────────────────────────────────────────
+
+  async appendMemoryEvent(event: MemoryEvent): Promise<void> {
+    await this._ensureInit();
+    if (this.degraded) return;
+
+    // id 用 event_ts + record_id + op 组合（append-only 流水无自然主键；
+    // 同一 record 同一毫秒同 op 极罕见，碰撞时 TCVDB upsert 覆盖可接受）。
+    const id = `${event.event_ts}__${event.record_id}__${event.op}`;
+    // dim=1 占位向量（events 不需向量检索，仅用 filter 查询）
+    const doc: Record<string, unknown> = {
+      id,
+      vector: [0],
+      event_ts: event.event_ts,
+      session_key: event.session_key,
+      session_id: event.session_id,
+      origin_session_id: event.origin_session_id ?? "",
+      origin_session_key: event.origin_session_key ?? "",
+      team_id: event.team_id ?? "",
+      agent_id: event.agent_id ?? "",
+      user_id: event.user_id ?? "",
+      task_id: event.task_id ?? "",
+      op: event.op,
+      record_id: event.record_id,
+      content: event.content,
+      memory_type: event.memory_type ?? "",
+      version: event.version ?? 0,
+      supersedes: JSON.stringify(event.supersedes ?? []),
+      superseded_by: event.superseded_by ?? "",
+      snapshot_json: event.snapshot_json ?? "",
+      reviewer_id: event.reviewer_id ?? "",
+      layer: event.layer ?? "l1",
+      source: event.source ?? "",
+      request_id: event.request_id ?? "",
+    };
+
+    try {
+      await this.client.upsert(this.eventsCollection, [doc]);
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} [events-append] FAILED record_id=${event.record_id} op=${event.op}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
+    await this._ensureInit();
+    if (this.degraded) return [];
+
+    const conds: string[] = [];
+    if (filter.session_id !== undefined) conds.push(eqFilter("session_id", filter.session_id));
+    if (filter.session_key !== undefined) conds.push(eqFilter("session_key", filter.session_key));
+    if (filter.origin_session_id !== undefined) conds.push(eqFilter("origin_session_id", filter.origin_session_id));
+    if (filter.origin_session_key !== undefined) conds.push(eqFilter("origin_session_key", filter.origin_session_key));
+    if (filter.record_id !== undefined) conds.push(eqFilter("record_id", filter.record_id));
+    if (filter.op !== undefined) conds.push(eqFilter("op", filter.op));
+    if (filter.layer !== undefined) conds.push(eqFilter("layer", filter.layer));
+    if (filter.source !== undefined) conds.push(eqFilter("source", filter.source));
+    if (filter.request_id !== undefined) conds.push(eqFilter("request_id", filter.request_id));
+    if (filter.team_id !== undefined) conds.push(eqFilter("team_id", filter.team_id));
+    if (filter.agent_id !== undefined) conds.push(eqFilter("agent_id", filter.agent_id));
+    if (filter.user_id !== undefined) conds.push(eqFilter("user_id", filter.user_id));
+    if (filter.task_id !== undefined) conds.push(eqFilter("task_id", filter.task_id));
+    // event_ts 是 ISO 8601 字符串，字典序即时间序（与 sqlite 实现一致）。
+    if (filter.since !== undefined) conds.push(`event_ts >= "${escapeFilterString(filter.since)}"`);
+    if (filter.until !== undefined) conds.push(`event_ts <= "${escapeFilterString(filter.until)}"`);
+
+    const filterExpr = joinFilter(conds);
+    const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);
+    const offset = Math.max(filter.offset ?? 0, 0);
+
+    try {
+      // _queryAllDocs 只支持从头取 N 条；要 offset 语义就多取 offset+limit 再切片。
+      const docs = await this._queryAllDocs(
+        this.eventsCollection,
+        filterExpr,
+        MEMORY_EVENTS_OUTPUT_FIELDS,
+        offset + limit,
+        [{ fieldName: "event_ts", direction: "asc" }],
+      );
+      const page = docs.slice(offset, offset + limit);
+
+      return page.map((doc) => {
+        let supersedes: string[] = [];
+        try { supersedes = JSON.parse(String(doc.supersedes ?? "[]")) as string[]; } catch { /* keep [] */ }
+        return {
+          event_ts: String(doc.event_ts ?? ""),
+          session_key: String(doc.session_key ?? ""),
+          session_id: String(doc.session_id ?? ""),
+          origin_session_id: String(doc.origin_session_id ?? "") || undefined,
+          origin_session_key: String(doc.origin_session_key ?? "") || undefined,
+          team_id: String(doc.team_id ?? "") || undefined,
+          agent_id: String(doc.agent_id ?? "") || undefined,
+          user_id: String(doc.user_id ?? "") || undefined,
+          task_id: String(doc.task_id ?? "") || undefined,
+          op: doc.op as MemoryEvent["op"],
+          record_id: String(doc.record_id ?? ""),
+          content: String(doc.content ?? ""),
+          memory_type: String(doc.memory_type ?? "") || undefined,
+          version: Number(doc.version ?? 0),
+          supersedes: supersedes.length ? supersedes : undefined,
+          superseded_by: String(doc.superseded_by ?? "") || undefined,
+          snapshot_json: String(doc.snapshot_json ?? "") || undefined,
+          reviewer_id: String(doc.reviewer_id ?? "") || undefined,
+          layer: (String(doc.layer ?? "l1") || "l1") as MemoryEvent["layer"],
+          source: (String(doc.source ?? "") || undefined) as MemoryEvent["source"],
+          request_id: String(doc.request_id ?? "") || undefined,
+        };
+      });
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} [events-query] FAILED: ${err instanceof Error ? err.message : String(err)}`,
       );
       return [];
     }

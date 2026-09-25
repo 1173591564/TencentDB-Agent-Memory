@@ -47,6 +47,8 @@ import type {
   IsolationFilter,
   AuditEntry,
   AuditQueryFilter,
+  MemoryEvent,
+  MemoryEventFilter,
   KnowledgeEntity,
   KnowledgeType,
   KnowledgeListResult,
@@ -794,6 +796,78 @@ export class MongoMemoryStore implements IMemoryStore {
       version: Number(d.version ?? 0),
       updated_at_ms: Number(d.updated_at_ms ?? 0),
       request_id: d.request_id as string | undefined,
+    };
+  }
+
+  // ════════════════════════════════════════════════════════
+  // Memory events（统一变更账：extraction / api_mutation / review）
+  // ════════════════════════════════════════════════════════
+
+  async appendMemoryEvent(event: MemoryEvent): Promise<void> {
+    const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
+    // _id 由 Mongo 自动生成（ObjectId 自带时间序，作同 event_ts 内的稳定次序键）。
+    await coll.insertOne({ ...event } as never);
+  }
+
+  async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
+    const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
+    const q: Record<string, unknown> = {};
+    if (filter.session_id !== undefined) q.session_id = filter.session_id;
+    if (filter.session_key !== undefined) q.session_key = filter.session_key;
+    if (filter.origin_session_id !== undefined) q.origin_session_id = filter.origin_session_id;
+    if (filter.origin_session_key !== undefined) q.origin_session_key = filter.origin_session_key;
+    if (filter.record_id !== undefined) q.record_id = filter.record_id;
+    if (filter.op !== undefined) q.op = filter.op;
+    if (filter.layer !== undefined) q.layer = filter.layer;
+    if (filter.source !== undefined) q.source = filter.source;
+    if (filter.request_id !== undefined) q.request_id = filter.request_id;
+    if (filter.team_id !== undefined) q.team_id = filter.team_id;
+    if (filter.agent_id !== undefined) q.agent_id = filter.agent_id;
+    if (filter.user_id !== undefined) q.user_id = filter.user_id;
+    if (filter.task_id !== undefined) q.task_id = filter.task_id;
+    // event_ts 是 ISO 8601 字符串，字典序即时间序（与 sqlite 实现一致）。
+    if (filter.since !== undefined || filter.until !== undefined) {
+      const range: Record<string, string> = {};
+      if (filter.since !== undefined) range.$gte = filter.since;
+      if (filter.until !== undefined) range.$lte = filter.until;
+      q.event_ts = range;
+    }
+
+    const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);
+    const offset = Math.max(filter.offset ?? 0, 0);
+    const docs = await coll
+      .find(q as never)
+      .sort({ event_ts: 1, _id: 1 })
+      .skip(offset)
+      .limit(limit)
+      .toArray();
+    return docs.map((d) => this.docToMemoryEvent(d));
+  }
+
+  private docToMemoryEvent(d: Record<string, unknown>): MemoryEvent {
+    const supersedes = Array.isArray(d.supersedes) ? (d.supersedes as string[]) : [];
+    return {
+      event_ts: String(d.event_ts ?? ""),
+      session_key: String(d.session_key ?? ""),
+      session_id: String(d.session_id ?? ""),
+      origin_session_id: String(d.origin_session_id ?? "") || undefined,
+      origin_session_key: String(d.origin_session_key ?? "") || undefined,
+      team_id: String(d.team_id ?? "") || undefined,
+      user_id: String(d.user_id ?? "") || undefined,
+      agent_id: String(d.agent_id ?? "") || undefined,
+      task_id: String(d.task_id ?? "") || undefined,
+      op: d.op as MemoryEvent["op"],
+      record_id: String(d.record_id ?? ""),
+      content: String(d.content ?? ""),
+      memory_type: String(d.memory_type ?? "") || undefined,
+      version: Number(d.version ?? 0),
+      supersedes: supersedes.length ? supersedes : undefined,
+      superseded_by: String(d.superseded_by ?? "") || undefined,
+      snapshot_json: String(d.snapshot_json ?? "") || undefined,
+      reviewer_id: String(d.reviewer_id ?? "") || undefined,
+      layer: (String(d.layer ?? "l1") || "l1") as MemoryEvent["layer"],
+      source: (String(d.source ?? "") || undefined) as MemoryEvent["source"],
+      request_id: String(d.request_id ?? "") || undefined,
     };
   }
 

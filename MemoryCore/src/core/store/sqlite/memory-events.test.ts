@@ -213,4 +213,50 @@ describe("memory_events migration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("rebuilds a legacy CHECK table so op='deleted' becomes writable, preserving rows", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "mem-events-check-"));
+    try {
+      const dbPath = path.join(dir, "vectors.db");
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(dbPath);
+      // Pre-ledger schema: op CHECK without 'deleted', no layer/source/request_id.
+      db.exec(`CREATE TABLE memory_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, event_ts TEXT NOT NULL,
+        session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+        origin_session_id TEXT NOT NULL DEFAULT '', origin_session_key TEXT NOT NULL DEFAULT '',
+        team_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '',
+        agent_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+        op TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted')),
+        record_id TEXT NOT NULL, content TEXT NOT NULL,
+        memory_type TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
+        supersedes TEXT NOT NULL DEFAULT '[]', superseded_by TEXT NOT NULL DEFAULT '',
+        snapshot_json TEXT NOT NULL DEFAULT '', reviewer_id TEXT NOT NULL DEFAULT '')`);
+      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-01T00:00:00Z','created','m_a','legacy-a')`);
+      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-02T00:00:00Z','reverted','m_b','legacy-b')`);
+      db.close();
+
+      const store = new VectorStore(dbPath, 0);
+      store.init();
+
+      // Legacy rows survive the rebuild with inferred source and layer='l1'.
+      const legacy = store.queryMemoryEvents({ limit: 10 });
+      expect(legacy).toHaveLength(2);
+      expect(legacy[0]).toMatchObject({ op: "created", source: "extraction", layer: "l1" });
+      expect(legacy[1]).toMatchObject({ op: "reverted", source: "review", layer: "l1" });
+
+      // The rebuilt CHECK accepts the new op.
+      store.appendMemoryEvent({
+        event_ts: "2026-01-01T00:00:00Z", session_key: "", session_id: "",
+        op: "deleted", record_id: "m_a", content: "",
+        layer: "l1", source: "api_mutation", request_id: "req-1",
+      });
+      const deleted = store.queryMemoryEvents({ op: "deleted" });
+      expect(deleted).toHaveLength(1);
+      expect(deleted[0]).toMatchObject({ record_id: "m_a", layer: "l1", source: "api_mutation", request_id: "req-1" });
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

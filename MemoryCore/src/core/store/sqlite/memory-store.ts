@@ -873,6 +873,8 @@ export class VectorStore implements IMemoryStore {
     //   - superseded 事件的 content 是旧记录快照；session_id 记执行淘汰的 session，
     //     origin_session_id 保留旧记录原归属
     //   - 不取代 memory_audit：audit 管显式 mutation API，本表管自动提取写入
+    //   - 统一变更账扩展：op 增加 deleted（管理面显式删除），新增 layer/source/
+    //     request_id 列区分变更来源与所属层（api_mutation 双写，见 v2-router）
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS memory_events (
         seq                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -885,7 +887,7 @@ export class VectorStore implements IMemoryStore {
         user_id            TEXT NOT NULL DEFAULT '',
         agent_id           TEXT NOT NULL DEFAULT '',
         task_id            TEXT NOT NULL DEFAULT '',
-        op                 TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted')),
+        op                 TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted','deleted')),
         record_id          TEXT NOT NULL,
         content            TEXT NOT NULL,
         memory_type        TEXT NOT NULL DEFAULT '',
@@ -893,7 +895,10 @@ export class VectorStore implements IMemoryStore {
         supersedes         TEXT NOT NULL DEFAULT '[]',
         superseded_by      TEXT NOT NULL DEFAULT '',
         snapshot_json      TEXT NOT NULL DEFAULT '',
-        reviewer_id        TEXT NOT NULL DEFAULT ''
+        reviewer_id        TEXT NOT NULL DEFAULT '',
+        layer              TEXT NOT NULL DEFAULT 'l1',
+        source             TEXT NOT NULL DEFAULT '',
+        request_id         TEXT NOT NULL DEFAULT ''
       )
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
@@ -903,6 +908,65 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
     // Existing installs: backfill the reviewer_id column added for review reverts.
     try { this.db.exec("ALTER TABLE memory_events ADD COLUMN reviewer_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
+    // Unified change ledger migration: pre-existing tables carry an op CHECK
+    // without 'deleted', and SQLite cannot ALTER a CHECK constraint — rebuild
+    // via create-copy-drop-rename. Detection reads sqlite_master.sql; legacy
+    // rows get layer='l1' and source inferred from op (reverted → review).
+    try {
+      const evTable = this.db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_events'",
+      ).get() as { sql?: string } | undefined;
+      if (evTable?.sql && !evTable.sql.includes("'deleted'")) {
+        this.db.exec(`
+          CREATE TABLE memory_events_new (
+            seq                INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_ts           TEXT NOT NULL,
+            session_key        TEXT NOT NULL DEFAULT '',
+            session_id         TEXT NOT NULL DEFAULT '',
+            origin_session_id  TEXT NOT NULL DEFAULT '',
+            origin_session_key TEXT NOT NULL DEFAULT '',
+            team_id            TEXT NOT NULL DEFAULT '',
+            user_id            TEXT NOT NULL DEFAULT '',
+            agent_id           TEXT NOT NULL DEFAULT '',
+            task_id            TEXT NOT NULL DEFAULT '',
+            op                 TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted','deleted')),
+            record_id          TEXT NOT NULL,
+            content            TEXT NOT NULL,
+            memory_type        TEXT NOT NULL DEFAULT '',
+            version            INTEGER NOT NULL DEFAULT 0,
+            supersedes         TEXT NOT NULL DEFAULT '[]',
+            superseded_by      TEXT NOT NULL DEFAULT '',
+            snapshot_json      TEXT NOT NULL DEFAULT '',
+            reviewer_id        TEXT NOT NULL DEFAULT '',
+            layer              TEXT NOT NULL DEFAULT 'l1',
+            source             TEXT NOT NULL DEFAULT '',
+            request_id         TEXT NOT NULL DEFAULT ''
+          )
+        `);
+        this.db.exec(`
+          INSERT INTO memory_events_new
+            (event_ts, session_key, session_id, origin_session_id, origin_session_key,
+             team_id, user_id, agent_id, task_id,
+             op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
+             layer, source, request_id)
+          SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
+                 team_id, user_id, agent_id, task_id,
+                 op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
+                 'l1', CASE WHEN op = 'reverted' THEN 'review' ELSE 'extraction' END, ''
+          FROM memory_events ORDER BY seq
+        `);
+        this.db.exec("DROP TABLE memory_events");
+        this.db.exec("ALTER TABLE memory_events_new RENAME TO memory_events");
+        // Old indexes died with the DROP; recreate them on the rebuilt table.
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_sessionkey ON memory_events(session_key, seq)");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_session_id)");
+        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
+      }
+    } catch (err) {
+      this.logger?.warn?.(`[memory-tdai][sqlite] memory_events CHECK migration failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     // ── Custom Memory Prompt ──
     this.db.exec(`
@@ -3487,8 +3551,9 @@ export class VectorStore implements IMemoryStore {
       INSERT INTO memory_events
         (event_ts, session_key, session_id, origin_session_id, origin_session_key,
          team_id, user_id, agent_id, task_id,
-         op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
+         layer, source, request_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     stmt.run(
       event.event_ts,
@@ -3509,6 +3574,9 @@ export class VectorStore implements IMemoryStore {
       event.superseded_by ?? "",
       event.snapshot_json ?? "",
       event.reviewer_id ?? "",
+      event.layer ?? "l1",
+      event.source ?? "",
+      event.request_id ?? "",
     );
   }
 
@@ -3521,6 +3589,9 @@ export class VectorStore implements IMemoryStore {
     if (filter.origin_session_key !== undefined) { conds.push("origin_session_key = ?"); args.push(filter.origin_session_key); }
     if (filter.record_id !== undefined)         { conds.push("record_id = ?");         args.push(filter.record_id); }
     if (filter.op !== undefined)                { conds.push("op = ?");                args.push(filter.op); }
+    if (filter.layer !== undefined)             { conds.push("layer = ?");             args.push(filter.layer); }
+    if (filter.source !== undefined)            { conds.push("source = ?");            args.push(filter.source); }
+    if (filter.request_id !== undefined)        { conds.push("request_id = ?");        args.push(filter.request_id); }
     if (filter.team_id !== undefined)           { conds.push("team_id = ?");           args.push(filter.team_id); }
     if (filter.agent_id !== undefined)          { conds.push("agent_id = ?");          args.push(filter.agent_id); }
     if (filter.user_id !== undefined)           { conds.push("user_id = ?");           args.push(filter.user_id); }
@@ -3535,7 +3606,8 @@ export class VectorStore implements IMemoryStore {
     const sql = `
       SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
              team_id, user_id, agent_id, task_id,
-             op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id
+             op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
+             layer, source, request_id
       FROM memory_events
       ${where}
       ORDER BY seq ASC
@@ -3552,7 +3624,7 @@ export class VectorStore implements IMemoryStore {
       user_id: string;
       agent_id: string;
       task_id: string;
-      op: "created" | "updated" | "merged" | "superseded" | "reverted";
+      op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted";
       record_id: string;
       content: string;
       memory_type: string;
@@ -3561,6 +3633,9 @@ export class VectorStore implements IMemoryStore {
       superseded_by: string;
       snapshot_json: string;
       reviewer_id: string;
+      layer: string;
+      source: string;
+      request_id: string;
     }>;
     return rows.map((r) => {
       const supersedes = JSON.parse(r.supersedes) as string[];
@@ -3583,6 +3658,9 @@ export class VectorStore implements IMemoryStore {
         superseded_by: r.superseded_by || undefined,
         snapshot_json: r.snapshot_json || undefined,
         reviewer_id: r.reviewer_id || undefined,
+        layer: (r.layer || "l1") as MemoryEvent["layer"],
+        source: (r.source || undefined) as MemoryEvent["source"],
+        request_id: r.request_id || undefined,
       };
     });
   }

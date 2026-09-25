@@ -188,6 +188,10 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
  *   - L0 不参与（不可变流水）
  *   - 5 个 mutation handler 各调一次：
  *     atomic/update + atomic/delete + scenario/write + scenario/rm + core/write
+ *
+ * 统一变更账：同一 mutation 镜像一条 memory_events（source=api_mutation），
+ * 让 diff/history/inbox 的审阅面能看到管理面变更。audit（API 访问日志）
+ * 与 events（变更事实流）双写并行，互不依赖、各自 best-effort。
  */
 async function recordAudit(
   store: IMemoryStore | undefined,
@@ -201,25 +205,51 @@ async function recordAudit(
     logger?: { warn?: (msg: string) => void };
   },
 ): Promise<void> {
-  if (!store?.appendAudit) return; // store 不支持 audit → 跳过
-  try {
-    await store.appendAudit({
-      audit_id: `audit-${randomUUID().replace(/-/g, "").slice(0, 16)}`,
-      record_id: args.record_id,
-      layer: args.layer,
-      action: args.action,
-      team_id: args.iso?.teamId,
-      agent_id: args.iso?.agentId,
-      user_id: args.iso?.userId,
-      task_id: args.iso?.taskId,
-      version: args.version,
-      updated_at_ms: Date.now(),
-      request_id: args.requestId,
-    });
-  } catch (err) {
-    args.logger?.warn?.(
-      `${TAG} audit append failed (${args.layer}/${args.action} record=${args.record_id}): ${err instanceof Error ? err.message : String(err)}`,
-    );
+  if (store?.appendAudit) {
+    try {
+      await store.appendAudit({
+        audit_id: `audit-${randomUUID().replace(/-/g, "").slice(0, 16)}`,
+        record_id: args.record_id,
+        layer: args.layer,
+        action: args.action,
+        team_id: args.iso?.teamId,
+        agent_id: args.iso?.agentId,
+        user_id: args.iso?.userId,
+        task_id: args.iso?.taskId,
+        version: args.version,
+        updated_at_ms: Date.now(),
+        request_id: args.requestId,
+      });
+    } catch (err) {
+      args.logger?.warn?.(
+        `${TAG} audit append failed (${args.layer}/${args.action} record=${args.record_id}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (store?.appendMemoryEvent) {
+    try {
+      await store.appendMemoryEvent({
+        event_ts: new Date().toISOString(),
+        // 管理面 mutation 无 session 语义，session 维度留空。
+        session_key: "",
+        session_id: "",
+        team_id: args.iso?.teamId,
+        user_id: args.iso?.userId,
+        agent_id: args.iso?.agentId,
+        task_id: args.iso?.taskId,
+        op: args.action === "delete" ? "deleted" : "updated",
+        record_id: args.record_id,
+        content: "",
+        version: args.version,
+        layer: args.layer.toLowerCase() as "l1" | "l2" | "l3",
+        source: "api_mutation",
+        request_id: args.requestId,
+      });
+    } catch (err) {
+      args.logger?.warn?.(
+        `${TAG} memory event mirror failed (${args.layer}/${args.action} record=${args.record_id}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }
 
@@ -1492,6 +1522,7 @@ async function revertOneL1Record(
       // 审核者身份（v3 isolation 的 user）——事件归属仍是原 session，
       // 但"谁驳回的"要可查。
       reviewer_id: iso?.userId,
+      source: "review",
     });
   } catch (err) {
     deps.logger.warn(`${TAG} reverted event append failed (non-fatal) for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);

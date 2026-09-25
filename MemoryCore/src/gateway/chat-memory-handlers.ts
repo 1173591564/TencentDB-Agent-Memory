@@ -318,10 +318,21 @@ export async function clearChatMemoryContentResilient(args: {
   teamId: string;
   agentId: string;
   logger: Logger;
+  /** 可选：审计行的 request_id（archiveAgent 路径无 HTTP requestId，留空）。 */
+  requestId?: string;
 }): Promise<{ l0Deleted: number; l1Deleted: number; profileDeleted: number }> {
   const { result } = await clearChatMemoryContentWithRetry({
     ...args,
     memoryId: `${args.teamId}/${args.agentId}`,
+  });
+  // archiveAgent 级联清空与 /v3/chat-memory/clear 行为对齐：同样留审计痕。
+  // 清理已成功，审计失败只 warn。
+  await recordClearAudit(args.store, {
+    memoryId: `${args.teamId}/${args.agentId}`,
+    teamId: args.teamId,
+    agentId: args.agentId,
+    requestId: args.requestId ?? "",
+    logger: args.logger,
   });
   return result;
 }
@@ -329,6 +340,7 @@ export async function clearChatMemoryContentResilient(args: {
 /**
  * 写清空审计。L1/L2/L3 各一条 delete 事件，record_id 用 memory_id（asset_id），
  * 不写任何原内容。审计失败不阻塞主流程（与 v2-router recordAudit 语义一致）。
+ * 同时镜像到 memory_events（source=api_mutation，统一变更账）。
  */
 export async function recordClearAudit(
   store: IMemoryStore,
@@ -340,26 +352,50 @@ export async function recordClearAudit(
     logger: Logger;
   },
 ): Promise<void> {
-  if (!store.appendAudit) return;
   const now = Date.now();
   for (const layer of ["L1", "L2", "L3"] as const) {
-    try {
-      await store.appendAudit({
-        audit_id: `audit-${randomUUID().replace(/-/g, "").slice(0, 16)}`,
-        record_id: args.memoryId,
-        layer,
-        action: "delete",
-        team_id: args.teamId,
-        agent_id: args.agentId,
-        version: 0,
-        updated_at_ms: now,
-        request_id: args.requestId,
-      });
-    } catch (err) {
-      args.logger.warn(
-        `${TAG} audit append failed (clear/${layer} memory=${args.memoryId}): ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-      );
+    if (store.appendAudit) {
+      try {
+        await store.appendAudit({
+          audit_id: `audit-${randomUUID().replace(/-/g, "").slice(0, 16)}`,
+          record_id: args.memoryId,
+          layer,
+          action: "delete",
+          team_id: args.teamId,
+          agent_id: args.agentId,
+          version: 0,
+          updated_at_ms: now,
+          request_id: args.requestId,
+        });
+      } catch (err) {
+        args.logger.warn(
+          `${TAG} audit append failed (clear/${layer} memory=${args.memoryId}): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    if (store.appendMemoryEvent) {
+      try {
+        await store.appendMemoryEvent({
+          event_ts: new Date().toISOString(),
+          session_key: "",
+          session_id: "",
+          team_id: args.teamId,
+          agent_id: args.agentId,
+          op: "deleted",
+          record_id: args.memoryId,
+          content: "",
+          version: 0,
+          layer: layer.toLowerCase() as "l1" | "l2" | "l3",
+          source: "api_mutation",
+          request_id: args.requestId,
+        });
+      } catch (err) {
+        args.logger.warn(
+          `${TAG} memory event mirror failed (clear/${layer} memory=${args.memoryId}): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   }
 }

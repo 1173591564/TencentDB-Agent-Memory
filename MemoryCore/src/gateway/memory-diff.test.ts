@@ -432,3 +432,71 @@ describe("POST /memory/review/inbox", () => {
     expect(data!.sessions).toHaveLength(0);
   });
 });
+
+describe("mutation → memory_events mirror (unified change ledger)", () => {
+  let dir: string;
+  let store: VectorStore;
+  let captured: { status: number; body: { code: number; data?: Record<string, unknown> } } | null;
+
+  const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
+    captured = null;
+    const req = { headers, method: "POST", url: pathname } as http.IncomingMessage;
+    const res = {} as http.ServerResponse;
+    const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
+      captured = { status, body: b as { code: number; data?: Record<string, unknown> } };
+    };
+    const deps = {
+      deployMode: "service",
+      getStore: () => store,
+      getEmbedding: () => undefined,
+      getStorage: () => undefined,
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
+    const cap = captured as ({ status: number; body: { code: number; data?: Record<string, unknown> } } | null);
+    return { status: cap?.status, data: cap?.body?.data };
+  };
+
+  const writeIso = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1" };
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), "mem-mirror-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    await writeMemory({ ...writeIso, baseDir: dir, vectorStore: store, memory: memory("salary 5000"), decision: decision("m_a", "store") });
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("atomic/delete writes both an audit row and a memory_events mirror", async () => {
+    const { status } = await call("/v3/atomic/delete", { ids: ["m_a"] });
+    expect(status).toBe(200);
+
+    // audit row (API access log, preserved as-is)
+    const audits = store.queryAudit!({ record_id: "m_a" });
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ layer: "L1", action: "delete", version: 0 });
+
+    // events mirror (unified change ledger, source=api_mutation)
+    const events = store.queryMemoryEvents({ record_id: "m_a", op: "deleted" });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      op: "deleted", layer: "l1", source: "api_mutation", version: 0,
+      team_id: "t1", user_id: "u1", agent_id: "a1",
+    });
+    expect(events[0].session_id).toBe(""); // management-plane mutation has no session
+  });
+
+  it("source/layer filters scope the mirror query", async () => {
+    await call("/v3/atomic/delete", { ids: ["m_a"] });
+    const apiOnly = store.queryMemoryEvents({ source: "api_mutation" });
+    expect(apiOnly).toHaveLength(1);
+    const extractionOnly = store.queryMemoryEvents({ source: "extraction" });
+    expect(extractionOnly.map((e) => e.op)).toEqual(["created"]);
+    const l2Only = store.queryMemoryEvents({ layer: "l2" });
+    expect(l2Only).toHaveLength(0);
+  });
+});

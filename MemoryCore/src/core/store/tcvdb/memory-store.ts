@@ -2751,6 +2751,12 @@ export class TcvdbMemoryStore implements IMemoryStore {
   async redactMemoryEvents(filter: MemoryEventRedactFilter): Promise<number> {
     await this._ensureInit();
     if (this.degraded) throw new Error("memory_events redact rejected: tcvdb store is degraded");
+    // event_ts 是字符串比较：不可解析的 until 会按字典序大面积误擦而非
+    // 安全落空。与 sqlite/mongo 同一护栏。
+    if (isoToEpochMs(filter.until) <= 0) return 0;
+    if (filter.team_id === undefined && filter.agent_id === undefined && filter.user_id === undefined) {
+      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${filter.until})`);
+    }
     const conds = [`event_ts <= "${escapeFilterString(filter.until)}"`];
     if (filter.team_id !== undefined) conds.push(eqFilter("team_id", filter.team_id));
     if (filter.agent_id !== undefined) conds.push(eqFilter("agent_id", filter.agent_id));

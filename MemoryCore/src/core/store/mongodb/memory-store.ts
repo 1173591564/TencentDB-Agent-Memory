@@ -898,6 +898,14 @@ export class MongoMemoryStore implements IMemoryStore {
 
   async redactMemoryEvents(filter: MemoryEventRedactFilter): Promise<number> {
     const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
+    // event_ts is lexicographically compared — an unparseable `until` does NOT
+    // safely match nothing; it can wipe broadly ("zzz" > every ISO string).
+    // Same guard as deleteL1Expired: reject instead of redacting on garbage.
+    if (isoToEpochMs(filter.until) <= 0) return 0;
+    if (filter.team_id === undefined && filter.agent_id === undefined && filter.user_id === undefined) {
+      // Legal (e.g. full clear), but wipes every tenant — surface it loudly.
+      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${filter.until})`);
+    }
     const q: Record<string, unknown> = { event_ts: { $lte: filter.until } };
     if (filter.team_id !== undefined) q.team_id = filter.team_id;
     if (filter.agent_id !== undefined) q.agent_id = filter.agent_id;

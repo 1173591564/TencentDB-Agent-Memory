@@ -3728,6 +3728,12 @@ export class VectorStore implements IMemoryStore {
 
   redactMemoryEvents(filter: MemoryEventRedactFilter): number {
     if (this.degraded) throw new Error("memory_events redact rejected: sqlite store is degraded");
+    // event_ts 是字符串比较：不可解析的 until 不能安全匹配为空，反而可能
+    // 按字典序大面积误擦（"zzz" > 所有 ISO 串）。与 mongo/tcvdb 同一护栏。
+    if (Number.isNaN(Date.parse(filter.until))) return 0;
+    if (filter.team_id === undefined && filter.agent_id === undefined && filter.user_id === undefined) {
+      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${filter.until})`);
+    }
     const conds = ["event_ts <= ?", "(content != '' OR snapshot_json != '')"];
     const args: SQLInputValue[] = [filter.until];
     if (filter.team_id !== undefined)  { conds.push("team_id = ?");  args.push(filter.team_id); }

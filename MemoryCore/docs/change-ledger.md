@@ -187,6 +187,11 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
   工作，丢弃它会让失败的 store 擦除永远不重试而账本却报健康。
 - 已知标记集是进程内状态且上限 10000 条（FIFO 淘汰）；另一进程的 in-flight 明文追加收敛于
   该进程的下次 backfill，与本节“其它 writer 分片”语义一致。
+- store 层查询/擦除语义（真 mongod 冒烟实测）：`queryMemoryEvents` 的 `limit` 被钳制到
+  `[1, 1000]`（`0`/负数按 1 处理，不是空集）、`offset` 负值归零；`event_ts` 为 ISO 字符串
+  字典序比较，未归一化的时间（如 `+08:00` 偏移）排序不等于时间序——写方必须归一化为 `Z`。
+- `redactMemoryEvents` 的 `until` 经 `isoToEpochMs` 校验：不可解析时返回 0 不擦除
+  （与 `deleteL1Expired` 同一护栏）；不带 team/agent/user 过滤时按全租户擦除并 warn。
 
 ## 保留期
 

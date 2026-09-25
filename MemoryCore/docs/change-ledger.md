@@ -24,6 +24,9 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
   - `events/YYYY-MM-DD.<writerId>.jsonl`：本 writer 追加的活动分片；
   - `events/YYYY-MM-DD[.<writerId>]~<gen>.jsonl`：擦除改写生成的封存分片（内容已脱敏，此后不再追加，再次改写时换新 `<gen>`）；
   - `events/YYYY-MM-DD.jsonl`：旧版无后缀分片（本改动之前写入），继续可回放、可改写。
+- COS 部署前置：目标桶**不得开启多 AZ 特性**——官方限制为 MAZ 桶不支持 Append Object
+  （追加请求返回 405 MethodNotAllowed），而 outbox 的 live 分片、擦除标记、封存分片全部依赖
+  `appendObject`。多 AZ 开启后无法关闭，必须建桶时选择单 AZ（已在真实 COS 桶冒烟验证）。
 - `writerId` = `<hostname>-<8 hex>`，首次启动时生成并持久化到 `<dataDir>/.metadata/ledger_writer_id`，
   同一数据目录重启后沿用（因此仍“拥有”并能改写重启前的分片）；每个数据目录只应有一个写入进程。
   未经 TdaiCore 初始化（如单测、脚本）时使用进程级随机 id。

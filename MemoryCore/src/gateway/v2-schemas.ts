@@ -110,6 +110,11 @@ import {
 export const conversationAddRequestSchema = z.object({
   session_id: z.string().min(1).default(DEFAULT_ISOLATION_ID),
   messages: z.array(_conversationItemSchema).min(1).max(100),
+  /**
+   * 幂等键（也可经 `Idempotency-Key` 请求头传入，body 优先）。同键重试得到
+   * 相同的 accepted_ids，L0 不重复写入。
+   */
+  idempotency_key: z.string().min(1).max(256).optional(),
 });
 export type ConversationAddRequest = z.infer<typeof conversationAddRequestSchema>;
 
@@ -493,3 +498,15 @@ export const memoryReviewInboxRequestSchema = z.object({
   limit: z.number().int().min(1).max(1000).default(500),
 });
 export type MemoryReviewInboxRequest = z.infer<typeof memoryReviewInboxRequestSchema>;
+
+// POST /v2|v3/memory/ledger/status — 变更账健康度（本进程见到的 store/outbox 追加失败）。
+export const memoryLedgerStatusRequestSchema = z.object({}).passthrough();
+export type MemoryLedgerStatusRequest = z.infer<typeof memoryLedgerStatusRequestSchema>;
+
+// POST /v2|v3/memory/ledger/backfill — 从 events/*.jsonl outbox 幂等回放缺失事件到 store。
+// 按请求 isolation 的 team/agent 限定回放范围。
+export const memoryLedgerBackfillRequestSchema = z.object({
+  /** 可选：只回放 event_ts ≥ since 的事件（ISO 8601）。 */
+  since: isoDateString.optional(),
+});
+export type MemoryLedgerBackfillRequest = z.infer<typeof memoryLedgerBackfillRequestSchema>;

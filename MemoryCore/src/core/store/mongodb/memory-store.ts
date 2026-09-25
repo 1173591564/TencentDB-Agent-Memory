@@ -60,6 +60,12 @@ import type { MemoryRecord } from "../../record/l1-writer.js";
 import { DEFAULT_ISOLATION_ID } from "../isolation.js";
 import { mongoSearchScoreToScore } from "../tokenize.js";
 import { COLLECTIONS } from "./collections.js";
+import { newMemoryEventId } from "../memory-event-id.js";
+import {
+  buildMemoryGenerationRefId,
+  type MemoryGenerationLayer,
+  type MemoryGenerationRefRecord,
+} from "../../memory-generation-log/types.js";
 import {
   MEMORY_SEARCH_INDEX,
   MEMORY_SEARCH_DEFINITION,
@@ -173,9 +179,17 @@ export class MongoMemoryStore implements IMemoryStore {
       ]),
       db.collection(COLLECTIONS.MEMORY_EVENTS).createIndexes([
         { key: { event_ts: 1, _id: 1 } },
+        {
+          key: { event_id: 1 },
+          unique: true,
+          partialFilterExpression: { event_id: { $type: "string", $gt: "" } },
+        },
         { key: { record_id: 1 } },
         { key: { session_id: 1 } },
         { key: { team_id: 1, agent_id: 1, user_id: 1 } },
+      ]),
+      db.collection(COLLECTIONS.MEMORY_GENERATION_REFS).createIndexes([
+        { key: { layer: 1, memory_id: 1 } },
       ]),
       db.collection(COLLECTIONS.KNOWLEDGE).createIndexes([
         { key: { team_id: 1, type: 1 } },
@@ -806,6 +820,37 @@ export class MongoMemoryStore implements IMemoryStore {
   }
 
   // ════════════════════════════════════════════════════════
+  // Memory generation provenance references
+  // ════════════════════════════════════════════════════════
+
+  async upsertMemoryGenerationRefs(records: MemoryGenerationRefRecord[]): Promise<void> {
+    if (records.length === 0) return;
+    const coll = await this.coll(COLLECTIONS.MEMORY_GENERATION_REFS);
+    await coll.bulkWrite(
+      records.map((record) => {
+        const { generation_ref_id, ...fields } = record;
+        return {
+          replaceOne: {
+            filter: { _id: generation_ref_id },
+            replacement: fields,
+            upsert: true,
+          },
+        };
+      }) as never,
+      { ordered: false },
+    );
+  }
+
+  async getMemoryGenerationRef(layer: MemoryGenerationLayer, memoryId: string): Promise<MemoryGenerationRefRecord | null> {
+    const coll = await this.coll(COLLECTIONS.MEMORY_GENERATION_REFS);
+    const id = buildMemoryGenerationRefId(layer, memoryId);
+    const doc = await coll.findOne({ _id: id, layer, memory_id: memoryId } as never);
+    if (!doc) return null;
+    const { _id, ...fields } = doc as unknown as Record<string, unknown>;
+    return { ...(fields as Omit<MemoryGenerationRefRecord, "generation_ref_id">), generation_ref_id: String(_id) };
+  }
+
+  // ════════════════════════════════════════════════════════
   // Memory events（统一变更账：extraction / api_mutation / review）
   // ════════════════════════════════════════════════════════
 
@@ -816,8 +861,10 @@ export class MongoMemoryStore implements IMemoryStore {
     // mongo stores `layer: undefined` as a missing field, which a
     // `{layer:"l1"}` filter would never match — diverging from the other
     // backends where the writer-side default lands in the row.
+    try {
     await coll.insertOne({
       ...event,
+      event_id: event.event_id || newMemoryEventId(),
       origin_session_id: event.origin_session_id ?? "",
       origin_session_key: event.origin_session_key ?? "",
       team_id: event.team_id ?? "",
@@ -834,6 +881,11 @@ export class MongoMemoryStore implements IMemoryStore {
       source: event.source ?? "",
       request_id: event.request_id ?? "",
     } as never);
+    } catch (err) {
+      // Duplicate event_id: the event already landed (outbox replay / retry).
+      if ((err as { code?: number }).code === 11000) return;
+      throw err;
+    }
   }
 
   async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
@@ -875,6 +927,7 @@ export class MongoMemoryStore implements IMemoryStore {
   private docToMemoryEvent(d: Record<string, unknown>): MemoryEvent {
     const supersedes = Array.isArray(d.supersedes) ? (d.supersedes as string[]) : [];
     return {
+      event_id: String(d.event_id ?? "") || undefined,
       event_ts: String(d.event_ts ?? ""),
       session_key: String(d.session_key ?? ""),
       session_id: String(d.session_id ?? ""),

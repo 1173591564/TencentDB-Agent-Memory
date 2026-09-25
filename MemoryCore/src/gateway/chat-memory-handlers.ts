@@ -33,6 +33,7 @@ import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapte
 import { buildProfileIsolationScope } from "../core/profile/profile-scope.js";
 import { MetadataError, type MetadataService } from "../metadata/service/metadata-service.js";
 import { buildChatMemoryAssetId } from "../metadata/utils/chat-memory-asset.js";
+import { appendLedgerEvent } from "../core/record/event-ledger.js";
 import type { Logger } from "../core/types.js";
 
 const TAG = "[chat-memory-handlers]";
@@ -337,6 +338,7 @@ export async function clearChatMemoryContentResilient(args: {
     agentId: args.agentId,
     requestId: args.requestId ?? "",
     logger: args.logger,
+    storage: args.storage,
   });
   return result;
 }
@@ -354,6 +356,7 @@ export async function recordClearAudit(
     agentId: string;
     requestId: string;
     logger: Logger;
+    storage?: StorageAdapter;
   },
 ): Promise<void> {
   const now = Date.now();
@@ -378,9 +381,9 @@ export async function recordClearAudit(
         );
       }
     }
-    if (store.appendMemoryEvent) {
+    if (store.appendMemoryEvent || args.storage) {
       try {
-        await store.appendMemoryEvent({
+        await appendLedgerEvent({ store, storage: args.storage, logger: args.logger, event: {
           event_ts: new Date().toISOString(),
           session_key: "",
           session_id: "",
@@ -393,7 +396,7 @@ export async function recordClearAudit(
           layer: layer.toLowerCase() as "l1" | "l2" | "l3",
           source: "api_mutation",
           request_id: args.requestId,
-        });
+        } });
       } catch (err) {
         args.logger.warn(
           `${TAG} memory event mirror failed (clear/${layer} memory=${args.memoryId}): ` +
@@ -473,6 +476,7 @@ async function handleChatMemoryClear(
         agentId: target.agent_id,
         requestId,
         logger: deps.logger,
+        storage,
       });
 
       items.push({

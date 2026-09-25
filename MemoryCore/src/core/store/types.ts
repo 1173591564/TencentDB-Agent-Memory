@@ -622,6 +622,12 @@ export interface AuditQueryFilter {
  * mutation 按 handler 实际操作的层填充。未填时按 l1 处理（老数据全部为 l1）。
  */
 export interface MemoryEvent {
+  /**
+   * 事件唯一身份（`evt-` + 32 hex）。写入点生成一次，JSONL outbox 与各
+   * store 共用，同一 event_id 重复写入是幂等的（回放不产生重复事件）。
+   * 老数据为空；store 在缺省时自动补生成。
+   */
+  event_id?: string;
   /** 事件发生时间（ISO 8601）。 */
   event_ts: string;
   /** 执行写入的 session key（conversation channel）。管理面 mutation 无 session 语义，为空串。 */

@@ -62,6 +62,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
+import { newMemoryEventId } from "../memory-event-id.js";
 import type { Logger } from "../../types.js";
 import type {
   MemoryPromptListFilter,
@@ -898,7 +899,8 @@ export class VectorStore implements IMemoryStore {
         reviewer_id        TEXT NOT NULL DEFAULT '',
         layer              TEXT NOT NULL DEFAULT 'l1',
         source             TEXT NOT NULL DEFAULT '',
-        request_id         TEXT NOT NULL DEFAULT ''
+        request_id         TEXT NOT NULL DEFAULT '',
+        event_id           TEXT NOT NULL DEFAULT ''
       )
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
@@ -952,7 +954,8 @@ export class VectorStore implements IMemoryStore {
             reviewer_id        TEXT NOT NULL DEFAULT '',
             layer              TEXT NOT NULL DEFAULT 'l1',
             source             TEXT NOT NULL DEFAULT '',
-            request_id         TEXT NOT NULL DEFAULT ''
+            request_id         TEXT NOT NULL DEFAULT '',
+            event_id           TEXT NOT NULL DEFAULT ''
           )
         `);
         this.db.exec(`
@@ -984,6 +987,11 @@ export class VectorStore implements IMemoryStore {
     } catch (err) {
       this.logger?.warn?.(`[memory-tdai][sqlite] memory_events CHECK migration failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    // event_id: stable per-event identity; the partial unique index makes
+    // re-appending the same event (outbox replay) a no-op while legacy rows
+    // (event_id='') stay unconstrained.
+    try { this.db.exec("ALTER TABLE memory_events ADD COLUMN event_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_event_id ON memory_events(event_id) WHERE event_id != ''");
 
     // ── Custom Memory Prompt ──
     this.db.exec(`
@@ -3570,8 +3578,9 @@ export class VectorStore implements IMemoryStore {
         (event_ts, session_key, session_id, origin_session_id, origin_session_key,
          team_id, user_id, agent_id, task_id,
          op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-         layer, source, request_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         layer, source, request_id, event_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_id) WHERE event_id != '' DO NOTHING
     `);
     stmt.run(
       event.event_ts,
@@ -3595,6 +3604,7 @@ export class VectorStore implements IMemoryStore {
       event.layer ?? "l1",
       event.source ?? "",
       event.request_id ?? "",
+      event.event_id || newMemoryEventId(),
     );
   }
 
@@ -3626,7 +3636,7 @@ export class VectorStore implements IMemoryStore {
       SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
              team_id, user_id, agent_id, task_id,
              op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-             layer, source, request_id
+             layer, source, request_id, event_id
       FROM memory_events
       ${where}
       ORDER BY seq ${filter.order === "desc" ? "DESC" : "ASC"}
@@ -3655,11 +3665,13 @@ export class VectorStore implements IMemoryStore {
       layer: string;
       source: string;
       request_id: string;
+      event_id: string;
     }>;
     return rows.map((r) => {
       let supersedes: string[] = [];
       try { supersedes = JSON.parse(r.supersedes) as string[]; } catch { /* malformed column → treat as none */ }
       return {
+        event_id: r.event_id || undefined,
         event_ts: r.event_ts,
         session_key: r.session_key,
         session_id: r.session_id,

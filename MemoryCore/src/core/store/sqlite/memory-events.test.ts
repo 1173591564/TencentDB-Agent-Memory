@@ -375,9 +375,71 @@ describe("tcvdb memory_events document id uniqueness", () => {
       op: "updated", record_id: "m_x", layer: "l1", content: "v1",
     });
     const doc = upsertCalls[0]![0]!;
-    expect(String(doc.id)).toContain("2026-01-01T00:00:00.000Z__m_x__updated__l1__");
+    expect(/^evt-[0-9a-f]{32}$/.test(String(doc.id))).toBe(true);
     await (store as unknown as { client: { upsert: (c: string, b: unknown[]) => Promise<void> } })
       .client.upsert("events", [doc]);
     expect(docs.size).toBe(1);
+  });
+
+  it("document id stays within the 128-char TCVDB limit for long record_ids", async () => {
+    const { store, upsertCalls } = makeTcvdbStore();
+    await store.appendMemoryEvent({
+      event_ts: "2026-01-01T00:00:00.000Z", session_key: "", session_id: "",
+      op: "deleted", record_id: `chat_memory-${"t".repeat(80)}-${"a".repeat(80)}`, layer: "l3", content: "",
+    });
+    expect(String(upsertCalls[0]![0]!.id).length <= 128).toBe(true);
+  });
+
+  it("re-appending the same event_id is idempotent and round-trips event_id", async () => {
+    const { store, docs } = makeTcvdbStore();
+    const ev = {
+      event_id: "evt-0123456789abcdef0123456789abcdef",
+      event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
+      op: "created" as const, record_id: "m_x", content: "v1",
+    };
+    await store.appendMemoryEvent(ev);
+    await store.appendMemoryEvent(ev);
+    expect(docs.size).toBe(1);
+    const [got] = await store.queryMemoryEvents({ record_id: "m_x" });
+    expect(got!.event_id).toBe(ev.event_id);
+  });
+});
+
+describe("sqlite memory_events event_id", () => {
+  let dir: string;
+  let store: VectorStore;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "ev-id-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+  });
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const ev = (over: Record<string, unknown> = {}) => ({
+    event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
+    op: "created" as const, record_id: "m_x", content: "v1", ...over,
+  });
+
+  it("assigns an event_id when the caller omits one", () => {
+    store.appendMemoryEvent(ev());
+    store.appendMemoryEvent(ev());
+    const events = store.queryMemoryEvents({ record_id: "m_x" });
+    expect(events).toHaveLength(2);
+    expect(/^evt-[0-9a-f]{32}$/.test(events[0]!.event_id ?? "")).toBe(true);
+    expect(events[0]!.event_id).not.toBe(events[1]!.event_id);
+  });
+
+  it("duplicate event_id is a no-op (replay idempotency)", () => {
+    const e = ev({ event_id: "evt-dup" });
+    store.appendMemoryEvent(e);
+    store.appendMemoryEvent(e);
+    expect(store.queryMemoryEvents({ record_id: "m_x" })).toHaveLength(1);
+  });
+
+  it("invalid op is still rejected rather than silently ignored", () => {
+    expect(() => store.appendMemoryEvent(ev({ event_id: "evt-bad", op: "bogus" }) as never)).toThrow();
   });
 });

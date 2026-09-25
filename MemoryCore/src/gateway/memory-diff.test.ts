@@ -17,6 +17,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { VectorStore } from "../core/store/sqlite/memory-store.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "../core/record/l1-writer.js";
 import { handleV2Route } from "./v2-router.js";
+import { StorageAdapter } from "../core/storage/adapter.js";
+import { createLocalStorageBackend } from "../core/storage/factory.js";
+import { appendLedgerEvent } from "../core/record/event-ledger.js";
 
 const memory = (content: string): ExtractedMemory => ({
   content, type: "work_fact", priority: 50,
@@ -638,5 +641,155 @@ describe("mutation → memory_events mirror (unified change ledger)", () => {
     expect(extractionOnly.map((e) => e.op)).toEqual(["created"]);
     const l2Only = store.queryMemoryEvents({ layer: "l2" });
     expect(l2Only).toHaveLength(0);
+  });
+});
+
+describe("change-ledger outbox endpoints", () => {
+  let dir: string;
+  let store: VectorStore;
+  let storage: StorageAdapter;
+  let captured: { status: number; body: { code: number; data?: Record<string, unknown> } } | null;
+
+  const call = async (pathname: string, body: unknown) => {
+    captured = null;
+    const req = { headers: ISO_HEADERS, method: "POST", url: pathname } as http.IncomingMessage;
+    const res = {} as http.ServerResponse;
+    const sendJson = (_r: http.ServerResponse, status: number, b: unknown) => {
+      captured = { status, body: b as NonNullable<typeof captured>["body"] };
+    };
+    const deps = {
+      deployMode: "service",
+      getStore: () => store,
+      getEmbedding: () => undefined,
+      getStorage: () => storage,
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
+    const cap = captured as ({ status: number; body: { code: number; data?: Record<string, unknown> } } | null);
+    return { status: cap?.status, data: cap?.body?.data };
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "mem-ledger-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    storage = new StorageAdapter(createLocalStorageBackend(path.join(dir, "data")));
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("management mutations land in the outbox with the same event_id as the store row", async () => {
+    await writeMemory({ sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1", baseDir: dir, vectorStore: store, storage, memory: memory("salary 5000"), decision: decision("m_a", "store") });
+    await call("/v3/atomic/delete", { ids: ["m_a"] });
+    const names = await storage.readdirNames("events/", ".jsonl");
+    const lines = (await Promise.all(names.map((n) => storage.readFile(`events/${n}`))))
+      .join("").split("\n").filter(Boolean).map((l) => JSON.parse(l) as { event_id: string; op: string });
+    expect(lines.map((l) => l.op).sort()).toEqual(["created", "deleted"]);
+    const storeIds = store.queryMemoryEvents({ record_id: "m_a" }).map((e) => e.event_id).sort();
+    expect(lines.map((l) => l.event_id).sort()).toEqual(storeIds);
+  });
+
+  it("backfill replays outbox events the store never received, idempotently", async () => {
+    const failing = { appendMemoryEvent: () => { throw new Error("vdb down"); } } as unknown as Parameters<typeof appendLedgerEvent>[0]["store"];
+    await appendLedgerEvent({ store: failing, storage, event: {
+      event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-x",
+      team_id: "t1", agent_id: "a1", user_id: "u1", op: "created", record_id: "m_lost", content: "lost", source: "extraction",
+    } });
+    await appendLedgerEvent({ store: failing, storage, event: {
+      event_ts: new Date().toISOString(), session_key: "sk-z", session_id: "ses-z",
+      team_id: "t2", agent_id: "a1", op: "created", record_id: "m_foreign", content: "other tenant",
+    } });
+    expect((await call("/v3/memory/diff", { session_id: "ses-x" })).data!.changes).toEqual([]);
+
+    const first = await call("/v3/memory/ledger/backfill", {});
+    expect(first.status).toBe(200);
+    expect(first.data).toMatchObject({ replayed: 1, skipped: 1, failed: 0 });
+    await call("/v3/memory/ledger/backfill", {});
+
+    const diff = await call("/v3/memory/diff", { session_id: "ses-x" });
+    expect((diff.data!.changes as Array<{ record_id: string }>).map((c) => c.record_id)).toEqual(["m_lost"]);
+    expect(store.queryMemoryEvents({ record_id: "m_foreign" })).toHaveLength(0);
+  });
+
+  it("status reports outbox availability, and diff/inbox flag a degraded ledger", async () => {
+    const ok = await call("/v3/memory/ledger/status", {});
+    expect(ok.data).toMatchObject({ supported: true, jsonl_outbox: true, health: { degraded: false } });
+    expect((await call("/v3/memory/diff", { session_id: "ses-x" })).data!.ledger).toBeUndefined();
+
+    const realAppend = store.appendMemoryEvent.bind(store);
+    store.appendMemoryEvent = () => { throw new Error("disk full"); };
+    await writeMemory({ sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1", baseDir: dir, vectorStore: store, storage, memory: memory("salary 7000"), decision: decision("m_c", "store") });
+    store.appendMemoryEvent = realAppend;
+
+    const status = await call("/v3/memory/ledger/status", {});
+    expect(status.data).toMatchObject({ health: { degraded: true, store_failures: 1 } });
+    expect((await call("/v3/memory/diff", { session_id: "ses-x" })).data!.ledger).toMatchObject({ degraded: true, store_failures: 1 });
+    expect((await call("/v3/memory/review/inbox", {})).data!.ledger).toMatchObject({ degraded: true });
+    expect(status.data).toMatchObject({ health: { pending_store_events: 1 } });
+
+    await call("/v3/memory/ledger/backfill", {});
+    const healed = await call("/v3/memory/ledger/status", {});
+    expect(healed.data).toMatchObject({ health: { degraded: false, pending_store_events: 0, store_failures: 1 } });
+    expect((await call("/v3/memory/diff", { session_id: "ses-x" })).data!.ledger).toBeUndefined();
+  });
+});
+
+describe("conversation/add idempotency", () => {
+  let dir: string;
+  let store: VectorStore;
+  let notified = 0;
+
+  const call = async (body: unknown, headers: Record<string, string> = {}) => {
+    let captured: { status: number; body: { data?: { accepted_ids: string[] } } } | null = null;
+    const req = { headers: { ...ISO_HEADERS, ...headers }, method: "POST", url: "/v3/conversation/add" } as http.IncomingMessage;
+    const deps = {
+      deployMode: "service",
+      getStore: () => store,
+      getEmbedding: () => undefined,
+      getStorage: () => undefined,
+      notifyPipeline: async () => { notified++; },
+      logger: { info() {}, debug() {}, warn() {}, error() {} },
+    } as unknown as Parameters<typeof handleV2Route>[6];
+    await handleV2Route(req, {} as http.ServerResponse, "/v3/conversation/add", "POST", async <T>() => body as T,
+      (_r, status, b) => { captured = { status, body: b as NonNullable<typeof captured>["body"] }; }, deps);
+    const cap = captured as ({ status: number; body: { data?: { accepted_ids: string[] } } } | null);
+    return cap?.body?.data?.accepted_ids ?? [];
+  };
+  const msgs = [{ role: "user", content: "hello" }, { role: "assistant", content: "hi" }];
+  const countL0 = () => store.queryL0ForL1("ses-x").length;
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "conv-idem-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    notified = 0;
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("same Idempotency-Key header replays the first result without side effects", async () => {
+    const key = `k-${Math.random()}`;
+    const a = await call({ session_id: "ses-x", messages: msgs }, { "idempotency-key": key });
+    const b = await call({ session_id: "ses-x", messages: msgs }, { "idempotency-key": key });
+    expect(a).toHaveLength(2);
+    expect(b).toEqual(a);
+    expect(notified).toBe(1);
+    expect(countL0()).toBe(2);
+  });
+
+  it("body idempotency_key derives deterministic ids; no key keeps random ids", async () => {
+    const key = `k-${Math.random()}`;
+    const a = await call({ session_id: "ses-x", messages: msgs, idempotency_key: key });
+    expect(a.every((id) => /^msg-[0-9a-f]{32}$/.test(id))).toBe(true);
+    const c = await call({ session_id: "ses-x", messages: msgs });
+    const d = await call({ session_id: "ses-x", messages: msgs });
+    expect(c[0] === d[0]).toBe(false);
+    expect(countL0()).toBe(6);
   });
 });

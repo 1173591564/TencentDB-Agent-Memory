@@ -27,6 +27,7 @@ import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import { appendRevertTombstone, type MemoryRecord } from "../core/record/l1-writer.js";
+import { appendLedgerEvent, getLedgerHealth, replayLedgerEvents } from "../core/record/event-ledger.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
 // ── Zod schemas (validated types + defaults) ──
@@ -52,6 +53,8 @@ import {
   memoryDiffRevertRequestSchema,
   memoryHistoryRequestSchema,
   memoryReviewInboxRequestSchema,
+  memoryLedgerStatusRequestSchema,
+  memoryLedgerBackfillRequestSchema,
   teamCreateRequestSchema,
   teamGetRequestSchema,
   teamUpdateRequestSchema,
@@ -177,6 +180,8 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/memory/diff/revert",
   "/memory/history",
   "/memory/review/inbox",
+  "/memory/ledger/status",
+  "/memory/ledger/backfill",
 ]);
 
 /**
@@ -203,6 +208,7 @@ async function recordAudit(
     version: number;
     requestId: string;
     logger?: { warn?: (msg: string) => void };
+    storage?: StorageAdapter;
   },
 ): Promise<void> {
   if (store?.appendAudit) {
@@ -226,9 +232,9 @@ async function recordAudit(
       );
     }
   }
-  if (store?.appendMemoryEvent) {
+  if (store?.appendMemoryEvent || args.storage) {
     try {
-      await store.appendMemoryEvent({
+      await appendLedgerEvent({ store, storage: args.storage, logger: { warn: (m: string) => args.logger?.warn?.(m) }, event: {
         event_ts: new Date().toISOString(),
         // 管理面 mutation 无 session 语义，session 维度留空。
         session_key: "",
@@ -244,7 +250,7 @@ async function recordAudit(
         layer: args.layer.toLowerCase() as "l1" | "l2" | "l3",
         source: "api_mutation",
         request_id: args.requestId,
-      });
+      } });
     } catch (err) {
       args.logger?.warn?.(
         `${TAG} memory event mirror failed (${args.layer}/${args.action} record=${args.record_id}): ${err instanceof Error ? err.message : String(err)}`,
@@ -347,6 +353,8 @@ export interface V2RouterDeps {
   requestIsolation?: { teamId?: string; userId: string; agentId: string; sessionId: string; taskId?: string };
   /** When isolation could not be resolved AND legacy_compat_mode is off, the missing fields. */
   requestIsolationMissing?: string[];
+  /** `Idempotency-Key` request header of the current request (set by dispatch). */
+  requestIdempotencyKey?: string;
 }
 
 // ============================
@@ -471,6 +479,8 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/memory/diff/revert": handleMemoryDiffRevert,
   "/memory/history": handleMemoryHistory,
   "/memory/review/inbox": handleMemoryReviewInbox,
+  "/memory/ledger/status": handleMemoryLedgerStatus,
+  "/memory/ledger/backfill": handleMemoryLedgerBackfill,
 };
 
 const routeTable: Record<string, RouteHandler> = {
@@ -669,6 +679,7 @@ export async function handleV2Route(
       // requestIsolationMissing is only set when the caller explicitly needs to reject incomplete
       // isolation (e.g. /v3 strict mode), which is handled separately above via collectV3Missing.
       requestIsolationMissing: undefined,
+      requestIdempotencyKey: headerIdempotencyKey(req),
     };
 
     const handlerStart = Date.now();
@@ -703,10 +714,47 @@ export async function handleV2Route(
 // L0 Conversation Handlers
 // ============================
 
+function headerIdempotencyKey(req: http.IncomingMessage): string | undefined {
+  const raw = req.headers["idempotency-key"];
+  const v = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+  return v ? v.slice(0, 256) : undefined;
+}
+
+/**
+ * conversation/add 幂等：同一 (service, 租户三元组, session, key) 的重试
+ * 在进程内直接返回首次结果，跳过 quota / 写入 / pipeline 通知等副作用。
+ * 跨实例或进程重启后缓存失效，此时靠确定性 L0 id + upsert 保证 L0 不重复，
+ * 但 pipeline 通知与 quota 上报可能再发生一次。
+ */
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const IDEMPOTENCY_MAX_ENTRIES = 10_000;
+const conversationAddIdempotency = new Map<string, { at: number; data: ConversationAddData }>();
+
+function idempotencyLookup(key: string): ConversationAddData | undefined {
+  const hit = conversationAddIdempotency.get(key);
+  if (!hit) return undefined;
+  if (Date.now() - hit.at > IDEMPOTENCY_TTL_MS) {
+    conversationAddIdempotency.delete(key);
+    return undefined;
+  }
+  return hit.data;
+}
+
+function idempotencyRemember(key: string, data: ConversationAddData): void {
+  conversationAddIdempotency.delete(key);
+  conversationAddIdempotency.set(key, { at: Date.now(), data });
+  while (conversationAddIdempotency.size > IDEMPOTENCY_MAX_ENTRIES) {
+    const oldest = conversationAddIdempotency.keys().next().value;
+    if (oldest === undefined) break;
+    conversationAddIdempotency.delete(oldest);
+  }
+}
+
 async function handleConversationAdd(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = conversationAddRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
   const { session_id, messages } = parsed.data;
+  const idempotencyKey = parsed.data.idempotency_key ?? deps.requestIdempotencyKey;
 
   // Enforce three-dim isolation. user_id / agent_id come from request body
   // or x-tdai-* headers (resolved in dispatchV2Request).  When the gateway's
@@ -724,6 +772,16 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
 
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
+
+  const idempotencyScope = idempotencyKey
+    ? createHash("sha256")
+      .update(JSON.stringify([auth.serviceId, iso?.teamId ?? "", iso?.userId ?? "", iso?.agentId ?? "", session_id, idempotencyKey]))
+      .digest("hex")
+    : undefined;
+  if (idempotencyScope) {
+    const cached = idempotencyLookup(idempotencyScope);
+    if (cached) return successEnvelope<ConversationAddData>(cached, requestId);
+  }
 
   // Quota check: memory limit
   if (deps.quotaManager) {
@@ -761,7 +819,11 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     // Full UUID (hyphens stripped, 32 hex) — do NOT truncate. At ~1e8 messages
     // a 12-hex (48-bit) id collides ~18 times by the birthday bound, and an
     // upsert-based write would silently overwrite the colliding message.
-    const id = `msg-${randomUUID().replace(/-/g, "")}`;
+    // With an idempotency key the id is derived from (scope, index) so a
+    // retry that misses the in-process cache upserts the same rows.
+    const id = idempotencyScope
+      ? `msg-${createHash("sha256").update(`${idempotencyScope}:${index}`).digest("hex").slice(0, 32)}`
+      : `msg-${randomUUID().replace(/-/g, "")}`;
     const ingestRecordedAtMs = ingestBaseMs + index;
     const recordedAtMs = msg.recorded_at
       ? new Date(msg.recorded_at).getTime()
@@ -788,7 +850,7 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   // single batch insert when the store supports it AND no per-message embedding
   // is required (keyword-only backends, e.g. Mongo). Otherwise fall back to the
   // per-record upsert loop (sqlite/tcvdb, incl. vector embedding).
-  if (store.insertL0Batch && !embedding) {
+  if (store.insertL0Batch && !embedding && !idempotencyScope) {
     await store.insertL0Batch(acceptedRecords);
   } else {
     for (const record of acceptedRecords) {
@@ -857,10 +919,11 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
     deps.quotaManager.reportMemoryAdded(auth.serviceId, acceptedIds.length).catch(() => {});
   }
 
-  return successEnvelope<ConversationAddData>(
-    { accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length },
-    requestId,
-  );
+  const data: ConversationAddData = {
+    accepted_ids: acceptedIds, accepted_versions: acceptedIds.map(() => "v1"), total_count: acceptedIds.length,
+  };
+  if (idempotencyScope) idempotencyRemember(idempotencyScope, data);
+  return successEnvelope<ConversationAddData>(data, requestId);
 }
 
 async function handleConversationQuery(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1159,6 +1222,7 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
     version: updatedVersion,
     requestId,
     logger: deps.logger,
+    storage: deps.getStorage(),
   });
 
   return successEnvelope<AtomicUpdateData>({ id, version: `v${updatedVersion}`, updated_at: now }, requestId);
@@ -1241,6 +1305,69 @@ async function handleAtomicCount(body: unknown, _auth: V2AuthContext, requestId:
     taskId: iso?.taskId,
   });
   return successEnvelope<CountData>({ total }, requestId);
+}
+
+/**
+ * 审阅面的变更账降级提示：本进程出现过事件追加失败时附带 `ledger`，
+ * 提醒审阅者 diff/inbox 可能不完整（可经 /memory/ledger/backfill 补齐）。
+ */
+function ledgerStatusField(store: IMemoryStore): { ledger?: { degraded: true; store_failures: number; jsonl_failures: number; pending_store_events: number; last_failure_at?: string } } {
+  const h = getLedgerHealth(store);
+  if (!h.degraded) return {};
+  return {
+    ledger: {
+      degraded: true,
+      store_failures: h.store_failures,
+      jsonl_failures: h.jsonl_failures,
+      pending_store_events: h.pending_store_events,
+      ...(h.last_failure_at ? { last_failure_at: h.last_failure_at } : {}),
+    },
+  };
+}
+
+/**
+ * POST /memory/ledger/status — 变更账健康度：outbox 是否可用 + 本进程追加失败计数。
+ */
+async function handleMemoryLedgerStatus(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = memoryLedgerStatusRequestSchema.safeParse(body ?? {});
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  const store = deps.getStore();
+  if (!store) return errorEnvelope(503, "Store not available", requestId);
+  const h = getLedgerHealth(store);
+  return successEnvelope({
+    supported: Boolean(store.appendMemoryEvent && store.queryMemoryEvents),
+    jsonl_outbox: Boolean(deps.getStorage()),
+    health: h,
+  }, requestId);
+}
+
+/**
+ * POST /memory/ledger/backfill — 从 events/*.jsonl outbox 回放事件到 store。
+ * 幂等（event_id 去重），store 故障恢复、节点重建、后端迁移后执行。
+ * 回放范围限定在请求 isolation 的 team/agent。
+ */
+async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = memoryLedgerBackfillRequestSchema.safeParse(body ?? {});
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  const store = deps.getStore();
+  if (!store) return errorEnvelope(503, "Store not available", requestId);
+  if (!store.appendMemoryEvent) {
+    return errorEnvelope(501, "Memory events not supported by this store backend", requestId);
+  }
+  const storage = deps.getStorage();
+  if (!storage) return errorEnvelope(503, "Storage not available", requestId);
+  const iso = deps.requestIsolation;
+  const result = await replayLedgerEvents({
+    store,
+    storage,
+    ...(parsed.data.since ? { since: parsed.data.since } : {}),
+    scope: {
+      ...(iso?.teamId ? { team_id: iso.teamId } : {}),
+      ...(iso?.agentId ? { agent_id: iso.agentId } : {}),
+    },
+    logger: deps.logger,
+  });
+  return successEnvelope(result, requestId);
 }
 
 /**
@@ -1383,6 +1510,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     count: changes.length,
     has_more: hasMore,
     next_offset: offset + events.length,
+    ...ledgerStatusField(store),
   }, requestId);
 }
 
@@ -1410,6 +1538,7 @@ interface RevertStore {
   queryMemoryEvents: NonNullable<IMemoryStore["queryMemoryEvents"]>;
   appendMemoryEvent: NonNullable<IMemoryStore["appendMemoryEvent"]>;
   deleteL1: IMemoryStore["deleteL1"];
+  queryL1Records: IMemoryStore["queryL1Records"];
   upsertL1: IMemoryStore["upsertL1"];
 }
 
@@ -1601,8 +1730,8 @@ async function revertOneL1Record(
   // 追加 reverted 事件：record_id=被撤销的新 record，supersedes=恢复的旧 id 列表。
   // session 归属用 lastWrite 的原 session——撤销是"对那次变更的驳回"，
   // 必须出现在被变更 session 的 diff 里；审核者的 session 不是这条事件的归属。
-  try {
-    await store.appendMemoryEvent({
+  {
+    const { store: ledgerOk } = await appendLedgerEvent({ store, storage: deps.getStorage(), logger: deps.logger, event: {
       event_ts: new Date().toISOString(),
       session_key: lastWrite.session_key,
       session_id: lastWrite.session_id,
@@ -1620,9 +1749,8 @@ async function revertOneL1Record(
       // 但"谁驳回的"要可查。
       reviewer_id: iso?.userId,
       source: "review",
-    });
-  } catch (err) {
-    deps.logger.warn(`${TAG} reverted event append failed (non-fatal) for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+    } });
+    if (!ledgerOk) deps.logger.warn(`${TAG} reverted event append failed (non-fatal) for ${recordId}`);
   }
 
   // JSONL 墓碑：revert 只删了向量侧，而 JSONL 是声明的备份/恢复 source of
@@ -1830,7 +1958,7 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
   }
 
   const sessions = [...bySession.values()].sort((a, b) => b.last_event_ts.localeCompare(a.last_event_ts));
-  return successEnvelope({ sessions, truncated, scanned: events.length + adminEvents.length }, requestId);
+  return successEnvelope({ sessions, truncated, scanned: events.length + adminEvents.length, ...ledgerStatusField(store) }, requestId);
 }
 
 async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1962,6 +2090,7 @@ async function handleAtomicDelete(body: unknown, auth: V2AuthContext, requestId:
       version: 0, // 已删除，无新版本
       requestId,
       logger: deps.logger,
+    storage: deps.getStorage(),
     });
   }
 
@@ -2614,6 +2743,7 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
     version,
     requestId,
     logger: deps.logger,
+    storage: deps.getStorage(),
   });
 
   return successEnvelope<ScenarioWriteData>({
@@ -2663,6 +2793,7 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
       version: 0,
       requestId,
       logger: deps.logger,
+    storage: deps.getStorage(),
     });
   }
 
@@ -2759,6 +2890,7 @@ async function handleCoreWrite(body: unknown, _auth: V2AuthContext, requestId: s
     version,
     requestId,
     logger: deps.logger,
+    storage: deps.getStorage(),
   });
 
   return successEnvelope<CoreWriteData>({

@@ -8,6 +8,15 @@ import { getPanelSession } from '../panelSession';
 import { request, ApiError } from './base';
 import type { MetaEnvelope } from './types';
 
+/** 变更账降级提示：内核进程出现过事件追加失败，diff/inbox 可能不完整。 */
+export interface MemoryLedgerDegraded {
+  degraded: true;
+  store_failures: number;
+  jsonl_failures: number;
+  pending_store_events: number;
+  last_failure_at?: string;
+}
+
 /** diff 里单条变更。replaced 是被 superseded 的旧记录快照。 */
 export interface MemoryDiffChange {
   op: 'created' | 'updated' | 'merged' | 'superseded' | 'reverted' | 'deleted';
@@ -43,6 +52,7 @@ export interface MemoryDiffData {
   has_more: boolean;
   /** 下一页应传的 offset（事件偏移）。 */
   next_offset: number;
+  ledger?: MemoryLedgerDegraded;
 }
 
 export interface MemoryRevertData {
@@ -112,6 +122,7 @@ export interface MemoryReviewInboxData {
   /** 扫描到事件上限——还有更早的变更未聚合，收窄时间窗再查。 */
   truncated: boolean;
   scanned: number;
+  ledger?: MemoryLedgerDegraded;
 }
 
 const PREFIX = '/api/v1/memory';

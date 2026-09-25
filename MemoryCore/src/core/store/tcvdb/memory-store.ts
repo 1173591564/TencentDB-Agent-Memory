@@ -8,10 +8,10 @@
  * - Filter expressions for scalar field queries
  * - Time fields stored as uint64 epoch ms (ISO ↔ epoch conversion internal)
  *
- * All methods are fault-tolerant: return empty/false on error, never throw.
+ * All methods are fault-tolerant: return empty/false on error, never throw —
+ * except appendMemoryEvent, which rethrows after logging so the ledger writer
+ * can count the failure and leave the event for outbox backfill.
  */
-
-import { randomUUID } from "node:crypto";
 
 import type { MemoryRecord } from "../../record/l1-writer.js";
 import type { EmbeddingProviderInfo } from "../embedding.js";
@@ -52,6 +52,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID } from "../types.js";
 import { TcvdbClient, TcvdbApiError } from "./client.js";
+import { newMemoryEventId } from "../memory-event-id.js";
 import type { BM25LocalEncoder } from "../bm25-local.js";
 import type { SparseVector } from "@tencentdb-agent-memory/tcvdb-text";
 import type {
@@ -171,7 +172,7 @@ const MEMORY_EVENTS_OUTPUT_FIELDS = [
   "team_id", "agent_id", "user_id", "task_id",
   "op", "record_id", "content", "memory_type", "version",
   "supersedes", "superseded_by", "snapshot_json", "reviewer_id",
-  "layer", "source", "request_id",
+  "layer", "source", "request_id", "event_id",
 ];
 
 // ============================
@@ -2579,19 +2580,16 @@ export class TcvdbMemoryStore implements IMemoryStore {
     await this._ensureInit();
     if (this.degraded) return;
 
-    // id = 元组前缀 + 每次 append 一个 randomUUID 后缀。
-    // 元组前缀保留可读性与 queryMemoryEvents 里 id tiebreak 的分组语义；
-    // uuid 后缀必需——TCVDB upsert 对相同 id 是整体替换：两条 (ts, record_id,
-    // op, layer) 相同但内容不同的事件（同毫秒同记录的两次 updated 镜像、
-    // 并发 append）在纯元组键下会互相覆盖、静默丢一条。
-    // uuid 在 upsert 前生成：客户端对同一请求体的内部重试复用同一 doc →
-    // 请求内幂等；跨 append 调用的去重是另一层契约，append-only 语义下
-    // 重复可见、丢失不可见，宁可重复。
-    const id = `${event.event_ts}__${event.record_id}__${event.op}__${event.layer ?? "l1"}__${randomUUID()}`;
+    // id = event_id：写入点生成的稳定身份（36 字符，远低于 TCVDB 文档 id
+    // 上限 128）。不能拼 record_id 等业务字段——管理面 asset_id 之类的长
+    // record_id 会把 id 撑过上限、upsert 被拒、事件静默丢失。upsert 对同 id
+    // 整体替换，正好让同一事件的重放/重试幂等，而不同事件 id 必不相同。
+    const id = event.event_id || newMemoryEventId();
     // dim=1 占位向量（events 不需向量检索，仅用 filter 查询）
     const doc: Record<string, unknown> = {
       id,
       vector: [0],
+      event_id: id,
       event_ts: event.event_ts,
       session_key: event.session_key,
       session_id: event.session_id,
@@ -2621,6 +2619,9 @@ export class TcvdbMemoryStore implements IMemoryStore {
       this.logger?.warn?.(
         `${TAG} [events-append] FAILED record_id=${event.record_id} op=${event.op}: ${err instanceof Error ? err.message : String(err)}`,
       );
+      // Surface to the ledger writer so the failure is counted (degraded
+      // status) and left for outbox backfill.
+      throw err;
     }
   }
 
@@ -2673,6 +2674,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         let supersedes: string[] = [];
         try { supersedes = JSON.parse(String(doc.supersedes ?? "[]")) as string[]; } catch { /* keep [] */ }
         return {
+          event_id: String(doc.event_id ?? "") || String(doc.id ?? "") || undefined,
           event_ts: String(doc.event_ts ?? ""),
           session_key: String(doc.session_key ?? ""),
           session_id: String(doc.session_id ?? ""),

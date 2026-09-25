@@ -158,6 +158,7 @@ export function MemoryReviewPage() {
   const [historyLoadingId, setHistoryLoadingId] = useState<string | null>(null);
   const [inbox, setInbox] = useState<MemoryReviewInboxSession[] | null>(null);
   const [inboxTruncated, setInboxTruncated] = useState(false);
+  const [ledgerDegraded, setLedgerDegraded] = useState<{ store_failures: number; jsonl_failures: number; pending_store_events: number; last_failure_at?: string } | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
 
   const teamOptions = useMemo(() => (teams ?? []).map((tm) => ({ value: tm.team_id, text: tm.name ?? tm.team_id })), [teams]);
@@ -196,6 +197,7 @@ export function MemoryReviewPage() {
       setChanges((prev) => (offset === 0 ? page : [...prev, ...page]));
       setHasMore(data.has_more ?? false);
       setNextOffset(data.next_offset ?? offset + page.length);
+      setLedgerDegraded(data.ledger ?? null);
       setQueried(true);
       if (offset === 0) {
         setSelected(new Set());
@@ -222,6 +224,7 @@ export function MemoryReviewPage() {
       });
       setInbox(data.sessions ?? []);
       setInboxTruncated(data.truncated ?? false);
+      setLedgerDegraded(data.ledger ?? null);
     } catch (err) {
       tea.notification.error(t('memoryReview.inboxFailed', '加载收件箱失败'), err instanceof Error ? err.message : String(err));
     } finally {
@@ -403,6 +406,17 @@ export function MemoryReviewPage() {
             </div>
           </Card.Body>
         </Card>
+
+        {ledgerDegraded ? (
+          <div style={{ marginTop: 16, padding: '8px 12px', fontSize: 12, color: '#a60', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 4 }}>
+            {t(
+              'memoryReview.ledgerDegraded',
+              '变更账降级：内核有 {{pending}} 条事件尚未写入存储，以下变更可能不完整——可调用 /v3/memory/ledger/backfill 从 outbox 补齐（补齐后提示自动消失）',
+              { pending: ledgerDegraded.pending_store_events },
+            )}
+            {ledgerDegraded.last_failure_at ? `（${ledgerDegraded.last_failure_at}）` : null}
+          </div>
+        ) : null}
 
         {!sessionId.trim() ? (
           <Card style={{ marginTop: 16 }}>

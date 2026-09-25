@@ -21,6 +21,7 @@ import { DEFAULT_ISOLATION_ID, type IMemoryStore } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
+import { appendLedgerEvent } from "./event-ledger.js";
 import type { Logger } from "../types.js";
 
 // ============================
@@ -460,7 +461,7 @@ export async function writeMemory(params: {
   // only restore path (superseded snapshots). Only the supersede-delete
   // outcome gates the supersession claims: when it failed nothing was
   // actually replaced, so the write is recorded as `created`.
-  if (vectorStore?.appendMemoryEvent) {
+  if (vectorStore?.appendMemoryEvent || storage) {
     try {
       const base = {
         event_ts: now,
@@ -478,7 +479,7 @@ export async function writeMemory(params: {
             `recording the write as 'created' (no superseded/supersedes events — nothing was actually replaced)`,
           );
         }
-        await vectorStore.appendMemoryEvent({
+        await appendLedgerEvent({ store: vectorStore, storage, logger, event: {
           ...base,
           op: "created",
           record_id: record.id,
@@ -486,10 +487,10 @@ export async function writeMemory(params: {
           memory_type: record.type,
           version: record.version ?? 0,
           source: "extraction",
-        });
+        } });
       } else {
         for (const old of supersededTargets) {
-          await vectorStore.appendMemoryEvent({
+          await appendLedgerEvent({ store: vectorStore, storage, logger, event: {
             ...base,
             origin_session_id: old.session_id || undefined,
             origin_session_key: old.session_key || undefined,
@@ -502,9 +503,9 @@ export async function writeMemory(params: {
             // 完整旧记录快照：revert 时按它重建（content/type/version 不够恢复）。
             snapshot_json: JSON.stringify(old),
             source: "extraction",
-          });
+          } });
         }
-        await vectorStore.appendMemoryEvent({
+        await appendLedgerEvent({ store: vectorStore, storage, logger, event: {
           ...base,
           op: decision.action === "merge" ? "merged" : "updated",
           record_id: record.id,
@@ -513,7 +514,7 @@ export async function writeMemory(params: {
           version: record.version ?? 0,
           supersedes: decision.target_ids,
           source: "extraction",
-        });
+        } });
       }
     } catch (err) {
       logger?.warn?.(

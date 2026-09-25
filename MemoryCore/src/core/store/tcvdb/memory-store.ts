@@ -666,6 +666,9 @@ export class TcvdbMemoryStore implements IMemoryStore {
     sort?: Array<Record<string, unknown>>,
   ): Promise<Array<Record<string, unknown>>> {
     const allDocs: Array<Record<string, unknown>> = [];
+    // VDB resolves sort ties arbitrarily per request — a tie spanning an
+    // internal page boundary can return the same doc twice. Dedupe by doc id.
+    const seenIds = new Set<string>();
     let offset = 0;
     const pageSize = limit && limit < QUERY_PAGE_SIZE ? limit : QUERY_PAGE_SIZE;
 
@@ -682,7 +685,12 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
       const resp = await this.client.query(collection, queryParams);
       const docs = resp.documents ?? [];
-      allDocs.push(...docs);
+      for (const d of docs) {
+        const id = String(d.id ?? "");
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        allDocs.push(d);
+      }
 
       // Stop if: we got fewer than page size (last page), or we hit caller's limit
       if (docs.length < pageSize) break;

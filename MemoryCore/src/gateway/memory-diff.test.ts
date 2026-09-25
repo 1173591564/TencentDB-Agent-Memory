@@ -19,7 +19,7 @@ import { writeMemory, type DedupDecision, type ExtractedMemory } from "../core/r
 import { handleV2Route } from "./v2-router.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 import { createLocalStorageBackend } from "../core/storage/factory.js";
-import { appendLedgerEvent } from "../core/record/event-ledger.js";
+import { appendLedgerEvent, redactLedgerEvents, replayLedgerEvents } from "../core/record/event-ledger.js";
 
 const memory = (content: string): ExtractedMemory => ({
   content, type: "work_fact", priority: 50,
@@ -317,7 +317,7 @@ describe("POST /memory/diff/revert", () => {
     expect(tip.data).toMatchObject({ record_id: "m_c", reverted: true, restored: ["m_b"] });
   });
 
-  it("api_mutation mirror events do not hijack the revert lastWrite", async () => {
+  it("a manual edit after extraction blocks the revert unless force is passed", async () => {
     // 模拟管理面镜像事件落在提取写入之后：它无 supersedes/快照/session，
     // 若被当作 lastWrite，revert 会恢复 0 条且 reverted 事件挂空 session。
     store.appendMemoryEvent({
@@ -326,7 +326,9 @@ describe("POST /memory/diff/revert", () => {
       op: "updated", record_id: "m_b", content: "", version: 0,
       layer: "l1", source: "api_mutation",
     });
-    const { status, data } = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    const blocked = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(blocked.status).toBe(409);
+    const { status, data } = await call("/v3/memory/diff/revert", { record_id: "m_b", force: true });
     expect(status).toBe(200);
     expect(data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
     const reverted = store.queryMemoryEvents({ record_id: "m_b", op: "reverted" });
@@ -364,6 +366,89 @@ describe("POST /memory/diff/revert", () => {
     const retry = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     expect(retry.status).toBe(200);
     expect(retry.data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
+  });
+
+  it("clear of the agent after the write blocks the revert (no resurrection of cleared data)", async () => {
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "t1", agent_id: "a1", op: "deleted", record_id: "asset-1", content: "",
+      version: 0, layer: "l1", source: "api_mutation", scope: "agent", until: new Date().toISOString(),
+    });
+    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(status).toBe(409);
+    expect((await store.queryL1Records({ recordIds: ["m_a"] }))).toHaveLength(0);
+  });
+
+  it("a record removed by TTL (row gone) cannot be reverted", async () => {
+    await store.deleteL1("m_b");
+    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(status).toBe(409);
+    expect((await store.queryL1Records({ recordIds: ["m_a"] }))).toHaveLength(0);
+  });
+
+  it("forked lineage: restoring m_a is refused while a concurrent successor m_c is live", async () => {
+    // Two sessions both superseded m_a (m_b from beforeEach, m_c here via a synthetic event).
+    await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("salary 8000"), decision: decision("m_c", "store") });
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-z",
+      team_id: "t1", user_id: "u1", agent_id: "a1",
+      op: "superseded", record_id: "m_a", content: "salary 5000", version: 0,
+      superseded_by: "m_c", snapshot_json: "",
+    });
+    const { status, data } = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(status).toBe(409);
+    expect(data).toBeUndefined();
+    expect((await store.queryL1Records({ recordIds: ["m_a"] }))).toHaveLength(0);
+  });
+
+  it("store query failure fails closed with 503 and changes nothing", async () => {
+    const real = store;
+    store = new Proxy(real, {
+      get(t, p) {
+        if (p === "queryL1Records") return async () => { throw new Error("vdb down"); };
+        const v = Reflect.get(t, p);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    }) as VectorStore;
+    const r = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    store = real;
+    expect(r.status).toBe(503);
+    expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })).toHaveLength(0);
+  });
+
+  it("management update carries a pre-edit snapshot and can be reverted layer by layer", async () => {
+    const up = await call("/v3/atomic/update", { id: "m_b", content: "salary 6500 (manual)" });
+    expect(up.status).toBe(200);
+    const manual = store.queryMemoryEvents({ record_id: "m_b", source: "api_mutation", op: "updated" });
+    expect(manual).toHaveLength(1);
+    expect(JSON.parse(manual[0].snapshot_json!).content).toBe("salary 6000");
+    expect(manual[0].content).toBe("salary 6500 (manual)");
+
+    expect((await call("/v3/memory/diff/revert", { record_id: "m_b" })).status).toBe(409);
+    const undoEdit = await call("/v3/memory/diff/revert", { record_id: "m_b", event_id: manual[0].event_id });
+    expect(undoEdit.status).toBe(200);
+    expect((await store.queryL1Records({ recordIds: ["m_b"] }))[0].content).toBe("salary 6000");
+
+    const undoExtraction = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(undoExtraction.status).toBe(200);
+    expect((await store.queryL1Records({ recordIds: ["m_a", "m_b"] })).map((r) => r.record_id)).toEqual(["m_a"]);
+  });
+
+  it("reviewer identity comes from the x-tdai-reviewer-id header, never the body", async () => {
+    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b", reviewer_id: "forged" }, { ...ISO_HEADERS, "x-tdai-reviewer-id": "panel-op" });
+    expect(status).toBe(200);
+    expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })[0].reviewer_id).toBe("panel-op");
+  });
+
+  it("a pending reverted marker blocks a second revert until backfill", async () => {
+    const realAppend = store.appendMemoryEvent.bind(store);
+    store.appendMemoryEvent = () => { throw new Error("disk full"); };
+    const first = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    store.appendMemoryEvent = realAppend;
+    expect(first.status).toBe(200);
+    expect(first.data).toMatchObject({ ledger_pending: true });
+    const second = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(second.status).toBe(503);
   });
 
   it("mid-chain guard walks by row existence — a dead chain tail does not block", async () => {
@@ -644,10 +729,13 @@ describe("mutation → memory_events mirror (unified change ledger)", () => {
   });
 });
 
+const SINCE = "2000-01-01T00:00:00.000Z";
+
 describe("change-ledger outbox endpoints", () => {
   let dir: string;
   let store: VectorStore;
   let storage: StorageAdapter;
+  let backfillEnabled = true;
   let captured: { status: number; body: { code: number; data?: Record<string, unknown> } } | null;
 
   const call = async (pathname: string, body: unknown) => {
@@ -662,6 +750,7 @@ describe("change-ledger outbox endpoints", () => {
       getStore: () => store,
       getEmbedding: () => undefined,
       getStorage: () => storage,
+      ledgerBackfillEnabled: backfillEnabled,
       logger: { info() {}, debug() {}, warn() {}, error() {} },
     } as unknown as Parameters<typeof handleV2Route>[6];
     await handleV2Route(req, res, pathname, "POST", async <T>() => body as T, sendJson, deps);
@@ -671,6 +760,7 @@ describe("change-ledger outbox endpoints", () => {
 
   beforeEach(() => {
     dir = mkdtempSync(path.join(tmpdir(), "mem-ledger-"));
+    backfillEnabled = true;
     store = new VectorStore(path.join(dir, "vectors.db"), 0);
     store.init();
     storage = new StorageAdapter(createLocalStorageBackend(path.join(dir, "data")));
@@ -704,14 +794,51 @@ describe("change-ledger outbox endpoints", () => {
     } });
     expect((await call("/v3/memory/diff", { session_id: "ses-x" })).data!.changes).toEqual([]);
 
-    const first = await call("/v3/memory/ledger/backfill", {});
+    const first = await call("/v3/memory/ledger/backfill", { since: SINCE });
     expect(first.status).toBe(200);
     expect(first.data).toMatchObject({ replayed: 1, skipped: 1, failed: 0 });
-    await call("/v3/memory/ledger/backfill", {});
+    await call("/v3/memory/ledger/backfill", { since: SINCE });
 
     const diff = await call("/v3/memory/diff", { session_id: "ses-x" });
     expect((diff.data!.changes as Array<{ record_id: string }>).map((c) => c.record_id)).toEqual(["m_lost"]);
     expect(store.queryMemoryEvents({ record_id: "m_foreign" })).toHaveLength(0);
+  });
+
+  it("backfill is off unless enabled, and requires since", async () => {
+    backfillEnabled = false;
+    expect((await call("/v3/memory/ledger/backfill", { since: SINCE })).status).toBe(403);
+    backfillEnabled = true;
+    expect((await call("/v3/memory/ledger/backfill", {})).status).toBe(400);
+  });
+
+  it("ledger health is per tenant and never leaks raw backend errors", async () => {
+    const realAppend = store.appendMemoryEvent.bind(store);
+    store.appendMemoryEvent = () => { throw new Error("secret-dsn://user:pw@host"); };
+    await appendLedgerEvent({ store, storage, event: {
+      event_ts: new Date().toISOString(), session_key: "sk-z", session_id: "ses-z",
+      team_id: "t2", agent_id: "a1", op: "created", record_id: "m_t2", content: "t2",
+    } });
+    store.appendMemoryEvent = realAppend;
+    const mine = await call("/v3/memory/ledger/status", {});
+    expect(mine.data).toMatchObject({ health: { degraded: false, pending_store_events: 0, store_failures: 0 } });
+    expect(JSON.stringify(mine.data)).not.toContain("secret-dsn");
+  });
+
+  it("clear redacts content/snapshots in store and outbox; backfill does not restore it", async () => {
+    await writeMemory({ sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1", baseDir: dir, vectorStore: store, storage, memory: memory("salary 5000"), decision: decision("m_a", "store") });
+    const until = new Date(Date.now() + 1).toISOString();
+    await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until } });
+    expect(store.queryMemoryEvents({ record_id: "m_a" })[0].content).toBe("");
+    // rebuild a fresh store from the outbox: cleared content must stay cleared
+    const fresh = new VectorStore(path.join(dir, "fresh.db"), 0);
+    fresh.init();
+    const r = await replayLedgerEvents({ store: fresh, storage, since: SINCE });
+    expect(r.redacted).toBe(1);
+    const ev = fresh.queryMemoryEvents({ record_id: "m_a" });
+    expect(ev).toHaveLength(1);
+    expect(ev[0].content).toBe("");
+    expect(ev[0].op).toBe("created");
+    fresh.close();
   });
 
   it("status reports outbox availability, and diff/inbox flag a degraded ledger", async () => {
@@ -730,7 +857,7 @@ describe("change-ledger outbox endpoints", () => {
     expect((await call("/v3/memory/review/inbox", {})).data!.ledger).toMatchObject({ degraded: true });
     expect(status.data).toMatchObject({ health: { pending_store_events: 1 } });
 
-    await call("/v3/memory/ledger/backfill", {});
+    await call("/v3/memory/ledger/backfill", { since: SINCE });
     const healed = await call("/v3/memory/ledger/status", {});
     expect(healed.data).toMatchObject({ health: { degraded: false, pending_store_events: 0, store_failures: 1 } });
     expect((await call("/v3/memory/diff", { session_id: "ses-x" })).data!.ledger).toBeUndefined();

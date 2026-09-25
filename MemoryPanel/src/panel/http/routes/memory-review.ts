@@ -1,11 +1,17 @@
 /**
  * Memory Review 路由 —— 记忆变更集（session diff）的查询与撤销代理。
  *
- * 四个端点都是数据面透明代理，直接转发到内核 /v3/memory/*：
+ * 端点都是透明代理，直接转发到内核 /v3/memory/*：
  *   POST /api/v1/memory/diff         → POST /v3/memory/diff
  *   POST /api/v1/memory/diff/revert  → POST /v3/memory/diff/revert（含 record_ids[] 批量）
  *   POST /api/v1/memory/history      → POST /v3/memory/history（单条记录事件血统）
  *   POST /api/v1/memory/review/inbox → POST /v3/memory/review/inbox（跨 session 收件箱）
+ *   POST /api/v1/memory/ledger/status   → POST /v3/memory/ledger/status（变更账健康度）
+ *   POST /api/v1/memory/ledger/backfill → POST /v3/memory/ledger/backfill（运维：outbox 回放，
+ *        内核需开启 TDAI_LEDGER_BACKFILL_ENABLED，且 since 必填）
+ *
+ * 审阅者身份：revert 以 x-tdai-reviewer-id 透传 Panel 登录用户（panelMeta.userId），
+ * body 里的 reviewer_id 不被信任、不转发。
  *
  * body 原样透传（session_id / record_id / reason / team_id / user_id /
  * agent_id 由调用方提供，内核侧做 v3 严格隔离校验——缺三元组直接 422）。
@@ -24,6 +30,7 @@ function buildCtx(c: import('hono').Context): MetaCallContext {
     gatewayApiKey: panelMeta.gatewayApiKey,
     userKey: panelMeta.userKey,
     reqId: c.get('reqId'),
+    ...(panelMeta.userId ? { reviewerId: panelMeta.userId } : {}),
   };
 }
 
@@ -46,7 +53,7 @@ export function registerMemoryReviewRoutes(api: Hono, deps: PanelDeps): void {
 
   api.post('/memory/diff/revert', validatePanelMetaHeaders(deps), async (c) => {
     const ctx = buildCtx(c);
-    const body = await readJson(c);
+    const { reviewer_id: _untrusted, ...body } = await readJson(c);
     const cred = toKernelCredentials(ctx, { timeoutMs: 30_000 });
     const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/diff/revert', body, cred);
     return respondEnvelope(c, envelope);
@@ -65,6 +72,22 @@ export function registerMemoryReviewRoutes(api: Hono, deps: PanelDeps): void {
     const body = await readJson(c);
     const cred = toKernelCredentials(ctx, { timeoutMs: 15_000 });
     const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/review/inbox', body, cred);
+    return respondEnvelope(c, envelope);
+  });
+
+  api.post('/memory/ledger/status', validatePanelMetaHeaders(deps), async (c) => {
+    const ctx = buildCtx(c);
+    const body = await readJson(c);
+    const cred = toKernelCredentials(ctx, { timeoutMs: 15_000 });
+    const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/ledger/status', body, cred);
+    return respondEnvelope(c, envelope);
+  });
+
+  api.post('/memory/ledger/backfill', validatePanelMetaHeaders(deps), async (c) => {
+    const ctx = buildCtx(c);
+    const body = await readJson(c);
+    const cred = toKernelCredentials(ctx, { timeoutMs: 120_000 });
+    const envelope = await deps.kernelHttp.postEnvelope('/v3/memory/ledger/backfill', body, cred);
     return respondEnvelope(c, envelope);
   });
 }

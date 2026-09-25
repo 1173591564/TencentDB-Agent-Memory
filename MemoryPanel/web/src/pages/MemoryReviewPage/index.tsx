@@ -160,6 +160,7 @@ export function MemoryReviewPage() {
   const [inboxTruncated, setInboxTruncated] = useState(false);
   const [ledgerDegraded, setLedgerDegraded] = useState<{ store_failures: number; jsonl_failures: number; pending_store_events: number; last_failure_at?: string } | null>(null);
   const [inboxLoading, setInboxLoading] = useState(false);
+  const [backfilling, setBackfilling] = useState(false);
 
   const teamOptions = useMemo(() => (teams ?? []).map((tm) => ({ value: tm.team_id, text: tm.name ?? tm.team_id })), [teams]);
   const agentOptions = useMemo(() => (agents ?? []).map((a) => ({ value: a.agent_id, text: a.name ?? a.agent_id })), [agents]);
@@ -276,6 +277,25 @@ export function MemoryReviewPage() {
       tea.notification.error(t('memoryReview.historyFailed', '加载历史失败'), err instanceof Error ? err.message : String(err));
     } finally {
       setHistoryLoadingId(null);
+    }
+  };
+
+  const handleBackfill = async () => {
+    const since = sinceInput.trim();
+    if (!canInbox || !since) return;
+    setBackfilling(true);
+    try {
+      const res = await memoryReviewApi.ledgerBackfill({ team_id: teamId, agent_id: agentId, user_id: userId, since });
+      tea.notification.success(
+        t('memoryReview.backfillOk', '补齐完成'),
+        `replayed: ${res.replayed} · failed: ${res.failed} · redacted: ${res.redacted}`,
+      );
+      if (sessionId.trim()) await fetchDiff(0);
+      else await fetchInbox();
+    } catch (err) {
+      tea.notification.error(t('memoryReview.backfillFailed', '补齐失败'), err instanceof Error ? err.message : String(err));
+    } finally {
+      setBackfilling(false);
     }
   };
 
@@ -411,10 +431,19 @@ export function MemoryReviewPage() {
           <div style={{ marginTop: 16, padding: '8px 12px', fontSize: 12, color: '#a60', background: '#fff7e6', border: '1px solid #ffd591', borderRadius: 4 }}>
             {t(
               'memoryReview.ledgerDegraded',
-              '变更账降级：内核有 {{pending}} 条事件尚未写入存储，以下变更可能不完整——可调用 /v3/memory/ledger/backfill 从 outbox 补齐（补齐后提示自动消失）',
+              '变更账降级：当前租户有 {{pending}} 条事件尚未写入存储，以下变更可能不完整——填写起始时间后可从 outbox 补齐（补齐后提示自动消失）',
               { pending: ledgerDegraded.pending_store_events },
             )}
             {ledgerDegraded.last_failure_at ? `（${ledgerDegraded.last_failure_at}）` : null}
+            <Button
+              type="link"
+              loading={backfilling}
+              disabled={!canInbox || !sinceInput.trim()}
+              title={sinceInput.trim() ? undefined : t('memoryReview.backfillNeedSince', '需先填写起始时间 (ISO)')}
+              onClick={() => void handleBackfill()}
+            >
+              {t('memoryReview.backfill', '从 outbox 补齐')}
+            </Button>
           </div>
         ) : null}
 

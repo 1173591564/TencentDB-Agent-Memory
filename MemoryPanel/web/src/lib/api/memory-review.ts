@@ -81,6 +81,18 @@ export interface MemoryRevertBatchData {
   failed: number;
 }
 
+/** memory/ledger/backfill 结果（outbox 回放）。 */
+export interface MemoryLedgerBackfillData {
+  files: number;
+  scanned: number;
+  replayed: number;
+  skipped: number;
+  malformed: number;
+  failed: number;
+  redacted: number;
+  health?: { degraded: boolean; pending_store_events: number };
+}
+
 /** memory/history 返回的单条事件（record 血统）。 */
 export interface MemoryHistoryEvent {
   event_ts: string;
@@ -164,4 +176,8 @@ export const memoryReviewApi = {
   /** 收件箱：tenant 维度最近有变更的 session 列表（不需要先知道 session_id）。 */
   inbox: (params: { team_id: string; agent_id: string; user_id: string; since?: string; until?: string; limit?: number }) =>
     call<MemoryReviewInboxData>('review/inbox', { ...params }),
+
+  /** 运维：从 outbox 回放当前租户缺失的事件（since 必填；内核需开启回放开关）。 */
+  ledgerBackfill: (params: { team_id: string; agent_id: string; user_id: string; since: string }) =>
+    call<MemoryLedgerBackfillData>('ledger/backfill', { ...params }),
 };

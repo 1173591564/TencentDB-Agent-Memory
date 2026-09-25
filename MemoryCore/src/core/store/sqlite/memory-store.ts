@@ -59,6 +59,7 @@ import type {
   AuditQueryFilter,
   MemoryEvent,
   MemoryEventFilter,
+  MemoryEventRedactFilter,
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
@@ -900,7 +901,11 @@ export class VectorStore implements IMemoryStore {
         layer              TEXT NOT NULL DEFAULT 'l1',
         source             TEXT NOT NULL DEFAULT '',
         request_id         TEXT NOT NULL DEFAULT '',
-        event_id           TEXT NOT NULL DEFAULT ''
+        event_id           TEXT NOT NULL DEFAULT '',
+        reason             TEXT NOT NULL DEFAULT '',
+        target_event_id    TEXT NOT NULL DEFAULT '',
+        scope              TEXT NOT NULL DEFAULT '',
+        until_ts           TEXT NOT NULL DEFAULT ''
       )
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
@@ -955,7 +960,11 @@ export class VectorStore implements IMemoryStore {
             layer              TEXT NOT NULL DEFAULT 'l1',
             source             TEXT NOT NULL DEFAULT '',
             request_id         TEXT NOT NULL DEFAULT '',
-            event_id           TEXT NOT NULL DEFAULT ''
+            event_id           TEXT NOT NULL DEFAULT '',
+            reason             TEXT NOT NULL DEFAULT '',
+            target_event_id    TEXT NOT NULL DEFAULT '',
+            scope              TEXT NOT NULL DEFAULT '',
+            until_ts           TEXT NOT NULL DEFAULT ''
           )
         `);
         this.db.exec(`
@@ -991,6 +1000,10 @@ export class VectorStore implements IMemoryStore {
     // re-appending the same event (outbox replay) a no-op while legacy rows
     // (event_id='') stay unconstrained.
     try { this.db.exec("ALTER TABLE memory_events ADD COLUMN event_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
+    for (const col of ["reason", "target_event_id", "scope", "until_ts"]) {
+      try { this.db.exec(`ALTER TABLE memory_events ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`); } catch { /* exists */ }
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_ts ON memory_events(event_ts, seq)");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_event_id ON memory_events(event_id) WHERE event_id != ''");
 
     // ── Custom Memory Prompt ──
@@ -3572,14 +3585,14 @@ export class VectorStore implements IMemoryStore {
   // ─────────────────────────────────────────────────────────
 
   appendMemoryEvent(event: MemoryEvent): void {
-    if (this.degraded) return;
+    if (this.degraded) throw new Error("memory_events append rejected: sqlite store is degraded");
     const stmt = this.db.prepare(`
       INSERT INTO memory_events
         (event_ts, session_key, session_id, origin_session_id, origin_session_key,
          team_id, user_id, agent_id, task_id,
          op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-         layer, source, request_id, event_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         layer, source, request_id, event_id, reason, target_event_id, scope, until_ts)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(event_id) WHERE event_id != '' DO NOTHING
     `);
     stmt.run(
@@ -3605,11 +3618,15 @@ export class VectorStore implements IMemoryStore {
       event.source ?? "",
       event.request_id ?? "",
       event.event_id || newMemoryEventId(),
+      event.reason ?? "",
+      event.target_event_id ?? "",
+      event.scope ?? "",
+      event.until ?? "",
     );
   }
 
   queryMemoryEvents(filter: MemoryEventFilter): MemoryEvent[] {
-    if (this.degraded) return [];
+    if (this.degraded) throw new Error("memory_events query rejected: sqlite store is degraded");
     const conds: string[] = [];
     const args: SQLInputValue[] = [];
     if (filter.session_id !== undefined)        { conds.push("session_id = ?");        args.push(filter.session_id); }
@@ -3636,10 +3653,10 @@ export class VectorStore implements IMemoryStore {
       SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
              team_id, user_id, agent_id, task_id,
              op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-             layer, source, request_id, event_id
+             layer, source, request_id, event_id, reason, target_event_id, scope, until_ts
       FROM memory_events
       ${where}
-      ORDER BY seq ${filter.order === "desc" ? "DESC" : "ASC"}
+      ORDER BY event_ts ${filter.order === "desc" ? "DESC" : "ASC"}, seq ${filter.order === "desc" ? "DESC" : "ASC"}
       LIMIT ? OFFSET ?
     `;
     const stmt = this.db.prepare(sql);
@@ -3666,6 +3683,10 @@ export class VectorStore implements IMemoryStore {
       source: string;
       request_id: string;
       event_id: string;
+      reason: string;
+      target_event_id: string;
+      scope: string;
+      until_ts: string;
     }>;
     return rows.map((r) => {
       let supersedes: string[] = [];
@@ -3693,8 +3714,25 @@ export class VectorStore implements IMemoryStore {
         layer: (r.layer || "l1") as MemoryEvent["layer"],
         source: (r.source || undefined) as MemoryEvent["source"],
         request_id: r.request_id || undefined,
+        reason: r.reason || undefined,
+        target_event_id: r.target_event_id || undefined,
+        scope: (r.scope || undefined) as MemoryEvent["scope"],
+        until: r.until_ts || undefined,
       };
     });
+  }
+
+  redactMemoryEvents(filter: MemoryEventRedactFilter): number {
+    if (this.degraded) throw new Error("memory_events redact rejected: sqlite store is degraded");
+    const conds = ["event_ts <= ?", "(content != '' OR snapshot_json != '')"];
+    const args: SQLInputValue[] = [filter.until];
+    if (filter.team_id !== undefined)  { conds.push("team_id = ?");  args.push(filter.team_id); }
+    if (filter.agent_id !== undefined) { conds.push("agent_id = ?"); args.push(filter.agent_id); }
+    if (filter.user_id !== undefined)  { conds.push("user_id = ?");  args.push(filter.user_id); }
+    const res = this.db.prepare(
+      `UPDATE memory_events SET content = '', snapshot_json = '' WHERE ${conds.join(" AND ")}`,
+    ).run(...args);
+    return Number(res.changes ?? 0);
   }
 
   // ─────────────────────────────────────────────────────────

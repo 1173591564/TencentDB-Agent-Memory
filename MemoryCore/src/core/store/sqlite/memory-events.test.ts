@@ -439,6 +439,29 @@ describe("sqlite memory_events event_id", () => {
     expect(store.queryMemoryEvents({ record_id: "m_x" })).toHaveLength(1);
   });
 
+  it("orders by event_ts (seq only breaks ties), so backfilled older events keep their place", () => {
+    store.appendMemoryEvent(ev({ event_id: "evt-new", op: "updated", event_ts: "2026-01-02T00:00:00.000Z" }));
+    store.appendMemoryEvent(ev({ event_id: "evt-old", op: "created", event_ts: "2026-01-01T00:00:00.000Z" }));
+    expect(store.queryMemoryEvents({ record_id: "m_x" }).map((e) => e.op)).toEqual(["created", "updated"]);
+    expect(store.queryMemoryEvents({ record_id: "m_x", order: "desc" }).map((e) => e.op)).toEqual(["updated", "created"]);
+  });
+
+  it("redaction blanks content/snapshot but keeps the metadata skeleton", () => {
+    store.appendMemoryEvent(ev({ event_id: "evt-a", team_id: "t1", agent_id: "a1", snapshot_json: "{\"x\":1}" }));
+    store.appendMemoryEvent(ev({ event_id: "evt-b", team_id: "t2", agent_id: "a1" }));
+    const n = store.redactMemoryEvents({ team_id: "t1", agent_id: "a1", until: "2026-12-31T00:00:00.000Z" });
+    expect(n).toBe(1);
+    const [a, b] = store.queryMemoryEvents({ record_id: "m_x" });
+    expect(a).toMatchObject({ event_id: "evt-a", op: "created", content: "" });
+    expect(a.snapshot_json ?? "").toBe("");
+    expect(b.content).toBe("v1");
+  });
+
+  it("degraded store rejects appends so the ledger records them as pending", () => {
+    (store as unknown as { degraded: boolean }).degraded = true;
+    expect(() => store.appendMemoryEvent(ev({ event_id: "evt-deg" }))).toThrow();
+  });
+
   it("invalid op is still rejected rather than silently ignored", () => {
     expect(() => store.appendMemoryEvent(ev({ event_id: "evt-bad", op: "bogus" }) as never)).toThrow();
   });

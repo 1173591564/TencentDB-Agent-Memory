@@ -468,8 +468,12 @@ export const memoryDiffRevertRequestSchema = z.object({
   record_id: z.string().min(1).optional(),
   /** 批量撤销（上限 50/次）。与 record_id 二选一或并用。 */
   record_ids: z.array(z.string().min(1)).min(1).max(50).optional(),
-  /** 可选：撤销理由，记入 reverted 事件的 content。 */
+  /** 可选：撤销理由，记入 reverted 事件的 reason（兼容：同时写入 content）。 */
   reason: z.string().optional(),
+  /** 可选：记录在提取写入后被人工编辑时，显式丢弃人工编辑继续撤销。默认 false（409）。 */
+  force: z.boolean().optional(),
+  /** 可选：要撤销的写入事件 event_id（逐层回退人工编辑）。仅可与单个 record_id 同用。 */
+  event_id: z.string().min(1).optional(),
 }).refine((d) => d.record_id || (d.record_ids?.length ?? 0) > 0, {
   message: "record_id or non-empty record_ids is required",
 });
@@ -506,7 +510,7 @@ export type MemoryLedgerStatusRequest = z.infer<typeof memoryLedgerStatusRequest
 // POST /v2|v3/memory/ledger/backfill — 从 events/*.jsonl outbox 幂等回放缺失事件到 store。
 // 按请求 isolation 的 team/agent 限定回放范围。
 export const memoryLedgerBackfillRequestSchema = z.object({
-  /** 可选：只回放 event_ts ≥ since 的事件（ISO 8601）。 */
-  since: isoDateString.optional(),
+  /** 必填：只回放 event_ts ≥ since 的事件（ISO 8601），限制扫描的 outbox 分片数。 */
+  since: isoDateString,
 });
 export type MemoryLedgerBackfillRequest = z.infer<typeof memoryLedgerBackfillRequestSchema>;

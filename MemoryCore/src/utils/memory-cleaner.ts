@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { IMemoryStore } from "../core/store/types.js";
+import { appendLedgerEvent, redactLedgerEvents } from "../core/record/event-ledger.js";
 import { ManagedTimer } from "./managed-timer.js";
 import type { Logger } from "../core/types.js";
 
@@ -23,6 +24,8 @@ interface CleanupStats {
 const TAG = "[memory-tdai][cleaner]";
 const L0_DIR_NAME = "conversations";
 const L1_DIR_NAME = "records";
+/** Change-ledger outbox (events/YYYY-MM-DD.jsonl) ages out with the same retention. */
+const EVENTS_DIR_NAME = "events";
 
 /** Minimum records to retain — skip deletion if total is at or below this threshold. */
 const MIN_RETAIN_L0 = 50;
@@ -87,6 +90,7 @@ export class LocalMemoryCleaner {
     const targetDirs = [
       path.join(this.opts.baseDir, L0_DIR_NAME),
       path.join(this.opts.baseDir, L1_DIR_NAME),
+      path.join(this.opts.baseDir, EVENTS_DIR_NAME),
     ];
 
     const total: CleanupStats = {
@@ -162,6 +166,27 @@ export class LocalMemoryCleaner {
 
       if (removedL1 > 0 || removedL0 > 0) {
         total.changedFiles += 1;
+      }
+
+      // ── Change ledger: TTL deletions must be on the books (revert must not
+      //    resurrect expired rows) and expired content must not outlive the
+      //    rows in memory_events. Metadata skeletons are kept. ──
+      if (removedL1 > 0) {
+        await appendLedgerEvent({ store: vectorStore, logger: this.opts.logger, event: {
+          event_ts: new Date().toISOString(),
+          session_key: "",
+          session_id: "",
+          op: "deleted",
+          record_id: `retention-l1-${cutoffIso}`,
+          content: "",
+          layer: "l1",
+          source: "retention",
+          scope: "retention",
+          until: cutoffIso,
+        } });
+      }
+      if (!skippedL1 && !failedL1DbCleanup) {
+        await redactLedgerEvents({ store: vectorStore, logger: this.opts.logger, filter: { until: cutoffIso } });
       }
 
       // ── Post-delete: audit summary ──

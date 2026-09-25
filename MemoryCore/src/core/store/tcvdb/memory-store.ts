@@ -43,6 +43,7 @@ import type {
   AuditQueryFilter,
   MemoryEvent,
   MemoryEventFilter,
+  MemoryEventRedactFilter,
   KnowledgeEntity,
   KnowledgeType,
   KnowledgeListResult,
@@ -173,6 +174,7 @@ const MEMORY_EVENTS_OUTPUT_FIELDS = [
   "op", "record_id", "content", "memory_type", "version",
   "supersedes", "superseded_by", "snapshot_json", "reviewer_id",
   "layer", "source", "request_id", "event_id",
+  "reason", "target_event_id", "scope", "until",
 ];
 
 // ============================
@@ -2578,7 +2580,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   async appendMemoryEvent(event: MemoryEvent): Promise<void> {
     await this._ensureInit();
-    if (this.degraded) return;
+    if (this.degraded) throw new Error("memory_events append rejected: tcvdb store is degraded");
 
     // id = event_id：写入点生成的稳定身份（36 字符，远低于 TCVDB 文档 id
     // 上限 128）。不能拼 record_id 等业务字段——管理面 asset_id 之类的长
@@ -2611,6 +2613,10 @@ export class TcvdbMemoryStore implements IMemoryStore {
       layer: event.layer ?? "l1",
       source: event.source ?? "",
       request_id: event.request_id ?? "",
+      reason: event.reason ?? "",
+      target_event_id: event.target_event_id ?? "",
+      scope: event.scope ?? "",
+      until: event.until ?? "",
     };
 
     try {
@@ -2627,7 +2633,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
     await this._ensureInit();
-    if (this.degraded) return [];
+    if (this.degraded) throw new Error("memory_events query rejected: tcvdb store is degraded");
 
     const conds: string[] = [];
     if (filter.session_id !== undefined) conds.push(eqFilter("session_id", filter.session_id));
@@ -2696,13 +2702,31 @@ export class TcvdbMemoryStore implements IMemoryStore {
           layer: (String(doc.layer ?? "l1") || "l1") as MemoryEvent["layer"],
           source: (String(doc.source ?? "") || undefined) as MemoryEvent["source"],
           request_id: String(doc.request_id ?? "") || undefined,
+          reason: String(doc.reason ?? "") || undefined,
+          target_event_id: String(doc.target_event_id ?? "") || undefined,
+          scope: (String(doc.scope ?? "") || undefined) as MemoryEvent["scope"],
+          until: String(doc.until ?? "") || undefined,
         };
       });
     } catch (err) {
       this.logger?.warn?.(
         `${TAG} [events-query] FAILED: ${err instanceof Error ? err.message : String(err)}`,
       );
-      return [];
+      // An empty list would read as "no changes" to review/revert callers.
+      throw err;
     }
+  }
+
+  async redactMemoryEvents(filter: MemoryEventRedactFilter): Promise<number> {
+    await this._ensureInit();
+    if (this.degraded) throw new Error("memory_events redact rejected: tcvdb store is degraded");
+    const conds = [`event_ts <= "${escapeFilterString(filter.until)}"`];
+    if (filter.team_id !== undefined) conds.push(eqFilter("team_id", filter.team_id));
+    if (filter.agent_id !== undefined) conds.push(eqFilter("agent_id", filter.agent_id));
+    if (filter.user_id !== undefined) conds.push(eqFilter("user_id", filter.user_id));
+    return this.client.update(this.eventsCollection, {
+      filter: joinFilter(conds),
+      update: { content: "", snapshot_json: "" },
+    });
   }
 }

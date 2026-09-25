@@ -33,7 +33,7 @@ import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapte
 import { buildProfileIsolationScope } from "../core/profile/profile-scope.js";
 import { MetadataError, type MetadataService } from "../metadata/service/metadata-service.js";
 import { buildChatMemoryAssetId } from "../metadata/utils/chat-memory-asset.js";
-import { appendLedgerEvent } from "../core/record/event-ledger.js";
+import { appendLedgerEvent, redactLedgerEvents } from "../core/record/event-ledger.js";
 import type { Logger } from "../core/types.js";
 
 const TAG = "[chat-memory-handlers]";
@@ -346,7 +346,9 @@ export async function clearChatMemoryContentResilient(args: {
 /**
  * 写清空审计。L1/L2/L3 各一条 delete 事件，record_id 用 memory_id（asset_id），
  * 不写任何原内容。审计失败不阻塞主流程（与 v2-router recordAudit 语义一致）。
- * 同时镜像到 memory_events（source=api_mutation，统一变更账）。
+ * 同时镜像到 memory_events（source=api_mutation, scope=agent，统一变更账），
+ * 并擦除该 team+agent 截至清空时刻的事件 content/snapshot（保留元数据骨架），
+ * 使 revert / backfill 都无法复活已清空的内容。
  */
 export async function recordClearAudit(
   store: IMemoryStore,
@@ -360,6 +362,7 @@ export async function recordClearAudit(
   },
 ): Promise<void> {
   const now = Date.now();
+  const until = new Date(now).toISOString();
   for (const layer of ["L1", "L2", "L3"] as const) {
     if (store.appendAudit) {
       try {
@@ -384,7 +387,7 @@ export async function recordClearAudit(
     if (store.appendMemoryEvent || args.storage) {
       try {
         await appendLedgerEvent({ store, storage: args.storage, logger: args.logger, event: {
-          event_ts: new Date().toISOString(),
+          event_ts: until,
           session_key: "",
           session_id: "",
           team_id: args.teamId,
@@ -393,6 +396,8 @@ export async function recordClearAudit(
           record_id: args.memoryId,
           content: "",
           version: 0,
+          scope: "agent",
+          until,
           layer: layer.toLowerCase() as "l1" | "l2" | "l3",
           source: "api_mutation",
           request_id: args.requestId,
@@ -405,6 +410,12 @@ export async function recordClearAudit(
       }
     }
   }
+  await redactLedgerEvents({
+    store,
+    storage: args.storage,
+    logger: args.logger,
+    filter: { team_id: args.teamId, agent_id: args.agentId, until },
+  });
 }
 
 async function handleChatMemoryClear(

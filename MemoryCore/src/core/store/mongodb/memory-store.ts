@@ -49,6 +49,7 @@ import type {
   AuditQueryFilter,
   MemoryEvent,
   MemoryEventFilter,
+  MemoryEventRedactFilter,
   KnowledgeEntity,
   KnowledgeType,
   KnowledgeListResult,
@@ -880,12 +881,29 @@ export class MongoMemoryStore implements IMemoryStore {
       layer: event.layer ?? "l1",
       source: event.source ?? "",
       request_id: event.request_id ?? "",
+      reason: event.reason ?? "",
+      target_event_id: event.target_event_id ?? "",
+      scope: event.scope ?? "",
+      until: event.until ?? "",
     } as never);
     } catch (err) {
       // Duplicate event_id: the event already landed (outbox replay / retry).
-      if ((err as { code?: number }).code === 11000) return;
+      // Only the event_id unique index means "already written"; any other
+      // duplicate-key violation is a real failure.
+      const e = err as { code?: number; keyPattern?: Record<string, unknown> };
+      if (e.code === 11000 && e.keyPattern !== undefined && "event_id" in e.keyPattern) return;
       throw err;
     }
+  }
+
+  async redactMemoryEvents(filter: MemoryEventRedactFilter): Promise<number> {
+    const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
+    const q: Record<string, unknown> = { event_ts: { $lte: filter.until } };
+    if (filter.team_id !== undefined) q.team_id = filter.team_id;
+    if (filter.agent_id !== undefined) q.agent_id = filter.agent_id;
+    if (filter.user_id !== undefined) q.user_id = filter.user_id;
+    const res = await coll.updateMany(q as never, { $set: { content: "", snapshot_json: "" } } as never);
+    return res.modifiedCount;
   }
 
   async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
@@ -949,6 +967,10 @@ export class MongoMemoryStore implements IMemoryStore {
       layer: (String(d.layer ?? "l1") || "l1") as MemoryEvent["layer"],
       source: (String(d.source ?? "") || undefined) as MemoryEvent["source"],
       request_id: String(d.request_id ?? "") || undefined,
+      reason: String(d.reason ?? "") || undefined,
+      target_event_id: String(d.target_event_id ?? "") || undefined,
+      scope: (String(d.scope ?? "") || undefined) as MemoryEvent["scope"],
+      until: String(d.until ?? "") || undefined,
     };
   }
 

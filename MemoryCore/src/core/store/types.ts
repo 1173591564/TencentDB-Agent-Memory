@@ -663,10 +663,30 @@ export interface MemoryEvent {
   snapshot_json?: string;
   /** 事件所属记忆层（l1/l2/l3）。未填按 l1 处理。 */
   layer?: "l1" | "l2" | "l3";
-  /** 变更来源（extraction / api_mutation / review）。写入方应显式标记——未标记的新行读回 undefined，按 source 过滤不会命中（"按 op 推断"仅适用于迁移回填的旧行）。 */
-  source?: "extraction" | "api_mutation" | "review";
+  /** 变更来源（extraction / api_mutation / review / retention）。写入方应显式标记——未标记的新行读回 undefined，按 source 过滤不会命中（"按 op 推断"仅适用于迁移回填的旧行）。 */
+  source?: "extraction" | "api_mutation" | "review" | "retention";
   /** Gateway request_id（api_mutation 来源时由调用方透传，便于与 audit 表对账）。 */
   request_id?: string;
+  /** reverted 事件：驳回理由。 */
+  reason?: string;
+  /** reverted 事件：被撤销的那次写入事件的 event_id（逐层回退的定位键）。 */
+  target_event_id?: string;
+  /**
+   * deleted 事件的删除范围：record=单条（缺省）；agent=clear/archive 按
+   * team+agent(+user) 整体清空（record_id 为资产 id）；retention=TTL 过期清理
+   *（record_id 为 `ttl:<cutoff>`，被删的是 updated_time < until 的全部 L1）。
+   */
+  scope?: "record" | "agent" | "retention";
+  /** scope=agent|retention 的 deleted 事件：删除覆盖到的时间上界（ISO 8601）。 */
+  until?: string;
+}
+
+/** redactMemoryEvents 过滤条件：擦除 event_ts ≤ until 且租户匹配的事件内容。 */
+export interface MemoryEventRedactFilter {
+  team_id?: string;
+  agent_id?: string;
+  user_id?: string;
+  until: string;
 }
 
 /** queryMemoryEvents 过滤条件，全部可选。 */
@@ -870,6 +890,11 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   // ── Memory Events（session 变更集；optional，同上）─────────────
   appendMemoryEvent?(event: MemoryEvent): MaybePromise<void>;
   queryMemoryEvents?(filter: MemoryEventFilter): MaybePromise<MemoryEvent[]>;
+  /**
+   * 擦除匹配事件的 content / snapshot_json（保留 op/时间/id 等元数据骨架）。
+   * clear/archive/TTL 调用，使变更账不再保留已清空记忆的原文。返回受影响行数。
+   */
+  redactMemoryEvents?(filter: MemoryEventRedactFilter): MaybePromise<number>;
 }
 
 // ============================

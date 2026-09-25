@@ -3657,7 +3657,8 @@ export class VectorStore implements IMemoryStore {
       request_id: string;
     }>;
     return rows.map((r) => {
-      const supersedes = JSON.parse(r.supersedes) as string[];
+      let supersedes: string[] = [];
+      try { supersedes = JSON.parse(r.supersedes) as string[]; } catch { /* malformed column → treat as none */ }
       return {
         event_ts: r.event_ts,
         session_key: r.session_key,

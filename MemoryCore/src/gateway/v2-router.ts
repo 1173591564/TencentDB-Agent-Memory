@@ -1772,6 +1772,29 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
   const truncated = fetched.length > limit || (limit >= 1000 && fetched.length === limit);
   const events = fetched.slice(0, limit);
 
+  // 管理面补充查询：clear/archive 是 agent 级管理操作，事件无 user_id（内核
+  // 数据面不解析调用者身份）——主查询按完整三元组过滤永远匹配不上它们，
+  // "该 agent 的记忆被管理面清空过"恰恰是审阅者必须看到的事实。这里按
+  // team+agent 补查 source=api_mutation 的事件，JS 侧只保留**无 user 归属**
+  // 的行（真正的管理面操作）——带 user_id 的 mutation 镜像仍只归该 user，
+  // 不跨 user 泄露。它们 session_id 为空，聚合落进 "(unknown)" 桶。
+  let adminEvents: MemoryEvent[] = [];
+  try {
+    const adminFetched = await store.queryMemoryEvents({
+      limit: limit + 1,
+      order: "desc",
+      team_id: iso?.teamId,
+      agent_id: iso?.agentId,
+      source: "api_mutation",
+      ...(parsed.data.since ? { since: parsed.data.since } : {}),
+      ...(parsed.data.until ? { until: parsed.data.until } : {}),
+    });
+    adminEvents = adminFetched.slice(0, limit).filter((e) => !e.user_id);
+  } catch (err) {
+    // 补充查询失败不阻塞主收件箱——管理面事件缺失降级为不可见。
+    deps.logger.warn(`${TAG} inbox admin-event supplement failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   // 按 session_id 聚合。superseded/reverted 事件不计入"变更数"（它们分别
   // 属于被替代的旧记录和驳回动作），但 reverted 标记该 session 有待关注的驳回。
   const bySession = new Map<string, {
@@ -1782,7 +1805,7 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
     last_event_ts: string;
     has_reverted: boolean;
   }>();
-  for (const e of events) {
+  for (const e of [...events, ...adminEvents]) {
     const sid = e.session_id || "(unknown)";
     let entry = bySession.get(sid);
     if (!entry) {
@@ -1807,7 +1830,7 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
   }
 
   const sessions = [...bySession.values()].sort((a, b) => b.last_event_ts.localeCompare(a.last_event_ts));
-  return successEnvelope({ sessions, truncated, scanned: events.length }, requestId);
+  return successEnvelope({ sessions, truncated, scanned: events.length + adminEvents.length }, requestId);
 }
 
 async function handleAtomicSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

@@ -657,7 +657,7 @@ export interface MemoryEvent {
   snapshot_json?: string;
   /** 事件所属记忆层（l1/l2/l3）。未填按 l1 处理。 */
   layer?: "l1" | "l2" | "l3";
-  /** 变更来源（extraction / api_mutation / review）。未填按 op 推断。 */
+  /** 变更来源（extraction / api_mutation / review）。写入方应显式标记——未标记的新行读回 undefined，按 source 过滤不会命中（"按 op 推断"仅适用于迁移回填的旧行）。 */
   source?: "extraction" | "api_mutation" | "review";
   /** Gateway request_id（api_mutation 来源时由调用方透传，便于与 audit 表对账）。 */
   request_id?: string;

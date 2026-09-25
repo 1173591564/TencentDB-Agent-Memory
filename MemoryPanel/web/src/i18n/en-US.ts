@@ -1820,4 +1820,5 @@ export const enUS = {
   'memoryReview.revertedBadge': 'Reverted',
   'memoryReview.replacedTitle': 'Replaced records',
   'memoryReview.fromSession': 'from session',
+  'memoryReview.adminOps': 'Management-plane ops (no session)',
 };

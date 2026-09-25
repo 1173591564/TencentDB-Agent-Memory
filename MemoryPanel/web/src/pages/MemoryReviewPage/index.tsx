@@ -171,7 +171,9 @@ export function MemoryReviewPage() {
     { value: 'created', text: 'created' },
     { value: 'updated', text: 'updated' },
     { value: 'merged', text: 'merged' },
+    { value: 'superseded', text: 'superseded' },
     { value: 'reverted', text: 'reverted' },
+    { value: 'deleted', text: 'deleted' },
   ], [t]);
 
   const fetchDiff = async (offset = 0, sid?: string) => {
@@ -426,14 +428,24 @@ export function MemoryReviewPage() {
               ) : (
                 inbox.map((s) => (
                   <div
-                    key={s.session_id}
+                    key={s.session_id || '(unknown)'}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px',
-                      border: '1px solid #eee', borderRadius: 4, marginBottom: 6, cursor: 'pointer',
+                      border: '1px solid #eee', borderRadius: 4, marginBottom: 6,
+                      // session_id 为空 = 管理面操作（clear/archive 等 agent 级变更），
+                      // 没有 session diff 可看——渲染为不可点击的说明行。
+                      cursor: s.session_id ? 'pointer' : 'default',
+                      background: s.session_id ? undefined : '#fafafa',
                     }}
-                    onClick={() => pickSession(s.session_id)}
+                    onClick={() => { if (s.session_id) pickSession(s.session_id); }}
                   >
-                    <code style={{ fontSize: 12 }}>{s.session_id}</code>
+                    {s.session_id ? (
+                      <code style={{ fontSize: 12 }}>{s.session_id}</code>
+                    ) : (
+                      <Tag theme="default" variant="soft" size="sm">
+                        {t('memoryReview.adminOps', '管理面操作（无会话归属）')}
+                      </Tag>
+                    )}
                     <Tag theme="primary" variant="soft" size="sm">
                       {t('memoryReview.inboxChanges', '{{count}} 条变更', { count: s.changes })}
                     </Tag>

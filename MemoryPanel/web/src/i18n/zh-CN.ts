@@ -1795,4 +1795,5 @@ export const zhCN = {
   'memoryReview.revertedBadge': '已撤销',
   'memoryReview.replacedTitle': '替代了以下记录',
   'memoryReview.fromSession': '来自会话',
+  'memoryReview.adminOps': '管理面操作（无会话归属）',
 };

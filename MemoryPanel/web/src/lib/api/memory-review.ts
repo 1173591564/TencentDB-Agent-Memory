@@ -77,7 +77,7 @@ export interface MemoryHistoryEvent {
   session_key: string;
   session_id: string;
   origin_session_id?: string;
-  op: 'created' | 'updated' | 'merged' | 'superseded' | 'reverted';
+  op: 'created' | 'updated' | 'merged' | 'superseded' | 'reverted' | 'deleted';
   record_id: string;
   content: string;
   memory_type?: string;

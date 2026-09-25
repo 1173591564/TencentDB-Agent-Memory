@@ -544,6 +544,33 @@ describe("POST /memory/review/inbox", () => {
     // 最新的 ses-new-1 必须在窗口内；最早的 ses-x 事件被截断属于预期。
     expect(sids).toContain("ses-new-1");
   });
+
+  it("surfaces userless management-plane ops (clear/archive) in the (unknown) bucket", async () => {
+    // clear/archive 事件无 user_id（内核数据面不解析调用者身份）——主查询按
+    // 三元组过滤永远匹配不上；补充查询按 team+agent+api_mutation 捞回，
+    // 且不得把**带 user_id 的他人 mutation 镜像**泄露进来。
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "t1", agent_id: "a1",
+      op: "deleted", record_id: "chat_memory-t1-a1", content: "",
+      layer: "l1", source: "api_mutation",
+    });
+    // 另一个 user 的 mutation 镜像：带 user_id，补充查询必须排除它。
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "t1", user_id: "u-other", agent_id: "a1",
+      op: "deleted", record_id: "m_of_other_user", content: "",
+      layer: "l1", source: "api_mutation",
+    });
+    const { status, data } = await call("/v3/memory/review/inbox", {});
+    expect(status).toBe(200);
+    const sessions = data!.sessions as Array<Record<string, unknown>>;
+    const adminBucket = sessions.find((s) => s.session_id === "");
+    expect(adminBucket).toBeDefined();
+    expect((adminBucket!.by_op as Record<string, number>).deleted).toBe(1); // 无 user 归属的那条
+    // 其他 user 的镜像不出现
+    expect(JSON.stringify(sessions)).not.toContain("m_of_other_user");
+  });
 });
 
 describe("mutation → memory_events mirror (unified change ledger)", () => {

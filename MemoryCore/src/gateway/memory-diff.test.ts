@@ -755,7 +755,7 @@ describe("mutation → memory_events mirror (unified change ledger)", () => {
 
   it("atomic/update returning false → 503 and no phantom updated event", async () => {
     const realUpsert = store.upsertL1.bind(store);
-    store.upsertL1 = async () => false; // degraded backend rejects the write
+    store.upsertL1 = () => false; // degraded backend rejects the write
     const { status } = await call("/v3/atomic/update", { id: "m_a", content: "hacked" });
     expect(status).toBe(503);
     // The ledger must not record a change that never landed.

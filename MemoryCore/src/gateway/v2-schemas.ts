@@ -434,17 +434,23 @@ export type V2AuthContext = z.infer<typeof v2AuthContextSchema>;
 // 每次写入操作一组 { op, record, replaced[] }，replaced 是被 superseded 的
 // 旧记录快照。原始事件行由 store.queryMemoryEvents 返回，聚合在 handler 完成。
 
+// since/until 必须是可解析的时间——store 层是裸字符串比较，垃圾值不会报错
+// 只会静默错过滤（如 until:"2026-01-15" 把当天事件全部排掉）。
+const isoDateString = z.string().refine((v) => !Number.isNaN(Date.parse(v)), {
+  message: "must be a parseable ISO 8601 timestamp",
+});
+
 export const memoryDiffRequestSchema = z.object({
   /** 必填：查询哪个 session 的变更集。 */
   session_id: z.string().min(1),
   limit: z.number().int().min(1).max(1000).default(500),
   offset: z.number().int().min(0).default(0),
-  /** 可选：按 op 过滤事件层（created/updated/merged/superseded/reverted）。 */
-  op: z.enum(["created", "updated", "merged", "superseded", "reverted"]).optional(),
+  /** 可选：按 op 过滤事件层（created/updated/merged/superseded/reverted/deleted）。 */
+  op: z.enum(["created", "updated", "merged", "superseded", "reverted", "deleted"]).optional(),
   /** 可选：只返 event_ts ≥ since 的事件（ISO 8601）。 */
-  since: z.string().optional(),
+  since: isoDateString.optional(),
   /** 可选：只返 event_ts ≤ until 的事件（ISO 8601）。 */
-  until: z.string().optional(),
+  until: isoDateString.optional(),
 });
 export type MemoryDiffRequest = z.infer<typeof memoryDiffRequestSchema>;
 
@@ -479,9 +485,9 @@ export type MemoryHistoryRequest = z.infer<typeof memoryHistoryRequestSchema>;
 // 聚合在 handler 完成：拉时间窗内事件按 session_id 分组。
 export const memoryReviewInboxRequestSchema = z.object({
   /** 可选：只统计 event_ts ≥ since 的事件（ISO 8601）。 */
-  since: z.string().optional(),
+  since: isoDateString.optional(),
   /** 可选：只统计 event_ts ≤ until 的事件（ISO 8601）。 */
-  until: z.string().optional(),
+  until: isoDateString.optional(),
   /** 事件扫描上限（再按 session 聚合）。 */
   limit: z.number().int().min(1).max(1000).default(500),
 });

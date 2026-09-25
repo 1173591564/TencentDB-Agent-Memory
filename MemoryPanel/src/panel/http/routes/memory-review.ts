@@ -11,10 +11,10 @@
  * agent_id 由调用方提供，内核侧做 v3 严格隔离校验——缺三元组直接 422）。
  */
 import type { Hono } from 'hono';
-import type { PanelDeps } from '../../../panel-deps.js';
-import { validatePanelMetaHeaders } from '../../middleware/validate-panel-headers.js';
-import { respondEnvelope } from '../../envelope.js';
-import { toKernelCredentials, type MetaCallContext } from '../../../kernel/types.js';
+import type { PanelDeps } from '../../panel-deps.js';
+import { validatePanelMetaHeaders } from '../middleware/validate-panel-headers.js';
+import { respondEnvelope } from '../envelope.js';
+import { toKernelCredentials, type MetaCallContext } from '../../kernel/types.js';
 
 function buildCtx(c: import('hono').Context): MetaCallContext {
   const panelMeta = c.get('panelMeta');

@@ -206,7 +206,7 @@ export async function appendRevertTombstone(params: {
   }
   const shardDate = formatLocalDate(new Date());
   try {
-    await storage.appendFile(StoragePaths.record(shardDate), buildRevertTombstoneLine(recordId, reviewerId));
+    await storage.appendFile(StoragePaths.record(shardDate), buildRevertTombstoneLine(recordId, reviewerId) + "\n");
     return true;
   } catch (err) {
     logger?.warn?.(
@@ -268,7 +268,16 @@ export async function writeMemory(params: {
   let supersededTargets: Awaited<ReturnType<NonNullable<typeof vectorStore>["queryL1Records"]>> = [];
   if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0 && vectorStore) {
     try {
-      supersededTargets = await vectorStore.queryL1Records({ recordIds: decision.target_ids });
+      // Scope the snapshot read to the same tenant filter used for the delete:
+      // a hallucinated/out-of-scope target_id must not leak a foreign record's
+      // content into a superseded event (which is stored under OUR tenancy and
+      // readable via /memory/diff).
+      supersededTargets = await vectorStore.queryL1Records({
+        recordIds: decision.target_ids,
+        ...(teamId || userId || agentId || taskId
+          ? { teamId, userId, agentId, taskId }
+          : sessionId ? { sessionId } : {}),
+      });
       const maxVersion = supersededTargets.reduce((max, row) => Math.max(max, row.version ?? 0), 0);
       nextVersion = maxVersion + 1;
     } catch (err) {
@@ -349,6 +358,10 @@ export async function writeMemory(params: {
     }
   };
 
+  // Outcome flags gate the event ledger below: events must record what the
+  // store actually did, not what the dedup decision intended.
+  let targetsDeleted = true;
+  let upsertOk = false;
   if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0) {
     // Remove target records from VectorStore (real-time deletion for retrieval accuracy).
     // JSONL is append-only — old records remain in files and are cleaned up periodically
@@ -359,17 +372,17 @@ export async function writeMemory(params: {
         // cross-session — see l1-extractor's dedup filter): targets may be
         // records written by earlier sessions of the same agent, so session
         // dimensions must NOT narrow the delete. team/user/agent/task keep
-        // tenant isolation on destructive operations.
+        // tenant isolation on destructive operations. taskId is passed
+        // verbatim ('' stays '') to match the recall filter exactly.
+        // Fail-closed: a caller carrying ONLY sessionId gets a session-scoped
+        // filter rather than an unscoped (all-tenant) delete.
         const deleteFilter = teamId || userId || agentId || taskId
-          ? { teamId, userId, agentId, taskId: taskId || undefined }
-          : undefined;
-        if (deleteFilter) {
-          await vectorStore.deleteL1Batch(decision.target_ids, deleteFilter);
-        } else {
-          await vectorStore.deleteL1Batch(decision.target_ids);
-        }
+          ? { teamId, userId, agentId, taskId }
+          : sessionId ? { sessionId } : undefined;
+        targetsDeleted = await vectorStore.deleteL1Batch(decision.target_ids, deleteFilter);
         logger?.debug?.(`${TAG} VectorStore: deleted ${decision.target_ids.length} target record(s) for ${decision.action}`);
       } catch (err) {
+        targetsDeleted = false;
         logger?.warn?.(
           `${TAG} VectorStore delete failed for ${decision.action}: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -418,7 +431,7 @@ export async function writeMemory(params: {
         }
       }
 
-      const upsertOk = await vectorStore.upsertL1(record, embedding);
+      upsertOk = await vectorStore.upsertL1(record, embedding);
       logger?.debug?.(`${TAG} [vec-dual-write] upsert result=${upsertOk} id=${record.id}`);
     } catch (err) {
       // Vector write failure should NOT block the main JSONL write
@@ -438,18 +451,28 @@ export async function writeMemory(params: {
   // - update/merge → 1 × superseded per target (old-content snapshot, when the
   //                  version query above succeeded) + 1 × updated/merged
   // - skip         → no event (nothing was written)
-  if (vectorStore?.appendMemoryEvent) {
+  // Events describe committed outcomes only: skip entirely when the upsert
+  // failed; when the supersede-delete failed the new record was written but
+  // nothing was replaced, so it is recorded as `created` (no superseded
+  // events, no supersedes claim) — the ledger stays restorable-truthful.
+  if (vectorStore?.appendMemoryEvent && upsertOk) {
     try {
       const base = {
         event_ts: now,
         session_key: sessionKey,
         session_id: record.sessionId,
-        team_id: record.teamId ?? "",
+        team_id: record.teamId || "default",
         user_id: record.userId ?? "",
         agent_id: record.agentId ?? "",
         task_id: record.taskId ?? "",
       };
-      if (decision.action === "store") {
+      if (decision.action === "store" || !targetsDeleted) {
+        if (!targetsDeleted) {
+          logger?.warn?.(
+            `${TAG} supersede delete failed for ${decision.action} id=${record.id}; ` +
+            `recording the write as 'created' (no superseded/supersedes events — nothing was actually replaced)`,
+          );
+        }
         await vectorStore.appendMemoryEvent({
           ...base,
           op: "created",

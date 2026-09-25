@@ -32,6 +32,7 @@ import { StoragePaths } from "../core/storage/types.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
 import { buildProfileIsolationScope } from "../core/profile/profile-scope.js";
 import { MetadataError, type MetadataService } from "../metadata/service/metadata-service.js";
+import { buildChatMemoryAssetId } from "../metadata/utils/chat-memory-asset.js";
 import type { Logger } from "../core/types.js";
 
 const TAG = "[chat-memory-handlers]";
@@ -321,14 +322,17 @@ export async function clearChatMemoryContentResilient(args: {
   /** 可选：审计行的 request_id（archiveAgent 路径无 HTTP requestId，留空）。 */
   requestId?: string;
 }): Promise<{ l0Deleted: number; l1Deleted: number; profileDeleted: number }> {
+  // record_id 统一用 asset_id 约定（chat_memory-{team}-{agent}）——与
+  // /v3/chat-memory/clear 的审计行一致，按 asset_id 查账时两条路径对得上。
+  const memoryId = buildChatMemoryAssetId(args.teamId, args.agentId);
   const { result } = await clearChatMemoryContentWithRetry({
     ...args,
-    memoryId: `${args.teamId}/${args.agentId}`,
+    memoryId,
   });
   // archiveAgent 级联清空与 /v3/chat-memory/clear 行为对齐：同样留审计痕。
   // 清理已成功，审计失败只 warn。
   await recordClearAudit(args.store, {
-    memoryId: `${args.teamId}/${args.agentId}`,
+    memoryId,
     teamId: args.teamId,
     agentId: args.agentId,
     requestId: args.requestId ?? "",

@@ -684,6 +684,8 @@ export interface MemoryEventFilter {
   until?: string;
   limit?: number;   // 默认 100，上限 1000
   offset?: number;
+  /** 排序方向：默认 "asc"（按追加序）。inbox 等"看最新"场景用 "desc"。 */
+  order?: "asc" | "desc";
 }
 
 export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStore {

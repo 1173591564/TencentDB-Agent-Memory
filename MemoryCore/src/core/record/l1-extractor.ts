@@ -326,7 +326,11 @@ export async function extractL1Memories(params: {
         // supersede the record written in session A. Session-scoped recall
         // (the old behaviour) left the old value recallable alongside the new
         // one. Tenant isolation is still enforced via team/user/agent/task.
-        ...(teamId || userId || agentId || taskId ? { filter: { teamId, userId, agentId, taskId } } : {}),
+        // Fail-closed fallback: a caller carrying ONLY sessionId gets a
+        // session-scoped filter rather than an unscoped (all-tenant) recall.
+        ...(teamId || userId || agentId || taskId
+          ? { filter: { teamId, userId, agentId, taskId } }
+          : sessionId ? { filter: { sessionId } } : {}),
       });
       dedupLatencyMs = Date.now() - dedupStartMs;
 

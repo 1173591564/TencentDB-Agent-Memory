@@ -2577,9 +2577,10 @@ export class TcvdbMemoryStore implements IMemoryStore {
     await this._ensureInit();
     if (this.degraded) return;
 
-    // id 用 event_ts + record_id + op 组合（append-only 流水无自然主键；
-    // 同一 record 同一毫秒同 op 极罕见，碰撞时 TCVDB upsert 覆盖可接受）。
-    const id = `${event.event_ts}__${event.record_id}__${event.op}`;
+    // id 用 event_ts + record_id + op + layer 组合（append-only 流水无自然
+    // 主键；layer 必带——recordClearAudit 同毫秒同 record_id+op 写 L1/L2/L3
+    // 三条，不带 layer 会静默覆盖丢事件）。
+    const id = `${event.event_ts}__${event.record_id}__${event.op}__${event.layer ?? "l1"}`;
     // dim=1 占位向量（events 不需向量检索，仅用 filter 查询）
     const doc: Record<string, unknown> = {
       id,
@@ -2649,8 +2650,16 @@ export class TcvdbMemoryStore implements IMemoryStore {
         filterExpr,
         MEMORY_EVENTS_OUTPUT_FIELDS,
         offset + limit,
-        [{ fieldName: "event_ts", direction: "asc" }],
+        [{ fieldName: "event_ts", direction: filter.order === "desc" ? "desc" : "asc" }],
       );
+      // TCVDB sort has no tiebreaker for equal event_ts; re-sort by the
+      // unique document id so page contents are at least deterministic.
+      docs.sort((a, b) => {
+        const t = String(a.event_ts ?? "").localeCompare(String(b.event_ts ?? ""));
+        if (t !== 0) return filter.order === "desc" ? -t : t;
+        const i = String(a.id ?? "").localeCompare(String(b.id ?? ""));
+        return filter.order === "desc" ? -i : i;
+      });
       const page = docs.slice(offset, offset + limit);
 
       return page.map((doc) => {

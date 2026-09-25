@@ -906,18 +906,30 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_session_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
-    // Existing installs: backfill the reviewer_id column added for review reverts.
+    // Existing installs: backfill columns added after the first release
+    // (reviewer_id for review reverts; snapshot_json for revert restore) so
+    // the copy below can reference them regardless of which schema the
+    // pre-existing table was created with.
     try { this.db.exec("ALTER TABLE memory_events ADD COLUMN reviewer_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
+    try { this.db.exec("ALTER TABLE memory_events ADD COLUMN snapshot_json TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
     // Unified change ledger migration: pre-existing tables carry an op CHECK
     // without 'deleted', and SQLite cannot ALTER a CHECK constraint — rebuild
     // via create-copy-drop-rename. Detection reads sqlite_master.sql; legacy
     // rows get layer='l1' and source inferred from op (reverted → review).
+    // The rebuild runs in a transaction: a crash between DROP and RENAME would
+    // otherwise orphan all events in memory_events_new while the next init's
+    // CREATE IF NOT EXISTS produces a fresh empty table that already contains
+    // 'deleted' — skipping detection and silently losing the data.
     try {
       const evTable = this.db.prepare(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_events'",
       ).get() as { sql?: string } | undefined;
       if (evTable?.sql && !evTable.sql.includes("'deleted'")) {
-        this.db.exec(`
+        this.db.exec("BEGIN");
+        try {
+          // Debris from a previously failed migration must not block retry.
+          this.db.exec("DROP TABLE IF EXISTS memory_events_new");
+          this.db.exec(`
           CREATE TABLE memory_events_new (
             seq                INTEGER PRIMARY KEY AUTOINCREMENT,
             event_ts           TEXT NOT NULL,
@@ -963,6 +975,11 @@ export class VectorStore implements IMemoryStore {
         this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
         this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_session_id)");
         this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
+          this.db.exec("COMMIT");
+        } catch (migErr) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already rolled back */ }
+          throw migErr;
+        }
       }
     } catch (err) {
       this.logger?.warn?.(`[memory-tdai][sqlite] memory_events CHECK migration failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3547,6 +3564,7 @@ export class VectorStore implements IMemoryStore {
   // ─────────────────────────────────────────────────────────
 
   appendMemoryEvent(event: MemoryEvent): void {
+    if (this.degraded) return;
     const stmt = this.db.prepare(`
       INSERT INTO memory_events
         (event_ts, session_key, session_id, origin_session_id, origin_session_key,
@@ -3581,6 +3599,7 @@ export class VectorStore implements IMemoryStore {
   }
 
   queryMemoryEvents(filter: MemoryEventFilter): MemoryEvent[] {
+    if (this.degraded) return [];
     const conds: string[] = [];
     const args: SQLInputValue[] = [];
     if (filter.session_id !== undefined)        { conds.push("session_id = ?");        args.push(filter.session_id); }
@@ -3610,7 +3629,7 @@ export class VectorStore implements IMemoryStore {
              layer, source, request_id
       FROM memory_events
       ${where}
-      ORDER BY seq ASC
+      ORDER BY seq ${filter.order === "desc" ? "DESC" : "ASC"}
       LIMIT ? OFFSET ?
     `;
     const stmt = this.db.prepare(sql);

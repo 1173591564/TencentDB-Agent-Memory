@@ -259,4 +259,63 @@ describe("memory_events migration", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("migrates the ORIGINAL schema too (no snapshot_json / reviewer_id columns)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "mem-events-orig-"));
+    try {
+      const dbPath = path.join(dir, "vectors.db");
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(dbPath);
+      // First shipped schema: no snapshot_json, no reviewer_id, CHECK without
+      // 'reverted'/'deleted'. The copy SELECT references snapshot_json — it
+      // only works because initSchema ALTER-backfills the column first.
+      db.exec(`CREATE TABLE memory_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, event_ts TEXT NOT NULL,
+        session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
+        origin_session_id TEXT NOT NULL DEFAULT '', origin_session_key TEXT NOT NULL DEFAULT '',
+        team_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '',
+        agent_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+        op TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded')),
+        record_id TEXT NOT NULL, content TEXT NOT NULL,
+        memory_type TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
+        supersedes TEXT NOT NULL DEFAULT '[]', superseded_by TEXT NOT NULL DEFAULT '')`);
+      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-01T00:00:00Z','created','m_oldest','v1')`);
+      db.close();
+
+      const store = new VectorStore(dbPath, 0);
+      store.init();
+      const rows = store.queryMemoryEvents({ record_id: "m_oldest" });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ op: "created", layer: "l1", source: "extraction" });
+      store.appendMemoryEvent({
+        event_ts: "2026-01-01T00:00:00Z", session_key: "", session_id: "",
+        op: "deleted", record_id: "m_oldest", content: "", source: "api_mutation",
+      });
+      expect(store.queryMemoryEvents({ op: "deleted" })).toHaveLength(1);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("order:'desc' returns newest events first", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "mem-events-desc-"));
+    try {
+      const store = new VectorStore(path.join(dir, "vectors.db"), 0);
+      store.init();
+      for (let i = 0; i < 3; i++) {
+        store.appendMemoryEvent({
+          event_ts: `2026-01-0${i + 1}T00:00:00Z`, session_key: "sk", session_id: "ses",
+          op: "created", record_id: `m_${i}`, content: `c${i}`,
+        });
+      }
+      const asc = store.queryMemoryEvents({ limit: 10 });
+      const desc = store.queryMemoryEvents({ limit: 10, order: "desc" });
+      expect(asc.map((e) => e.record_id)).toEqual(["m_0", "m_1", "m_2"]);
+      expect(desc.map((e) => e.record_id)).toEqual(["m_2", "m_1", "m_0"]);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

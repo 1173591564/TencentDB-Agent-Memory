@@ -171,6 +171,12 @@ export class MongoMemoryStore implements IMemoryStore {
         { key: { record_id: 1 } },
         { key: { updated_at_ms: 1 } },
       ]),
+      db.collection(COLLECTIONS.MEMORY_EVENTS).createIndexes([
+        { key: { event_ts: 1, _id: 1 } },
+        { key: { record_id: 1 } },
+        { key: { session_id: 1 } },
+        { key: { team_id: 1, agent_id: 1, user_id: 1 } },
+      ]),
       db.collection(COLLECTIONS.KNOWLEDGE).createIndexes([
         { key: { team_id: 1, type: 1 } },
       ]),
@@ -806,7 +812,28 @@ export class MongoMemoryStore implements IMemoryStore {
   async appendMemoryEvent(event: MemoryEvent): Promise<void> {
     const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
     // _id 由 Mongo 自动生成（ObjectId 自带时间序，作同 event_ts 内的稳定次序键）。
-    await coll.insertOne({ ...event } as never);
+    // Normalize the optional fields to the same defaults sqlite/TCVDB persist:
+    // mongo stores `layer: undefined` as a missing field, which a
+    // `{layer:"l1"}` filter would never match — diverging from the other
+    // backends where the writer-side default lands in the row.
+    await coll.insertOne({
+      ...event,
+      origin_session_id: event.origin_session_id ?? "",
+      origin_session_key: event.origin_session_key ?? "",
+      team_id: event.team_id ?? "",
+      user_id: event.user_id ?? "",
+      agent_id: event.agent_id ?? "",
+      task_id: event.task_id ?? "",
+      memory_type: event.memory_type ?? "",
+      version: event.version ?? 0,
+      supersedes: event.supersedes ?? [],
+      superseded_by: event.superseded_by ?? "",
+      snapshot_json: event.snapshot_json ?? "",
+      reviewer_id: event.reviewer_id ?? "",
+      layer: event.layer ?? "l1",
+      source: event.source ?? "",
+      request_id: event.request_id ?? "",
+    } as never);
   }
 
   async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
@@ -835,9 +862,10 @@ export class MongoMemoryStore implements IMemoryStore {
 
     const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);
     const offset = Math.max(filter.offset ?? 0, 0);
+    const dir = filter.order === "desc" ? -1 : 1;
     const docs = await coll
       .find(q as never)
-      .sort({ event_ts: 1, _id: 1 })
+      .sort({ event_ts: dir, _id: dir })
       .skip(offset)
       .limit(limit)
       .toArray();

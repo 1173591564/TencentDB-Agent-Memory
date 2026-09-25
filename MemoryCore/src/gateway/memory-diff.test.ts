@@ -52,8 +52,10 @@ describe("POST /memory/diff", () => {
       getStore: () => store,
       getEmbedding: () => undefined,
       getStorage: () => ({
+        // 真实 appendFile 写原始字节不加换行——mock 自动补 "\n" 会掩盖
+        // 调用方漏写换行的 bug（JSONL 行粘连）。
         appendFile: async (key: string, content: string) => {
-          writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content + "\n");
+          writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content);
         },
       }) as never,
       logger: { info() {}, debug() {}, warn() {}, error() {} },
@@ -159,6 +161,13 @@ describe("POST /memory/diff", () => {
     const empty = await call("/v3/memory/diff", { session_id: "ses-y", until: "2000-01-01T00:00:00Z" });
     expect(empty.data!.changes).toHaveLength(0);
   });
+
+  it("rejects unparseable since/until instead of silently mis-filtering", async () => {
+    const bad = await call("/v3/memory/diff", { session_id: "ses-y", since: "not-a-date" });
+    expect(bad.status).toBe(400);
+    const bad2 = await call("/v3/memory/diff", { session_id: "ses-y", until: "next friday" });
+    expect(bad2.status).toBe(400);
+  });
 });
 
 describe("POST /memory/diff/revert", () => {
@@ -180,7 +189,7 @@ describe("POST /memory/diff/revert", () => {
       getEmbedding: () => undefined,
       getStorage: () => ({
         appendFile: async (key: string, content: string) => {
-          writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content + "\n");
+          writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content);
         },
       }) as never,
       logger: { info() {}, debug() {}, warn() {}, error() {} },
@@ -283,6 +292,56 @@ describe("POST /memory/diff/revert", () => {
     const { status } = await call("/v3/memory/diff/revert", { reason: "x" });
     expect(status).toBe(400);
   });
+
+  it("tombstone line is newline-terminated so the next append cannot glue onto it", async () => {
+    await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    const file = [...writtenFiles.values()].find((v) => v.includes('"tombstone":"l1"'));
+    expect(file?.endsWith("\n")).toBe(true);
+    // 行级完整性：文件里每个非空行都必须能独立 JSON.parse（粘连行会挂）。
+    for (const line of (file ?? "").split("\n").filter((l) => l.trim())) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+  });
+
+  it("blocks reverting a mid-chain record that was itself superseded", async () => {
+    // m_c supersedes m_b — reverting m_b would resurrect m_a while m_c stays live.
+    await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("salary 7000"), decision: decision("m_c", "update", ["m_b"], "salary 7000") });
+    const mid = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(mid.status).toBe(409);
+    // Reverting the newest record in the chain is the correct path.
+    const tip = await call("/v3/memory/diff/revert", { record_id: "m_c" });
+    expect(tip.status).toBe(200);
+    expect(tip.data).toMatchObject({ record_id: "m_c", reverted: true, restored: ["m_b"] });
+  });
+
+  it("api_mutation mirror events do not hijack the revert lastWrite", async () => {
+    // 模拟管理面镜像事件落在提取写入之后：它无 supersedes/快照/session，
+    // 若被当作 lastWrite，revert 会恢复 0 条且 reverted 事件挂空 session。
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "t1", user_id: "u1", agent_id: "a1",
+      op: "updated", record_id: "m_b", content: "", version: 0,
+      layer: "l1", source: "api_mutation",
+    });
+    const { status, data } = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
+    const reverted = store.queryMemoryEvents({ record_id: "m_b", op: "reverted" });
+    expect(reverted[0].session_id).toBe("ses-y");
+  });
+
+  it("single-element record_ids returns the batch shape (field-driven, not length-driven)", async () => {
+    const { status, data } = await call("/v3/memory/diff/revert", { record_ids: ["m_b"] });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ succeeded: 1, failed: 0 });
+    expect(data!.results as unknown[]).toHaveLength(1);
+  });
+
+  it("record_id + record_ids combined may not exceed 50", async () => {
+    const ids = Array.from({ length: 50 }, (_, i) => `m_x${i}`);
+    const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b", record_ids: ids });
+    expect(status).toBe(400);
+  });
 });
 
 describe("POST /memory/history", () => {
@@ -360,6 +419,13 @@ describe("POST /memory/history", () => {
     const { status } = await call("/v3/memory/history", {});
     expect(status).toBe(400);
   });
+
+  it("strips snapshot_json from the response (full row dumps stay server-side)", async () => {
+    const { data } = await call("/v3/memory/history", { record_id: "m_a" });
+    const events = data!.events as Array<Record<string, unknown>>;
+    expect(events.length).toBeGreaterThan(0);
+    for (const e of events) expect(e.snapshot_json).toBeUndefined();
+  });
 });
 
 describe("POST /memory/review/inbox", () => {
@@ -430,6 +496,19 @@ describe("POST /memory/review/inbox", () => {
   it("until filter bounds the scan window", async () => {
     const { data } = await call("/v3/memory/review/inbox", { until: "2000-01-01T00:00:00Z" });
     expect(data!.sessions).toHaveLength(0);
+  });
+
+  it("scans the NEWEST events when the window exceeds limit (desc order)", async () => {
+    // 总事件数(4) > limit(3)：升序扫描会把最新 session 切掉，倒序保证最新窗口。
+    for (let i = 0; i < 2; i++) {
+      await writeMemory({ ...writeIso, sessionId: `ses-new-${i}`, baseDir: dir, vectorStore: store, memory: memory(`fact ${i}`), decision: decision(`m_n${i}`, "store") });
+    }
+    const { status, data } = await call("/v3/memory/review/inbox", { limit: 3 });
+    expect(status).toBe(200);
+    expect(data!.truncated).toBe(true);
+    const sids = (data!.sessions as Array<Record<string, unknown>>).map((s) => s.session_id);
+    // 最新的 ses-new-1 必须在窗口内；最早的 ses-x 事件被截断属于预期。
+    expect(sids).toContain("ses-new-1");
   });
 });
 

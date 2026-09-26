@@ -11,7 +11,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { MemoryEvent } from "../types.js";
+import type { L0Record, MemoryEvent } from "../types.js";
+import type { MemoryRecord } from "../../record/l1-writer.js";
 import { TcvdbMemoryStore } from "../tcvdb/memory-store.js";
 import { VectorStore } from "./memory-store.js";
 
@@ -464,5 +465,119 @@ describe("sqlite memory_events event_id", () => {
 
   it("invalid op is still rejected rather than silently ignored", () => {
     expect(() => store.appendMemoryEvent(ev({ event_id: "evt-bad", op: "bogus" }) as never)).toThrow();
+  });
+});
+
+describe("sqlite store-level instant/filter contract", () => {
+  let dir: string;
+  let store: VectorStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "mem-contract-"));
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const ev = (over: Partial<MemoryEvent> = {}): MemoryEvent => ({
+    event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
+    team_id: "t1", agent_id: "a1", op: "created", record_id: "m_x", content: "v1", ...over,
+  });
+  const rec = (over: Partial<MemoryRecord> = {}): MemoryRecord => ({
+    id: "m_rec", content: "c", type: "work_fact", priority: 50, scene_name: "default",
+    source_message_ids: [], metadata: {}, timestamps: [],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+    sessionKey: "sk", sessionId: "ses", teamId: "t1", userId: "u1", agentId: "a1",
+    ...over,
+  });
+  const l0 = (over: Partial<L0Record> = {}): L0Record => ({
+    id: "l0_1", sessionKey: "sk", sessionId: "ses", role: "user",
+    messageText: "hi", recordedAt: "2026-01-01T00:00:00.000Z", timestamp: 0, ...over,
+  });
+
+  it("appendMemoryEvent enforces canonical event_ts at store level", () => {
+    expect(() => store.appendMemoryEvent(ev({ event_ts: "March 5, 2026" }))).toThrow(/non-canonical/);
+    expect(() => store.appendMemoryEvent(ev({ event_ts: "2026-01-01T00:00:00.123456Z" }))).toThrow(/non-canonical/);
+    // 等价拼法在写入点坍缩为规范形——+08:00 = 02:00Z
+    store.appendMemoryEvent(ev({ event_ts: "2026-01-01T10:00:00+08:00", record_id: "m_off" }));
+    expect(store.queryMemoryEvents({ record_id: "m_off" })[0]!.event_ts).toBe("2026-01-01T02:00:00.000Z");
+  });
+
+  it("redactMemoryEvents refuses filters carrying fields outside the whitelist", () => {
+    store.appendMemoryEvent(ev({ record_id: "m_keep" }));
+    const n = store.redactMemoryEvents({ team_id: "t1", agent_id: "a1", task_id: "tk", until: "2026-12-31T00:00:00.000Z" } as never);
+    expect(n).toBe(0);
+    expect(store.queryMemoryEvents({ record_id: "m_keep" })[0]!.content).toBe("v1");
+  });
+
+  it("upsertL1 rejects non-canonical instants and normalizes equivalent forms", () => {
+    expect(store.upsertL1(rec({ updatedAt: "yesterday" }), undefined)).toBe(false);
+    expect(store.upsertL1(rec({ id: "m_bad", createdAt: "not a date" }), undefined)).toBe(false);
+    // "" 是不朽哨兵（兼作 80% 护栏下的 keeper 行）
+    expect(store.upsertL1(rec({ id: "m_imm", updatedAt: "" }), undefined)).toBe(true);
+    // "+08:00" → 02:00Z：cutoff 03:00Z 下按过期删除（存原始串会词法漏删）
+    expect(store.upsertL1(rec({ id: "m_off", updatedAt: "2026-01-01T10:00:00+08:00" }), undefined)).toBe(true);
+    expect(store.deleteL1Expired("2026-01-01T03:00:00.000Z")).toBe(1);
+    // 余下只有 '' 哨兵行——TTL 永不删
+    expect(store.deleteL1Expired("2026-01-01T03:00:00.000Z")).toBe(0);
+  });
+
+  it("upsertL0 rejects a non-canonical recordedAt", () => {
+    expect(store.upsertL0(l0({ recordedAt: "March 5, 2026" }), undefined)).toBe(false);
+    expect(store.upsertL0(l0({ id: "l0_keep", recordedAt: "" }), undefined)).toBe(true); // '' keeper
+    expect(store.upsertL0(l0({ id: "l0_ok", recordedAt: "2026-01-01T10:00:00+08:00" }), undefined)).toBe(true);
+    expect(store.deleteL0Expired("2026-01-01T03:00:00.000Z")).toBe(1);
+  });
+
+  it("'' and 'default' are the same isolation bucket on query and redact", () => {
+    store.appendMemoryEvent(ev({ record_id: "m_leg", team_id: "" }));        // legacy/foreign form
+    store.appendMemoryEvent(ev({ record_id: "m_def", team_id: "default" })); // contract form
+    store.appendMemoryEvent(ev({ record_id: "m_t1", team_id: "t1" }));
+    // 一个 "default" 过滤同时覆盖两种存储形态；"" 过滤愈合为同一过滤
+    for (const team_id of ["default", ""]) {
+      const ids = store.queryMemoryEvents({ team_id }).map((e) => e.record_id).sort();
+      expect(ids).toEqual(["m_def", "m_leg"]);
+    }
+    // 擦除同样双形态命中（marker 侧覆盖语义由 markerCovers 的对称愈合保证）
+    expect(store.redactMemoryEvents({ team_id: "default", until: "2027-01-01T00:00:00.000Z" })).toBe(2);
+    expect(store.redactMemoryEvents({ team_id: "t1", until: "2027-01-01T00:00:00.000Z" })).toBe(1);
+  });
+
+  it("init normalizes legacy '' isolation ids and non-canonical instant columns", async () => {
+    const migDir = mkdtempSync(path.join(tmpdir(), "mem-contract-mig-"));
+    try {
+      const dbPath = path.join(migDir, "vectors.db");
+      const seed = new VectorStore(dbPath, 0);
+      seed.init();
+      seed.close();
+      const { DatabaseSync } = await import("node:sqlite");
+      const db = new DatabaseSync(dbPath);
+      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content, team_id, user_id, agent_id)
+        VALUES ('2020-01-01T00:00:00.000Z', 'created', 'm_leg', 'x', '', '', '')`);
+      db.exec(`INSERT INTO l1_records (record_id, content, updated_time) VALUES
+        ('m_t', 'x', '2020-03-01T10:00:00+08:00'), ('m_k', 'x', '2030-01-01T00:00:00.000Z')`);
+      db.exec(`INSERT INTO l0_conversations (record_id, session_key, message_text, recorded_at) VALUES
+        ('l0_t', 'sk', 'hi', '2020-03-01T10:00:00+08:00'), ('l0_k', 'sk', 'hi', '2030-01-01T00:00:00.000Z')`);
+      db.close();
+
+      const reopened = new VectorStore(dbPath, 0);
+      try {
+        reopened.init();
+        const row = reopened.queryMemoryEvents({ record_id: "m_leg" })[0]!;
+        expect(row).toMatchObject({ team_id: "default", user_id: "default", agent_id: "default" });
+        // +08:00 → 02:00Z → cutoff 03:00Z 下过期（未归一化的字符串会漏删；
+        // keeper 行把比例压到 50%，不触发 80% 护栏）
+        expect(reopened.deleteL1Expired("2020-03-01T03:00:00.000Z")).toBe(1);
+        expect(reopened.deleteL0Expired("2020-03-01T03:00:00.000Z")).toBe(1);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(migDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
   });
 });

@@ -12,6 +12,7 @@
 
 import { z } from "zod";
 import { DEFAULT_ISOLATION_ID } from "../core/store/types.js";
+import { canonIsoTs } from "../core/store/memory-event-id.js";
 
 // ============================
 // Re-export all generated schemas as-is
@@ -53,7 +54,8 @@ export {
 export type {
   ConversationRole,
   Pagination,
-  ConversationAddRequest,
+  // ConversationAddRequest intentionally omitted: overridden below by the
+  // local schema-derived type (session_id default + idempotency_key).
   ConversationAddData,
   ConversationQueryRequest,
   ConversationQueryData,
@@ -126,17 +128,28 @@ export interface CountData {
   total: number;
 }
 
+// 时间戳边界契约：store 层全是裸字符串比较，词法序必须等于时间序——所以
+// 只收"能无损表示为毫秒"的 ISO 形态并归一化为规范形 `…ss.sssZ`：
+//   收：…ssZ / …ss.ssZ / …ss.sssZ / ±HH:mm（含省略秒的 …HH:mmZ）
+//   拒：date-only、无时区（本地时区歧义）、空格分隔、>3 位小数（有损舍入
+//   会放宽边界）、任何 Date.parse 不认的值——400 而不是静默错过滤。
+const isoDateString = z.string()
+  .refine((v) => canonIsoTs(v) !== null, {
+    message: "must be an ISO 8601 instant with timezone and ≤ms precision (normalized to YYYY-MM-DDTHH:mm:ss.sssZ)",
+  })
+  .transform((v) => canonIsoTs(v)!);
+
 export const conversationCountRequestSchema = z.object({
   session_id: z.string().min(1).optional(),
-  time_start: z.string().optional(),
-  time_end: z.string().optional(),
+  time_start: isoDateString.optional(),
+  time_end: isoDateString.optional(),
 });
 export type ConversationCountRequest = z.infer<typeof conversationCountRequestSchema>;
 
 export const atomicCountRequestSchema = z.object({
   type: z.string().optional(),
-  time_start: z.string().optional(),
-  time_end: z.string().optional(),
+  time_start: isoDateString.optional(),
+  time_end: isoDateString.optional(),
 });
 export type AtomicCountRequest = z.infer<typeof atomicCountRequestSchema>;
 
@@ -152,7 +165,7 @@ export type CoreCountRequest = z.infer<typeof coreCountRequestSchema>;
 // Override: atomic response version exposure
 // ============================
 
-export interface AtomicDetail extends GeneratedAtomicDetail {
+export interface AtomicDetail extends Omit<GeneratedAtomicDetail, "version"> {
   /** Monotonic L1 memory version, starts from 0 and increments on update/merge. */
   version: number;
   team_id?: string;
@@ -438,17 +451,6 @@ export type V2AuthContext = z.infer<typeof v2AuthContextSchema>;
 // POST /v2|v3/memory/diff — 聚合查询某个 session 的 L1 变更：
 // 每次写入操作一组 { op, record, replaced[] }，replaced 是被 superseded 的
 // 旧记录快照。原始事件行由 store.queryMemoryEvents 返回，聚合在 handler 完成。
-
-// since/until 必须是可解析的时间——store 层是裸字符串比较，垃圾值不会报错
-// 只会静默错过滤。注意这挡不住语义坑：date-only 的 until:"2026-01-15" 合法
-// 但会排掉当天全部事件（字典序 < "2026-01-15T…"）——调用方应传完整时间戳。
-const isoDateString = z.string().refine(
-  // Date.parse alone accepts "March 5, 2026" / "01/02/2026" / "2026" — all
-  // garbage under the stores' lexicographic event_ts compare. Require the ISO
-  // shape (date-only still legal; documented edge) AND parseability.
-  (v) => /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(v) && !Number.isNaN(Date.parse(v)),
-  { message: "must be an ISO 8601 timestamp (YYYY-MM-DD[THH:mm[:ss[.fff]][Z|±HH:mm]])" },
-);
 
 export const memoryDiffRequestSchema = z.object({
   /** 必填：查询哪个 session 的变更集。 */

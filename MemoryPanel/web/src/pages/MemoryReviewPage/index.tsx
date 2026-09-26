@@ -409,14 +409,14 @@ export function MemoryReviewPage() {
               <Input
                 size="m"
                 style={{ width: 170 }}
-                placeholder={t('memoryReview.since', '起始时间 (ISO)')}
+                placeholder={t('memoryReview.since', '起始时间 2026-01-01T00:00:00.000Z')}
                 value={sinceInput}
                 onChange={(v) => setSinceInput(v)}
               />
               <Input
                 size="m"
                 style={{ width: 170 }}
-                placeholder={t('memoryReview.until', '截止时间 (ISO)')}
+                placeholder={t('memoryReview.until', '截止时间 2026-01-01T00:00:00.000Z')}
                 value={untilInput}
                 onChange={(v) => setUntilInput(v)}
               />

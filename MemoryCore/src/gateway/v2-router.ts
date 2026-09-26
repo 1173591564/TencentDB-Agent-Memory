@@ -1054,16 +1054,6 @@ async function handleConversationCount(body: unknown, _auth: V2AuthContext, requ
   };
   const total = await store.countL0(countFilter);
   return successEnvelope<CountData>({ total }, requestId);
-
-  const allRows = await store.queryL0ForL1(session_id ?? "", undefined, 10000);
-  let filtered = session_id ? allRows.filter((r) => r.session_key === session_id || r.session_id === session_id) : allRows;
-  if (iso?.teamId) filtered = filtered.filter((r) => r.team_id === iso.teamId);
-  if (iso?.userId) filtered = filtered.filter((r) => r.user_id === iso.userId);
-  if (iso?.agentId) filtered = filtered.filter((r) => r.agent_id === iso.agentId);
-  if (iso?.taskId) filtered = filtered.filter((r) => r.task_id === iso.taskId);
-  if (time_start) { const ms = new Date(time_start).getTime(); filtered = filtered.filter((r) => r.timestamp >= ms); }
-  if (time_end) { const ms = new Date(time_end).getTime(); filtered = filtered.filter((r) => r.timestamp <= ms); }
-  return successEnvelope<CountData>({ total: filtered.length }, requestId);
 }
 
 async function handleConversationSearch(body: unknown, auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1764,8 +1754,10 @@ async function planRevert(
     limit: 1000,
   });
   const cleared = scopeDeletes.find((e) =>
-    (e.scope === "agent" || (e.scope === undefined && e.source === "api_mutation" && !e.user_id && e.record_id !== recordId)) &&
-    (!e.user_id || e.user_id === iso?.userId),
+    (e.scope === "agent" || (e.scope === undefined && e.source === "api_mutation" && (!e.user_id || e.user_id === "default") && e.record_id !== recordId)) &&
+    // userless management clears land on "default" under the 4-id contract —
+    // they cover every user; legacy "" rows still read as undefined.
+    (!e.user_id || e.user_id === "default" || e.user_id === iso?.userId),
   );
   if (cleared) {
     return fail(409, `Memory of this agent was cleared at ${cleared.event_ts} after record ${recordId} was written — reverting would resurrect cleared data`);
@@ -2140,10 +2132,14 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
   // 管理面侧查的是"前 limit+1 行再 JS 过滤无 user_id"——若先截断后过滤，
   // 真正的 clear/archive 事件可能被切掉而无人知晓：把截断信号并进 truncated。
   if (adminFetched.length > limit) truncated = true;
-  const adminEvents = adminFetched.slice(0, limit).filter((e) => !e.user_id);
+  // 无 user 归属 = 管理面操作（clear/archive）；4-id 契约下这类事件落
+  // user_id="default"，旧行的 "" 仍读作 undefined——两种形态都算。
+  const adminEvents = adminFetched.slice(0, limit).filter((e) => !e.user_id || e.user_id === "default");
 
   // 按 session_id 聚合。superseded/reverted 事件不计入"变更数"（它们分别
   // 属于被替代的旧记录和驳回动作），但 reverted 标记该 session 有待关注的驳回。
+  // 去重：4-id 契约下管理面事件落 user_id="default"，若 iso.userId 同样解析
+  // 为 "default"，同一事件会同时命中主查询与补充查询——按 event_id 只计一次。
   const bySession = new Map<string, {
     session_id: string;
     session_key: string;
@@ -2152,7 +2148,12 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
     last_event_ts: string;
     has_reverted: boolean;
   }>();
+  const seen = new Set<string>();
   for (const e of [...events, ...adminEvents]) {
+    if (e.event_id !== undefined) {
+      if (seen.has(e.event_id)) continue;
+      seen.add(e.event_id);
+    }
     const sid = e.session_id || "(unknown)";
     let entry = bySession.get(sid);
     if (!entry) {

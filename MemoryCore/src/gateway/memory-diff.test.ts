@@ -171,6 +171,43 @@ describe("POST /memory/diff", () => {
     const bad2 = await call("/v3/memory/diff", { session_id: "ses-y", until: "next friday" });
     expect(bad2.status).toBe(400);
   });
+
+  it("equivalent bounds normalize to the same instant (…ssZ ≡ …ss.sssZ)", async () => {
+    store.appendMemoryEvent({
+      event_ts: "2026-09-25T12:00:00.250Z", session_key: "sk-y", session_id: "ses-y",
+      team_id: "t1", user_id: "u1", agent_id: "a1",
+      op: "created", record_id: "m_ms", content: "boundary",
+    });
+    // '…00Z' and '…00.000Z' denote the same instant — the .250Z event must
+    // be included either way (pre-contract it was skipped under '…00Z').
+    for (const since of ["2026-09-25T12:00:00Z", "2026-09-25T12:00:00.000Z"]) {
+      const { status, data } = await call("/v3/memory/diff", { session_id: "ses-y", since });
+      expect(status).toBe(200);
+      expect(data!.changes.some((c) => c.record_id === "m_ms")).toBe(true);
+    }
+    // until at the same instant excludes the .250Z event either way.
+    const excl = await call("/v3/memory/diff", { session_id: "ses-y", until: "2026-09-25T12:00:00Z" });
+    expect(excl.data!.changes.some((c) => c.record_id === "m_ms")).toBe(false);
+  });
+
+  it("accepts offset/short-fraction bounds (normalized), rejects ambiguous/lossy forms", async () => {
+    const off = await call("/v3/memory/diff", { session_id: "ses-y", since: "2026-09-25T20:00:00+08:00" });
+    expect(off.status).toBe(200);
+    const frac = await call("/v3/memory/diff", { session_id: "ses-y", since: "2026-09-25T12:00:00.5Z" });
+    expect(frac.status).toBe(200);
+    const noSec = await call("/v3/memory/diff", { session_id: "ses-y", since: "2026-09-25T12:00Z" });
+    expect(noSec.status).toBe(200);
+    for (const [key, v] of [
+      ["since", "2026-09-25"],                  // date-only: until-then-excludes-the-day trap
+      ["until", "2026-09-25T12:00:00"],         // zone-less: parsed as local time, compared as written
+      ["since", "2026-09-25 12:00:00Z"],        // space separator
+      ["until", "2026-09-25T12:00:00.123456Z"], // >ms precision: rounding would widen the bound
+      ["since", "March 5, 2026"],
+    ] as const) {
+      const { status } = await call("/v3/memory/diff", { session_id: "ses-y", [key]: v });
+      expect(status).toBe(400);
+    }
+  });
 });
 
 describe("POST /memory/diff/revert", () => {
@@ -683,6 +720,42 @@ describe("POST /memory/review/inbox", () => {
     expect((adminBucket!.by_op as Record<string, number>).deleted).toBe(1); // 无 user 归属的那条
     // 其他 user 的镜像不出现
     expect(JSON.stringify(sessions)).not.toContain("m_of_other_user");
+  });
+
+  it("management ops stored with user 'default' surface once — main+admin double-hit deduped", async () => {
+    // 4-id 契约：无 user 归属的管理面事件落 user_id="default"。请求不带
+    // user 头时 iso.userId 同样解析为 "default"——同一事件同时命中主查询
+    // 与补充查询，event_id 去重后只能计一次。
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "t1", agent_id: "a1", user_id: "default",
+      op: "deleted", record_id: "chat_memory-t1-a1", content: "",
+      layer: "l1", source: "api_mutation",
+    });
+    const noUser = {
+      authorization: "Bearer test-key", "x-tdai-service-id": "svc",
+      "x-tdai-team-id": "t1", "x-tdai-agent-id": "a1",
+      "x-tdai-user-id": "default",
+    };
+    const { status, data } = await call("/v3/memory/review/inbox", {}, noUser);
+    expect(status).toBe(200);
+    const sessions = data!.sessions as Array<Record<string, unknown>>;
+    const adminBucket = sessions.find((s) => s.session_id === "");
+    expect((adminBucket!.by_op as Record<string, number>).deleted).toBe(1); // 不是 2
+  });
+
+  it("retention (TTL) events stay out of a real tenant's review inbox", async () => {
+    // retention 事件没有租户身份——落到 "default" 桶，只对 default 范围的
+    // 审阅可见；真实租户（t1/a1/u1）的 inbox 不含它（不跨租户泄漏）。
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "default", agent_id: "default", user_id: "default",
+      op: "deleted", record_id: "retention-l1-2026-03-01", content: "",
+      layer: "l1", source: "retention",
+    });
+    const { status, data } = await call("/v3/memory/review/inbox", {});
+    expect(status).toBe(200);
+    expect(JSON.stringify(data!.sessions)).not.toContain("retention-l1");
   });
 });
 

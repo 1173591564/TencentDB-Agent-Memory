@@ -674,7 +674,7 @@ export interface MemoryEvent {
   /**
    * deleted 事件的删除范围：record=单条（缺省）；agent=clear/archive 按
    * team+agent(+user) 整体清空（record_id 为资产 id）；retention=TTL 过期清理
-   *（record_id 为 `ttl:<cutoff>`，被删的是 updated_time < until 的全部 L1）。
+   *（record_id 为 `retention-l1-<cutoff>`，被删的是 updated_time < until 的全部 L1）。
    */
   scope?: "record" | "agent" | "retention";
   /** scope=agent|retention 的 deleted 事件：删除覆盖到的时间上界（ISO 8601）。 */

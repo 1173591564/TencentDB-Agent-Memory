@@ -63,7 +63,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
-import { newMemoryEventId } from "../memory-event-id.js";
+import { canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import type { Logger } from "../../types.js";
 import type {
   MemoryPromptListFilter,
@@ -162,6 +162,19 @@ const require = createRequire(import.meta.url);
 
 function requireNodeSqlite(): typeof import("node:sqlite") {
   return require("node:sqlite") as typeof import("node:sqlite");
+}
+
+/**
+ * Isolation-id equality for memory_events queries/redacts: a defined value
+ * heals "" → "default" (see healIsoId) and "default" matches BOTH stored
+ * forms — legacy/foreign rows may carry "" while contract writes store
+ * "default". Other values compare by plain equality.
+ */
+function pushIsoCond(conds: string[], args: SQLInputValue[], col: string, v: string | undefined): void {
+  if (v === undefined) return;
+  const healed = v || DEFAULT_ISOLATION_ID;
+  if (healed === DEFAULT_ISOLATION_ID) conds.push(`${col} IN ('','${DEFAULT_ISOLATION_ID}')`);
+  else { conds.push(`${col} = ?`); args.push(healed); }
 }
 
 /**
@@ -1006,6 +1019,66 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_ts ON memory_events(event_ts, seq)");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_event_id ON memory_events(event_id) WHERE event_id != ''");
 
+    // event_ts 契约：全链路裸字符串比较要求规范形 `…ss.sssZ`。老库可能存着
+    // 无毫秒/带偏移的非规范行（schema 收紧前写入或回放进来），此处一次性
+    // 归一化；连无损归一都做不到的行原样保留并告警。
+    try {
+      const legacy = this.db
+        .prepare("SELECT seq, event_ts FROM memory_events WHERE event_ts NOT GLOB '????-??-??T??:??:??.???Z'")
+        .all() as Array<{ seq: number; event_ts: string }>;
+      const fix = this.db.prepare("UPDATE memory_events SET event_ts = ? WHERE seq = ?");
+      let fixed = 0, bad = 0;
+      for (const r of legacy) {
+        const canon = canonIsoTs(r.event_ts);
+        if (canon === null) { bad += 1; continue; }
+        fix.run(canon, r.seq);
+        fixed += 1;
+      }
+      if (fixed > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${fixed} legacy memory_events.event_ts rows to canonical form`);
+      if (bad > 0) this.logger?.warn?.(`[memory-tdai][sqlite] ${bad} memory_events rows hold unrepresentable event_ts (left as-is)`);
+    } catch (err) {
+      this.logger?.warn?.(`[memory-tdai][sqlite] event_ts normalization failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // 4-id 契约：team/user/agent 的空形态统一为 "default"（对齐记录存储与
+    // resolveIsolation），历史 '' 行回填；task_id 保持 ''（无 default 约定）。
+    try {
+      let migrated = 0;
+      for (const col of ["team_id", "user_id", "agent_id"]) {
+        const res = this.db.prepare(`UPDATE memory_events SET ${col} = 'default' WHERE ${col} = ''`).run();
+        migrated += Number(res.changes);
+      }
+      if (migrated > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${migrated} legacy memory_events isolation ids to 'default'`);
+    } catch (err) {
+      this.logger?.warn?.(`[memory-tdai][sqlite] memory_events isolation-id normalization failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // l1/l0 的 instant 列与 event_ts 同一契约：'…ss.sssZ' 或 ''（不朽哨兵，
+    // TTL 守卫跳过）。老库可能存着非规范形态，同样一次性归一化。
+    for (const [table, col] of [
+      ["l1_records", "updated_time"],
+      ["l1_records", "created_time"],
+      ["l0_conversations", "recorded_at"],
+    ] as const) {
+      try {
+        const legacy = this.db
+          .prepare(`SELECT record_id, ${col} AS v FROM ${table} WHERE ${col} != '' AND ${col} NOT GLOB '????-??-??T??:??:??.???Z'`)
+          .all() as Array<{ record_id: string; v: string }>;
+        const fix = this.db.prepare(`UPDATE ${table} SET ${col} = ? WHERE record_id = ?`);
+        let fixed = 0, bad = 0;
+        for (const r of legacy) {
+          const canon = canonIsoTs(r.v);
+          if (canon === null) { bad += 1; continue; }
+          fix.run(canon, r.record_id);
+          fixed += 1;
+        }
+        if (fixed > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${fixed} legacy ${table}.${col} rows to canonical form`);
+        if (bad > 0) this.logger?.warn?.(`[memory-tdai][sqlite] ${bad} ${table}.${col} rows hold unrepresentable instants (left as-is)`);
+      } catch (err) {
+        this.logger?.warn?.(`[memory-tdai][sqlite] ${table}.${col} normalization failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     // ── Custom Memory Prompt ──
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS memory_prompts (
@@ -1352,6 +1425,19 @@ export class VectorStore implements IMemoryStore {
       this.logger?.warn(`${TAG} [L1-upsert] SKIPPED (degraded mode) id=${record.id}`);
       return false;
     }
+    // updated_time/created_time are lexically compared (TTL `updated_time < ?`,
+    // incremental cursors, ORDER BY) — only the canonical instant or the ""
+    // sentinel may persist; anything else is rejected rather than written
+    // as an uncomparable value.
+    const createdAt = canonRecordTs(record.createdAt);
+    const updatedAt = canonRecordTs(record.updatedAt);
+    if (createdAt === null || updatedAt === null) {
+      this.logger?.warn(
+        `${TAG} [L1-upsert] REJECTED id=${record.id}: timestamps outside the instant contract ` +
+        `(createdAt="${record.createdAt}" updatedAt="${record.updatedAt}")`,
+      );
+      return false;
+    }
     try {
       const { id: recordId, timestamps } = record;
       const tsStr = timestamps[0] ?? "";
@@ -1398,8 +1484,8 @@ export class VectorStore implements IMemoryStore {
           tsStr,
           tsStart,
           tsEnd,
-          record.createdAt,
-          record.updatedAt,
+          createdAt,
+          updatedAt,
           JSON.stringify(record.metadata),
           (record as MemoryRecord & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
           (record as MemoryRecord & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
@@ -1408,7 +1494,7 @@ export class VectorStore implements IMemoryStore {
         if (!skipVec) {
           // vec0 does not support ON CONFLICT → delete then insert
           this.stmtDeleteVec!.run(recordId);
-          this.stmtInsertVec!.run(recordId, Buffer.from(embedding!.buffer), record.updatedAt);
+          this.stmtInsertVec!.run(recordId, Buffer.from(embedding!.buffer), updatedAt);
         } else {
           this.logger?.debug?.(
             `${TAG} [L1-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${recordId}`,
@@ -1895,6 +1981,14 @@ export class VectorStore implements IMemoryStore {
       this.logger?.warn(`${TAG} [L0-upsert] SKIPPED (degraded mode) id=${record.id}`);
       return false;
     }
+    // recorded_at drives the lexical TTL sweep — same contract as above.
+    const recordedAt = canonRecordTs(record.recordedAt);
+    if (recordedAt === null) {
+      this.logger?.warn(
+        `${TAG} [L0-upsert] REJECTED id=${record.id}: recordedAt "${record.recordedAt}" outside the instant contract`,
+      );
+      return false;
+    }
     try {
       const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
 
@@ -1920,7 +2014,7 @@ export class VectorStore implements IMemoryStore {
           record.taskId || "",
           record.role,
           record.messageText,
-          record.recordedAt,
+          recordedAt,
           record.timestamp,
           (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
           (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
@@ -1929,7 +2023,7 @@ export class VectorStore implements IMemoryStore {
         if (!skipVec) {
           // vec0 does not support ON CONFLICT → delete then insert
           this.stmtL0DeleteVec!.run(record.id);
-          this.stmtL0InsertVec!.run(record.id, Buffer.from(embedding!.buffer), record.recordedAt);
+          this.stmtL0InsertVec!.run(record.id, Buffer.from(embedding!.buffer), recordedAt);
         } else {
           this.logger?.debug?.(
             `${TAG} [L0-upsert] Skipping vec write (${embedding ? "zero vector" : "no embedding"}) id=${record.id}`,
@@ -1953,7 +2047,7 @@ export class VectorStore implements IMemoryStore {
               (record as L0Record & { userId?: string }).userId || DEFAULT_ISOLATION_ID,
               (record as L0Record & { agentId?: string }).agentId || DEFAULT_ISOLATION_ID,
               record.role,
-              record.recordedAt,
+              recordedAt,
               record.timestamp,
             );
           } catch (ftsErr) {
@@ -3590,6 +3684,14 @@ export class VectorStore implements IMemoryStore {
 
   appendMemoryEvent(event: MemoryEvent): void {
     if (this.degraded) throw new Error("memory_events append rejected: sqlite store is degraded");
+    // Defense-in-depth: appendLedgerEvent already enforces this, but a row
+    // must never persist a timestamp the store itself cannot safely compare.
+    // (event_id is an opaque equality key — shape rules live at the ledger
+    // append / replay-parse trust boundaries, not the store mechanics layer.)
+    const eventTs = canonIsoTs(event.event_ts);
+    if (eventTs === null) {
+      throw new Error(`memory_events append rejected: non-canonical event_ts "${event.event_ts}" event_id=${event.event_id}`);
+    }
     const stmt = this.db.prepare(`
       INSERT INTO memory_events
         (event_ts, session_key, session_id, origin_session_id, origin_session_key,
@@ -3600,7 +3702,7 @@ export class VectorStore implements IMemoryStore {
       ON CONFLICT(event_id) WHERE event_id != '' DO NOTHING
     `);
     stmt.run(
-      event.event_ts,
+      eventTs,
       event.session_key,
       event.session_id,
       event.origin_session_id ?? "",
@@ -3642,9 +3744,9 @@ export class VectorStore implements IMemoryStore {
     if (filter.layer !== undefined)             { conds.push("layer = ?");             args.push(filter.layer); }
     if (filter.source !== undefined)            { conds.push("source = ?");            args.push(filter.source); }
     if (filter.request_id !== undefined)        { conds.push("request_id = ?");        args.push(filter.request_id); }
-    if (filter.team_id !== undefined)           { conds.push("team_id = ?");           args.push(filter.team_id); }
-    if (filter.agent_id !== undefined)          { conds.push("agent_id = ?");          args.push(filter.agent_id); }
-    if (filter.user_id !== undefined)           { conds.push("user_id = ?");           args.push(filter.user_id); }
+    pushIsoCond(conds, args, "team_id", filter.team_id);
+    pushIsoCond(conds, args, "agent_id", filter.agent_id);
+    pushIsoCond(conds, args, "user_id", filter.user_id);
     if (filter.task_id !== undefined)           { conds.push("task_id = ?");           args.push(filter.task_id); }
     if (filter.since !== undefined)             { conds.push("event_ts >= ?");         args.push(filter.since); }
     if (filter.until !== undefined)             { conds.push("event_ts <= ?");         args.push(filter.until); }
@@ -3728,17 +3830,23 @@ export class VectorStore implements IMemoryStore {
 
   redactMemoryEvents(filter: MemoryEventRedactFilter): number {
     if (this.degraded) throw new Error("memory_events redact rejected: sqlite store is degraded");
-    // event_ts 是字符串比较：不可解析的 until 不能安全匹配为空，反而可能
-    // 按字典序大面积误擦（"zzz" > 所有 ISO 串）。与 mongo/tcvdb 同一护栏。
-    if (Number.isNaN(Date.parse(filter.until))) return 0;
-    if (filter.team_id === undefined && filter.agent_id === undefined && filter.user_id === undefined) {
-      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${filter.until})`);
+    // event_ts 是字符串比较：非规范 until 不能安全匹配为空，反而可能按
+    // 字典序大面积误擦（所有 ISO 串 < "March 5, 2026"）。与 mongo/tcvdb
+    // 同一契约：毫秒精确形态归一化为 `…ss.sssZ`，其余拒绝。字段白名单与
+    // marker 读侧共享：未知字段会被静默忽略 → 过宽擦除，整体拒收。
+    if (!isValidRedactFilter(filter)) return 0;
+    const until = canonIsoTs(filter.until)!;
+    const teamId = healIsoId(filter.team_id);
+    const agentId = healIsoId(filter.agent_id);
+    const userId = healIsoId(filter.user_id);
+    if (teamId === undefined && agentId === undefined && userId === undefined) {
+      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${until})`);
     }
     const conds = ["event_ts <= ?", "(content != '' OR snapshot_json != '')"];
-    const args: SQLInputValue[] = [filter.until];
-    if (filter.team_id !== undefined)  { conds.push("team_id = ?");  args.push(filter.team_id); }
-    if (filter.agent_id !== undefined) { conds.push("agent_id = ?"); args.push(filter.agent_id); }
-    if (filter.user_id !== undefined)  { conds.push("user_id = ?");  args.push(filter.user_id); }
+    const args: SQLInputValue[] = [until];
+    pushIsoCond(conds, args, "team_id", teamId);
+    pushIsoCond(conds, args, "agent_id", agentId);
+    pushIsoCond(conds, args, "user_id", userId);
     const res = this.db.prepare(
       `UPDATE memory_events SET content = '', snapshot_json = '' WHERE ${conds.join(" AND ")}`,
     ).run(...args);

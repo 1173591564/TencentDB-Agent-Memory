@@ -29,7 +29,8 @@ import { join } from "node:path";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
-import { withMemoryEventId } from "../store/memory-event-id.js";
+import { DEFAULT_ISOLATION_ID } from "../store/isolation.js";
+import { canonIsoTs, EVENT_ID_RE, healIsoId, isValidRedactFilter, newMemoryEventId, withMemoryEventId } from "../store/memory-event-id.js";
 import type { Logger } from "../types.js";
 
 /** The store capabilities the ledger needs; health is tracked per store object and tenant. */
@@ -211,6 +212,12 @@ const pendingRedactionsByStore = new Map<object | string, Map<string, PendingRed
 const knownRedactionsByStore = new Map<object | string, Map<string, MemoryEventRedactFilter>>();
 
 function registerKnownRedaction(store: LedgerStore | undefined, filter: MemoryEventRedactFilter): void {
+  // markerCovers compares event_ts <= until lexically — every registered
+  // filter must carry a canonical until (defense-in-depth: callers already
+  // normalize, but a garbage until must never drive coverage checks).
+  const until = canonIsoTs(filter.until);
+  if (until === null) return;
+  filter = { ...filter, until };
   const key = storeKeyOf(store);
   let m = knownRedactionsByStore.get(key);
   if (!m) {
@@ -641,6 +648,37 @@ export async function appendLedgerEvent(params: {
 }): Promise<LedgerAppendResult> {
   const { store, storage, logger } = params;
   let event = withMemoryEventId(params.event);
+  // A caller-supplied id outside the contract shape is re-minted rather than
+  // persisted — a malformed id must not enter dedup space.
+  if (!EVENT_ID_RE.test(event.event_id)) {
+    logger?.warn?.(
+      `${TAG} append: malformed event_id "${event.event_id}" re-minted record_id=${event.record_id}`,
+    );
+    event = { ...event, event_id: newMemoryEventId() };
+  }
+  // event_ts is compared lexically everywhere (queries, markers, replay) —
+  // enforce the canonical ms form at ingest rather than trusting callers.
+  // A timestamp that cannot be losslessly represented is rejected loudly.
+  const eventTs = canonIsoTs(event.event_ts);
+  if (eventTs === null) {
+    logger?.warn?.(
+      `${TAG} append rejected: event_ts "${event.event_ts}" is not a millisecond-exact ISO instant ` +
+      `event_id=${event.event_id} record_id=${event.record_id}`,
+    );
+    return { event_id: event.event_id, jsonl: false, store: false };
+  }
+  // Isolation ids converge on the record-store form: "default" for
+  // team/user/agent (matching upsert bindings and resolveIsolation),
+  // undefined for task — never ""/missing/"default" for the same logical
+  // "no value". Coverage, scope and query filters all compare by equality.
+  event = {
+    ...event,
+    event_ts: eventTs,
+    team_id: event.team_id || DEFAULT_ISOLATION_ID,
+    agent_id: event.agent_id || DEFAULT_ISOLATION_ID,
+    user_id: event.user_id || DEFAULT_ISOLATION_ID,
+    task_id: event.task_id || undefined,
+  };
   // Redaction race guard: an append that lands after a clear/TTL must never
   // persist plaintext — not in the outbox (a rewrite may have already swept
   // that shard) and not in the store (its wipe already ran). Events covered by
@@ -726,7 +764,34 @@ export async function redactLedgerEvents(params: {
   filter: MemoryEventRedactFilter;
   logger?: LedgerLogger;
 }): Promise<{ jsonl: boolean; rewritten?: number; redacted?: number }> {
-  const { store, storage, filter, logger } = params;
+  const { store, storage, logger } = params;
+  // The marker's until drives lexical coverage checks everywhere — normalize
+  // to canonical form once so the outbox marker, registered filter and store
+  // call all carry the same bound. An unrepresentable until is rejected.
+  const until = canonIsoTs(params.filter.until);
+  if (until === null) {
+    logger?.warn?.(`${TAG} redaction rejected: until "${params.filter.until}" is not a millisecond-exact ISO instant`);
+    return { jsonl: false };
+  }
+  // "" ids heal to "default" on defined fields — the marker written to the
+  // outbox, the registered coverage filter and the store wipe must all
+  // agree on the same logical scope (undefined stays unconstrained).
+  const filter: MemoryEventRedactFilter = {
+    ...params.filter,
+    until,
+    team_id: healIsoId(params.filter.team_id),
+    agent_id: healIsoId(params.filter.agent_id),
+    user_id: healIsoId(params.filter.user_id),
+  };
+  // The same whitelist that guards on-disk markers guards the write path: a
+  // filter carrying fields outside {team_id,agent_id,user_id,until} (e.g. a
+  // task_id smuggled past the type) is silently dropped by coverage and the
+  // stores — erasing wider than claimed AND writing a marker replay would
+  // reject (plaintext then re-appends = un-redaction). Refuse outright.
+  if (!isValidRedactFilter(filter)) {
+    logger?.warn?.(`${TAG} redaction rejected: filter carries fields outside {team_id,agent_id,user_id,until}`);
+    return { jsonl: false };
+  }
   const out: { jsonl: boolean; rewritten?: number; redacted?: number } = { jsonl: false };
   // Register before any leg runs: appends covered by this filter must
   // skeletonize even while (or if) the marker/rewrite/store legs below fail.
@@ -797,38 +862,40 @@ const MEMORY_EVENT_OPS: ReadonlySet<string> = new Set<MemoryEvent["op"]>(
 );
 
 function isReplayableEvent(e: Partial<Record<keyof MemoryEvent, unknown>>): e is MemoryEvent {
-  return typeof e.event_id === "string" && e.event_id !== "" &&
+  return typeof e.event_id === "string" && EVENT_ID_RE.test(e.event_id) &&
     typeof e.record_id === "string" && e.record_id !== "" &&
     typeof e.op === "string" && MEMORY_EVENT_OPS.has(e.op) &&
-    typeof e.event_ts === "string" && !Number.isNaN(Date.parse(e.event_ts));
+    typeof e.event_ts === "string" && canonIsoTs(e.event_ts) !== null;
 }
 
 /**
- * A marker line is trusted to drive store wipes — only accept plain
- * {team_id?,agent_id?,user_id?,until} string fields with a parseable `until`.
- * Anything else is malformed (defense-in-depth: a forged/garbage marker could
- * otherwise widen a store wipe across tenants).
+ * A marker line is trusted to drive store wipes — validated by the shared
+ * isValidRedactFilter whitelist (see memory-event-id.ts). A forged/garbage
+ * marker — e.g. one smuggling a `task_id` coverage ignores — could otherwise
+ * widen a store wipe across tenants.
  */
-function isValidMarkerFilter(f: unknown): f is MemoryEventRedactFilter {
-  if (typeof f !== "object" || f === null || Array.isArray(f)) return false;
-  const r = f as Record<string, unknown>;
-  for (const k of ["team_id", "agent_id", "user_id", "task_id"]) {
-    if (r[k] !== undefined && typeof r[k] !== "string") return false;
-  }
-  return typeof r.until === "string" && !Number.isNaN(Date.parse(r.until));
-}
 
 function markerCovers(m: MemoryEventRedactFilter, e: MemoryEvent): boolean {
-  return e.event_ts <= m.until &&
-    (m.team_id === undefined || (e.team_id ?? "") === m.team_id) &&
-    (m.agent_id === undefined || (e.agent_id ?? "") === m.agent_id) &&
-    (m.user_id === undefined || (e.user_id ?? "") === m.user_id);
+  // Legacy rows may still carry ""/missing ids — read them through the same
+  // normalization writes use ("default") so coverage is form-independent.
+  const tenantMatch =
+    (m.team_id === undefined || (e.team_id || DEFAULT_ISOLATION_ID) === healIsoId(m.team_id)) &&
+    (m.agent_id === undefined || (e.agent_id || DEFAULT_ISOLATION_ID) === healIsoId(m.agent_id)) &&
+    (m.user_id === undefined || (e.user_id || DEFAULT_ISOLATION_ID) === healIsoId(m.user_id));
+  // Compare canonical instants: a foreign-writer line may carry `+08:00` or
+  // omitted-millis event_ts that lexically escapes a canonical until. An
+  // unevaluable timestamp is treated as in-window — a corrupt ts must not
+  // shield plaintext from a tenant-scoped wipe.
+  const ets = canonIsoTs(e.event_ts);
+  return tenantMatch && (ets === null || ets <= m.until);
 }
 
 function inScope(scope: LedgerScope | undefined, e: MemoryEvent): boolean {
-  return (scope?.team_id === undefined || (e.team_id ?? "") === scope.team_id) &&
-    (scope?.agent_id === undefined || (e.agent_id ?? "") === scope.agent_id) &&
-    (scope?.user_id === undefined || (e.user_id ?? "") === scope.user_id) &&
+  // Same legacy-form healing as markerCovers, on BOTH sides: ""/missing ids
+  // read as the write-side normalization target ("default"; task stays bare).
+  return (scope?.team_id === undefined || (e.team_id || DEFAULT_ISOLATION_ID) === healIsoId(scope.team_id)) &&
+    (scope?.agent_id === undefined || (e.agent_id || DEFAULT_ISOLATION_ID) === healIsoId(scope.agent_id)) &&
+    (scope?.user_id === undefined || (e.user_id || DEFAULT_ISOLATION_ID) === healIsoId(scope.user_id)) &&
     (scope?.task_id === undefined || (e.task_id ?? "") === scope.task_id);
 }
 
@@ -900,10 +967,18 @@ export async function replayLedgerEvents(params: {
       if (parsed.redact !== undefined) {
         // A redact object that fails validation must not silently act as an
         // event; it is not replayable either way — count it malformed.
-        if (!isValidMarkerFilter(parsed.redact)) {
+        if (!isValidRedactFilter(parsed.redact)) {
           out.malformed += 1;
           continue;
         }
+        // Normalize the bound: markerCovers compares event_ts <= until
+        // lexically, so a foreign writer's `+08:00`/`…ssZ` until would
+        // mis-cover (or a garbage one would cover everything). Defined
+        // "" ids heal to "default" for the same reason (see healIsoId).
+        parsed.redact.until = canonIsoTs(parsed.redact.until)!;
+        parsed.redact.team_id = healIsoId(parsed.redact.team_id);
+        parsed.redact.agent_id = healIsoId(parsed.redact.agent_id);
+        parsed.redact.user_id = healIsoId(parsed.redact.user_id);
         markersByKey.set(redactionKey(parsed.redact), parsed.redact);
         continue;
       }
@@ -911,7 +986,20 @@ export async function replayLedgerEvents(params: {
         out.malformed += 1;
         continue;
       }
-      events.push(parsed);
+      // Normalize event_ts to the canonical ms form so store rows, sorting
+      // and the `since` compare all share the one lexical-safe shape —
+      // foreign/outdated writer forms (+08:00, omitted millis) keep their
+      // instant, and lossy forms never reach the store. Isolation ids get
+      // the same healing: legacy ""/missing forms converge on the write
+      // contract ("default"/undefined) so scope filters see them uniformly.
+      events.push({
+        ...parsed,
+        event_ts: canonIsoTs(parsed.event_ts)!,
+        team_id: parsed.team_id || DEFAULT_ISOLATION_ID,
+        agent_id: parsed.agent_id || DEFAULT_ISOLATION_ID,
+        user_id: parsed.user_id || DEFAULT_ISOLATION_ID,
+        task_id: parsed.task_id || undefined,
+      });
     }
   }
   const markers = [...markersByKey.values()];

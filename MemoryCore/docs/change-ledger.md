@@ -138,7 +138,9 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 回放范围限定在请求 isolation 的 team/agent，按文件日期与 `event_ts` 过滤。
 - 依赖 `event_id` 幂等，可安全重复执行；非 JSON、非对象（如 `null`、数组）或缺 `event_id` 的畸形行计入 `malformed` 并跳过，不影响后续行与分片。
 - store 拒绝写入（含降级状态）时回放计入 `failed`，事件保持 pending，直到真正写入成功。
-- 未知 `op`、非字符串 `event_id`/`record_id`、无法解析的 `event_ts` 同样计入 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
+- 未知 `op`、非字符串 `event_id`/`record_id`、非毫秒精确的 `event_ts`（含可解析垃圾如自然语言、
+  无时区/超过毫秒精度的形态）同样计入 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
+  可无损归一的形态（`+08:00` 偏移、省略毫秒/秒）在落库前归一化为 `…ss.sssZ`；擦除标记的 `until` 同理。
 - 回放先重试 pending 的标记追加 / 分片改写，再用扫描到的全部标记（含其它 writer 写的）改写本 writer 拥有的分片
   （计入 `outbox_redacted`；失败计入 `outbox_failed` 并保持 pending）。`redacted` 统计被标记覆盖、以骨架形式回放的事件数。
 - 回放会先把扫描到的 clear/TTL 擦除标记重新应用到 store（收窄到请求的 team/agent，幂等，计入 `redactions_applied`）。
@@ -159,7 +161,10 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
   完整收敛待真实例验证多列 sort 决胜键（`id` 作次级 sort 是否被服务端接受）。
 - `event_ts` 取写入实例的本机时钟；多实例部署需 NTP 同步，时钟漂移会影响跨实例事件的相对顺序
   与 `since` 过滤，但不会导致事件丢失或重复（身份由 `event_id` 决定）。
-- 回放写入的事件保留原 `event_ts`，diff/history 中的顺序与原始写入一致。
+- `event_ts` 契约：全链路词法比较要求规范形 `YYYY-MM-DDTHH:mm:ss.sssZ`。三个注入口强制归一——
+  HTTP 边界 schema（`isoDateString`：收任意毫秒精确 ISO 形态归一化，歧义/有损形态 400）、
+  `appendLedgerEvent` 写入门禁（不可归一则拒写）、回放入口（行级归一化，不可归一计 `malformed`）。
+  回放写入的事件保留原时刻，diff/history 中的顺序与原始写入一致。
 
 ## conversation/add 幂等
 
@@ -188,10 +193,12 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 已知标记集是进程内状态且上限 10000 条（FIFO 淘汰）；另一进程的 in-flight 明文追加收敛于
   该进程的下次 backfill，与本节“其它 writer 分片”语义一致。
 - store 层查询/擦除语义（真 mongod 冒烟实测）：`queryMemoryEvents` 的 `limit` 被钳制到
-  `[1, 1000]`（`0`/负数按 1 处理，不是空集）、`offset` 负值归零；`event_ts` 为 ISO 字符串
-  字典序比较，未归一化的时间（如 `+08:00` 偏移）排序不等于时间序——写方必须归一化为 `Z`。
-- `redactMemoryEvents` 的 `until` 经 `isoToEpochMs` 校验：不可解析时返回 0 不擦除
-  （与 `deleteL1Expired` 同一护栏）；不带 team/agent/user 过滤时按全租户擦除并 warn。
+  `[1, 1000]`（`0`/负数按 1 处理，不是空集）、`offset` 负值归零；`event_ts` 词法比较的正确性
+  由上条契约保证（SQLite 存量非规范行在 init 时一次性归一化；Mongo/TCVDB 账本为本特性新增，
+  无存量包袱）。
+- `redactMemoryEvents` 的 `until` 经 `canonIsoTs` 校验：毫秒精确形态归一化后比较，
+  不可无损归一的值返回 0 不擦除（与 `deleteL1Expired` 的 `isoToEpochMs` 护栏不同——
+  后者数字域比较天然消歧，词法比较必须严格）；不带 team/agent/user 过滤时按全租户擦除并 warn。
 
 ## 保留期
 

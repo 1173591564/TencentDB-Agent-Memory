@@ -10,7 +10,7 @@ import { VectorStore } from "../store/sqlite/memory-store.js";
 import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
-import type { IMemoryStore, MemoryEvent } from "../store/types.js";
+import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
 import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId } from "./event-ledger.js";
 import { LocalMemoryCleaner } from "../../utils/memory-cleaner.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "./l1-writer.js";
@@ -29,6 +29,9 @@ const ev = (over: Partial<MemoryEvent> = {}): MemoryEvent => ({
   event_ts: "2026-03-01T10:00:00.000Z", session_key: "sk", session_id: "ses",
   team_id: "t1", agent_id: "a1", op: "created", record_id: "m_x", content: "v1", ...over,
 });
+
+/** Contract-shaped event ids — fixtures must survive replay's shape validation. */
+const eid = (n: number): string => `evt-${n.toString(16).padStart(32, "0")}`;
 
 describe("event ledger outbox", () => {
   let dir: string;
@@ -113,15 +116,77 @@ describe("event ledger outbox", () => {
   });
 
   it("rows with an unknown op or unparseable fields are malformed, not store failures", async () => {
-    const good = ev({ event_id: "evt-good" });
+    const good = ev({ event_id: eid(1) });
     await storage.appendFile(StoragePaths.event("2026-03-01"), [
-      JSON.stringify({ ...good, event_id: "evt-badop", op: "exploded" }),
-      JSON.stringify({ ...good, event_id: "evt-badts", event_ts: "yesterday" }),
+      JSON.stringify({ ...good, event_id: eid(7), op: "exploded" }),
+      JSON.stringify({ ...good, event_id: eid(8), event_ts: "yesterday" }),
+      JSON.stringify({ ...good, event_id: "evt-not32hex" }),
       JSON.stringify({ ...good, event_id: 7 }),
       JSON.stringify(good),
     ].join("\n") + "\n");
     const r = await replayLedgerEvents({ store, storage, logger: silent });
-    expect(r).toMatchObject({ scanned: 4, replayed: 1, malformed: 3, failed: 0 });
+    expect(r).toMatchObject({ scanned: 5, replayed: 1, malformed: 4, failed: 0 });
+  });
+
+  it("append normalizes missing isolation ids to 'default' (task stays absent)", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ team_id: undefined, agent_id: undefined, user_id: undefined, task_id: "" }), logger: silent });
+    const row = store.queryMemoryEvents({ record_id: "m_x" })[0]!;
+    expect(row).toMatchObject({ team_id: "default", agent_id: "default", user_id: "default" });
+    expect(row.task_id).toBeUndefined();
+  });
+
+  it("a caller-supplied event_id outside the contract shape is re-minted", async () => {
+    const r = await appendLedgerEvent({ store, storage, event: ev({ event_id: "not-an-evt" }), logger: silent });
+    expect(r.event_id).toMatch(/^evt-[0-9a-f]{32}$/);
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.event_id).toBe(r.event_id);
+  });
+
+  it("a redact marker smuggling an unknown field counts malformed and erases nothing", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ content: "secret" }), logger: silent });
+    await storage.appendFile(StoragePaths.event("2026-03-01"),
+      JSON.stringify({ redact: { team_id: "t1", agent_id: "a1", task_id: "tk", until: "2026-12-31T00:00:00.000Z" }, marker_ts: "2026-03-01T10:00:01.000Z" }) + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r.malformed).toBe(1);
+    // 被拒的 marker 未注册：同范围后续 append 仍是明文，历史行也未被骨架化。
+    await appendLedgerEvent({ store, storage, event: ev({ record_id: "m_after", content: "still" }), logger: silent });
+    expect(store.queryMemoryEvents({ record_id: "m_after" })[0]!.content).toBe("still");
+    expect(await storage.readFile(StoragePaths.event("2026-03-01"))).toContain("secret");
+  });
+
+  it("a '' team_id redact filter heals to 'default' — marker, registry and wipe agree", async () => {
+    // 无 team 归属的事件写入后落 "default"；一个带 "" 的 filter 语义相同——
+    // marker、注册表与 store 擦除必须命中同一批行，回放时覆盖关系才成立。
+    await appendLedgerEvent({ store, storage, event: ev({ team_id: undefined, content: "secret" }), logger: silent });
+    const res = await redactLedgerEvents({ store, storage, logger: silent,
+      filter: { team_id: "", until: "2026-12-31T00:00:00.000Z" } });
+    expect(res.redacted).toBe(1);
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+    // marker 写出的是愈合后的形态——回放按 "default" 覆盖，行为一致
+    const names = await storage.readdirNames("events/", ".jsonl");
+    const raw = (await Promise.all(names.map((n) => storage.readFile(`events/${n}`)))).join("");
+    expect(raw).toContain('"team_id":"default"');
+    // 注册表同形态覆盖：redact 之后无 team 归属的写入只能落骨架
+    await appendLedgerEvent({ store, storage, event: ev({ record_id: "m_after", team_id: undefined, content: "later" }), logger: silent });
+    expect(store.queryMemoryEvents({ record_id: "m_after" })[0]!.content).toBe("");
+  });
+
+  it("a foreign marker carrying '' ids still covers 'default'-normalized events", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ team_id: undefined, content: "secret" }), logger: silent });
+    await storage.appendFile(StoragePaths.event("2026-03-02"),
+      JSON.stringify({ redact: { team_id: "", agent_id: "a1", until: "2026-12-31T00:00:00.000Z" }, marker_ts: "2026-03-02T00:00:01.000Z" }) + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r.redactions_applied).toBe(1);
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+  });
+
+  it("redactLedgerEvents refuses a filter carrying an unknown field — no wipe, no marker", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ content: "secret" }), logger: silent });
+    const res = await redactLedgerEvents({ store, storage, logger: silent,
+      filter: { team_id: "t1", agent_id: "a1", task_id: "tk", until: "2026-12-31T00:00:00.000Z" } as never });
+    expect(res).toMatchObject({ jsonl: false });
+    expect(res.redacted).toBeUndefined();
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("secret");
+    expect(await storage.readFile(StoragePaths.event("2026-03-01"))).not.toContain('"redact"');
   });
 
   it("a failed store redaction degrades the ledger until backfill re-applies the marker", async () => {
@@ -176,6 +241,54 @@ describe("event ledger outbox", () => {
     const r = await replayLedgerEvents({ store: rejecting, storage, logger: silent });
     expect(r).toMatchObject({ replayed: 0, failed: 1 });
     expect(getLedgerHealth(rejecting, { team_id: "t1", agent_id: "a1" })).toMatchObject({ degraded: true, pending_store_events: 1 });
+  });
+
+  it("append rejects an unrepresentable event_ts and normalizes ms-exact forms", async () => {
+    const bad = await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-01" }), logger: silent });
+    expect(bad).toMatchObject({ jsonl: false, store: false });
+    expect(store.queryMemoryEvents({ record_id: "m_x" })).toHaveLength(0);
+
+    const ok = await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-01T18:00:00+08:00" }), logger: silent });
+    expect(ok).toMatchObject({ jsonl: true, store: true });
+    expect((await outboxLines()).at(-1)!.event_ts).toBe("2026-03-01T10:00:00.000Z");
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.event_ts).toBe("2026-03-01T10:00:00.000Z");
+  });
+
+  it("replay normalizes foreign event_ts forms and rejects ambiguous/lossy ones", async () => {
+    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+      JSON.stringify({ ...ev({ record_id: "m_off" }), event_ts: "2026-03-01T18:00:00+08:00", event_id: eid(2) }),
+      JSON.stringify({ ...ev({ record_id: "m_noms" }), event_ts: "2026-03-01T10:00:00Z", event_id: eid(3) }),
+      // Parseable garbage and zone-less instants are malformed, never stored.
+      JSON.stringify({ ...ev({ record_id: "m_bad" }), event_ts: "March 1, 2026", event_id: eid(9) }),
+      JSON.stringify({ ...ev({ record_id: "m_noz" }), event_ts: "2026-03-01T10:00:00", event_id: eid(10) }),
+      JSON.stringify({ ...ev({ record_id: "m_us" }), event_ts: "2026-03-01T10:00:00.123456Z", event_id: eid(11) }),
+    ].join("\n") + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r).toMatchObject({ replayed: 2, malformed: 3 });
+    expect(store.queryMemoryEvents({ record_id: "m_off" })[0]!.event_ts).toBe("2026-03-01T10:00:00.000Z");
+    expect(store.queryMemoryEvents({ record_id: "m_noms" })[0]!.event_ts).toBe("2026-03-01T10:00:00.000Z");
+  });
+
+  it("a marker's non-canonical until is normalized; a garbage until counts malformed and wipes nothing", async () => {
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ content: "secret" }), logger: silent });
+    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+      // "+08:00" → 2026-12-30T16:00:00.000Z — still covers the March event.
+      JSON.stringify({ redact: { team_id: "t1", agent_id: "a1", until: "2026-12-31T00:00:00+08:00" }, marker_ts: "2026-12-30T16:00:01.000Z" }),
+      // A parseable-but-non-ISO until would lexically cover EVERY event row.
+      JSON.stringify({ redact: { until: "March 5, 2026" }, marker_ts: "2026-03-05T00:00:00.000Z" }),
+    ].join("\n") + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r.malformed).toBe(1);
+    expect(r.redactions_applied).toBe(1);
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
+  });
+
+  it("redactLedgerEvents rejects an unrepresentable until before any leg runs", async () => {
+    await appendLedgerEvent({ store, storage, event: ev({ content: "keep" }), logger: silent });
+    const res = await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "next tuesday" }, logger: silent });
+    expect(res).toEqual({ jsonl: false });
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("keep");
+    expect((await outboxLines()).filter((l) => (l as unknown as { redact?: unknown }).redact)).toHaveLength(0);
   });
 
   it("rebuilding a store from the outbox reproduces writeMemory's events exactly", async () => {
@@ -367,8 +480,8 @@ describe("event ledger in-place outbox redaction", () => {
   });
 
   it("mixed legacy (unsuffixed) and per-writer shards replay and redact correctly", async () => {
-    await storage.appendFile(StoragePaths.event("2026-03-01"), JSON.stringify(ev({ event_id: "e_legacy", record_id: "m_l", content: "legacy secret" })) + "\n");
-    await storage.appendFile("events/2026-03-02.w9.jsonl", JSON.stringify(ev({ event_id: "e_other", event_ts: "2026-03-02T10:00:00.000Z", team_id: "t2", record_id: "m_o", content: "other" })) + "\n");
+    await storage.appendFile(StoragePaths.event("2026-03-01"), JSON.stringify(ev({ event_id: eid(4), record_id: "m_l", content: "legacy secret" })) + "\n");
+    await storage.appendFile("events/2026-03-02.w9.jsonl", JSON.stringify(ev({ event_id: eid(5), event_ts: "2026-03-02T10:00:00.000Z", team_id: "t2", record_id: "m_o", content: "other" })) + "\n");
     await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-03T10:00:00.000Z", record_id: "m_new", content: "new" }), logger: silent });
     expect(await shardNames()).toEqual(["2026-03-01.jsonl", "2026-03-02.w9.jsonl", "2026-03-03.w1.jsonl"]);
 
@@ -407,7 +520,7 @@ describe("event ledger in-place outbox redaction", () => {
     const cutoffMs = cutoff.getTime();
     // covered by the TTL (event_ts <= cutoff) but in a shard the cleaner keeps by name
     const oldTs = new Date(cutoffMs).toISOString();
-    await appendLedgerEvent({ store, storage, event: ev({ event_id: "e_old", event_ts: oldTs, content: "expired secret" }), logger: silent });
+    await appendLedgerEvent({ store, storage, event: ev({ event_id: eid(6), event_ts: oldTs, content: "expired secret" }), logger: silent });
     await appendLedgerEvent({ store, storage, event: ev({ event_ts: new Date(now).toISOString(), team_id: "t2", record_id: "m_live", content: "live" }), logger: silent });
 
     const ttlStore = Object.assign(Object.create(store) as IMemoryStore, {
@@ -426,7 +539,7 @@ describe("event ledger in-place outbox redaction", () => {
     const raw = await rawOutbox();
     expect(raw).not.toContain("expired secret");
     expect(raw).toContain("\"live\"");
-    expect(rows.find((r) => r.event_id === "e_old")).toMatchObject({ op: "created", record_id: "m_x", content: "" });
+    expect(rows.find((r) => r.event_id === eid(6))).toMatchObject({ op: "created", record_id: "m_x", content: "" });
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
   });
 

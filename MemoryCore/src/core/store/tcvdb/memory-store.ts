@@ -53,7 +53,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID } from "../types.js";
 import { TcvdbClient, TcvdbApiError } from "./client.js";
-import { newMemoryEventId } from "../memory-event-id.js";
+import { canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import type { BM25LocalEncoder } from "../bm25-local.js";
 import type { SparseVector } from "@tencentdb-agent-memory/tcvdb-text";
 import type {
@@ -198,6 +198,20 @@ function escapeFilterString(value: string): string {
 
 function eqFilter(field: string, value: string): string {
   return `${field} = "${escapeFilterString(value)}"`;
+}
+
+/**
+ * Isolation-id match for memory_events queries/redacts: a defined value
+ * heals "" → "default" (see healIsoId) and "default" matches BOTH stored
+ * forms — legacy/foreign rows may carry "" while contract writes store
+ * "default". Other values compare by plain equality.
+ */
+function isoCond(field: string, v: string | undefined): string | undefined {
+  const healed = healIsoId(v);
+  if (healed === undefined) return undefined;
+  return healed === DEFAULT_ISOLATION_ID
+    ? `(${field} = "" or ${field} = "${DEFAULT_ISOLATION_ID}")`
+    : eqFilter(field, healed);
 }
 
 function buildIsolationConditions(filter?: IsolationFilter): string[] {
@@ -726,6 +740,13 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private async _upsertL1Async(record: MemoryRecord): Promise<void> {
     await this._ensureInit();
     if (this.degraded) return;
+    // created_time/updated_time feed the _ms TTL/cursor compares — canonical
+    // instants or the "" sentinel only (same contract as sqlite/mongo).
+    if (canonRecordTs(record.createdAt) === null || canonRecordTs(record.updatedAt) === null) {
+      throw new Error(
+        `timestamps outside the instant contract (createdAt="${record.createdAt}" updatedAt="${record.updatedAt}")`,
+      );
+    }
 
     const tsStr = record.timestamps[0] ?? "";
     const tsStart = record.timestamps.length > 0
@@ -777,7 +798,18 @@ export class TcvdbMemoryStore implements IMemoryStore {
       await this._ensureInit();
       if (this.degraded) return 0;
 
-      const docs = records.map((record) => {
+      const ok = records.filter((record) => {
+        if (canonRecordTs(record.createdAt) === null || canonRecordTs(record.updatedAt) === null) {
+          this.logger?.warn?.(
+            `${TAG} [L1-batch] SKIPPED id=${record.id}: timestamps outside the instant contract`,
+          );
+          return false;
+        }
+        return true;
+      });
+      if (ok.length === 0) return 0;
+
+      const docs = ok.map((record) => {
         const tsStr = record.timestamps[0] ?? "";
         const tsStart = record.timestamps.length > 0
           ? record.timestamps.reduce((a, b) => (a < b ? a : b)) : tsStr;
@@ -817,7 +849,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       });
 
       await this.client.upsert(this.l1Collection, docs);
-      return records.length;
+      return docs.length;
     } catch (err) {
       this.logger?.warn(`${TAG} [L1-upsertBatch] FAILED (${records.length} records): ${err instanceof Error ? err.message : String(err)}`);
       return 0;
@@ -868,7 +900,9 @@ export class TcvdbMemoryStore implements IMemoryStore {
       await this._ensureInit();
       if (this.degraded) return 0;
 
-      const filter = `updated_time_ms < ${cutoffMs}`;
+      // `_ms > 0` mirrors sqlite's `updated_time != ''`: an absent timestamp
+      // (stored as 0) is an immortal sentinel, not "expired since epoch".
+      const filter = `updated_time_ms > 0 and updated_time_ms < ${cutoffMs}`;
       const toDelete = await this.client.count(this.l1Collection, filter);
       if (toDelete === 0) return 0;
 
@@ -1160,6 +1194,9 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private async _upsertL0Async(record: L0Record): Promise<void> {
     await this._ensureInit();
     if (this.degraded) return;
+    if (canonRecordTs(record.recordedAt) === null) {
+      throw new Error(`recordedAt "${record.recordedAt}" outside the instant contract`);
+    }
 
     const doc: Record<string, unknown> = {
       id: record.id,
@@ -1196,7 +1233,18 @@ export class TcvdbMemoryStore implements IMemoryStore {
       await this._ensureInit();
       if (this.degraded) return 0;
 
-      const docs = records.map((record) => {
+      const ok = records.filter((record) => {
+        if (canonRecordTs(record.recordedAt) === null) {
+          this.logger?.warn?.(
+            `${TAG} [L0-batch] SKIPPED id=${record.id}: recordedAt "${record.recordedAt}" outside the instant contract`,
+          );
+          return false;
+        }
+        return true;
+      });
+      if (ok.length === 0) return 0;
+
+      const docs = ok.map((record) => {
         const doc: Record<string, unknown> = {
           id: record.id,
           message_text: record.messageText,
@@ -1222,7 +1270,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       });
 
       await this.client.upsert(this.l0Collection, docs);
-      return records.length;
+      return docs.length;
     } catch (err) {
       this.logger?.warn(`${TAG} [L0-upsertBatch] FAILED (${records.length} records): ${err instanceof Error ? err.message : String(err)}`);
       return 0;
@@ -1253,7 +1301,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       await this._ensureInit();
       if (this.degraded) return 0;
 
-      const filter = `recorded_at_ms < ${cutoffMs}`;
+      const filter = `recorded_at_ms > 0 and recorded_at_ms < ${cutoffMs}`;
       const toDelete = await this.client.count(this.l0Collection, filter);
       if (toDelete === 0) return 0;
 
@@ -2617,13 +2665,19 @@ export class TcvdbMemoryStore implements IMemoryStore {
     // （replayLedgerEvents 先应用 redact 标记再落库），ledger 侧的
     // appendLedgerEvent 也对已知 marker 覆盖的事件写骨架 + 补定向擦除，
     // 不存在"明文事件覆盖已擦骨架"的路径。
+    // Defense-in-depth (same as sqlite/mongo): non-canonical event_ts must
+    // never reach a lexical compare.
+    const eventTs = canonIsoTs(event.event_ts);
+    if (eventTs === null) {
+      throw new Error(`memory_events append rejected: non-canonical event_ts "${event.event_ts}" event_id=${event.event_id}`);
+    }
     const id = event.event_id || newMemoryEventId();
     // dim=1 占位向量（events 不需向量检索，仅用 filter 查询）
     const doc: Record<string, unknown> = {
       id,
       vector: [0],
       event_id: id,
-      event_ts: event.event_ts,
+      event_ts: eventTs,
       session_key: event.session_key,
       session_id: event.session_id,
       origin_session_id: event.origin_session_id ?? "",
@@ -2676,9 +2730,12 @@ export class TcvdbMemoryStore implements IMemoryStore {
     if (filter.layer !== undefined) conds.push(eqFilter("layer", filter.layer));
     if (filter.source !== undefined) conds.push(eqFilter("source", filter.source));
     if (filter.request_id !== undefined) conds.push(eqFilter("request_id", filter.request_id));
-    if (filter.team_id !== undefined) conds.push(eqFilter("team_id", filter.team_id));
-    if (filter.agent_id !== undefined) conds.push(eqFilter("agent_id", filter.agent_id));
-    if (filter.user_id !== undefined) conds.push(eqFilter("user_id", filter.user_id));
+    const teamCond = isoCond("team_id", filter.team_id);
+    const agentCond = isoCond("agent_id", filter.agent_id);
+    const userCond = isoCond("user_id", filter.user_id);
+    if (teamCond !== undefined) conds.push(teamCond);
+    if (agentCond !== undefined) conds.push(agentCond);
+    if (userCond !== undefined) conds.push(userCond);
     if (filter.task_id !== undefined) conds.push(eqFilter("task_id", filter.task_id));
     // event_ts 是 ISO 8601 字符串，字典序即时间序（与 sqlite 实现一致）。
     if (filter.since !== undefined) conds.push(`event_ts >= "${escapeFilterString(filter.since)}"`);
@@ -2751,16 +2808,21 @@ export class TcvdbMemoryStore implements IMemoryStore {
   async redactMemoryEvents(filter: MemoryEventRedactFilter): Promise<number> {
     await this._ensureInit();
     if (this.degraded) throw new Error("memory_events redact rejected: tcvdb store is degraded");
-    // event_ts 是字符串比较：不可解析的 until 会按字典序大面积误擦而非
-    // 安全落空。与 sqlite/mongo 同一护栏。
-    if (isoToEpochMs(filter.until) <= 0) return 0;
-    if (filter.team_id === undefined && filter.agent_id === undefined && filter.user_id === undefined) {
-      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${filter.until})`);
+    // event_ts 是字符串比较：非规范 until 会按字典序大面积误擦而非安全
+    // 落空。与 sqlite/mongo 同一契约：毫秒精确形态归一化，其余拒绝。
+    // 字段白名单与 marker 读侧共享（未知字段会被静默忽略 → 过宽擦除）。
+    if (!isValidRedactFilter(filter)) return 0;
+    const until = canonIsoTs(filter.until)!;
+    const teamCond = isoCond("team_id", filter.team_id);
+    const agentCond = isoCond("agent_id", filter.agent_id);
+    const userCond = isoCond("user_id", filter.user_id);
+    if (teamCond === undefined && agentCond === undefined && userCond === undefined) {
+      this.logger?.warn?.(`${TAG} redactMemoryEvents without isolation filter: wipes events across ALL tenants (until=${until})`);
     }
-    const conds = [`event_ts <= "${escapeFilterString(filter.until)}"`];
-    if (filter.team_id !== undefined) conds.push(eqFilter("team_id", filter.team_id));
-    if (filter.agent_id !== undefined) conds.push(eqFilter("agent_id", filter.agent_id));
-    if (filter.user_id !== undefined) conds.push(eqFilter("user_id", filter.user_id));
+    const conds = [`event_ts <= "${escapeFilterString(until)}"`];
+    if (teamCond !== undefined) conds.push(teamCond);
+    if (agentCond !== undefined) conds.push(agentCond);
+    if (userCond !== undefined) conds.push(userCond);
     return this.client.update(this.eventsCollection, {
       filter: joinFilter(conds),
       update: { content: "", snapshot_json: "" },

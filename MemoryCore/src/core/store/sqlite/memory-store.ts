@@ -63,7 +63,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
-import { canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
+import { canonEventBound, canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import type { Logger } from "../../types.js";
 import type {
   MemoryPromptListFilter,
@@ -1028,11 +1028,18 @@ export class VectorStore implements IMemoryStore {
         .all() as Array<{ seq: number; event_ts: string }>;
       const fix = this.db.prepare("UPDATE memory_events SET event_ts = ? WHERE seq = ?");
       let fixed = 0, bad = 0;
-      for (const r of legacy) {
-        const canon = canonIsoTs(r.event_ts);
-        if (canon === null) { bad += 1; continue; }
-        fix.run(canon, r.seq);
-        fixed += 1;
+      this.db.exec("BEGIN");
+      try {
+        for (const r of legacy) {
+          const canon = canonIsoTs(r.event_ts);
+          if (canon === null) { bad += 1; continue; }
+          fix.run(canon, r.seq);
+          fixed += 1;
+        }
+        this.db.exec("COMMIT");
+      } catch (err) {
+        this.db.exec("ROLLBACK");
+        throw err;
       }
       if (fixed > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${fixed} legacy memory_events.event_ts rows to canonical form`);
       if (bad > 0) this.logger?.warn?.(`[memory-tdai][sqlite] ${bad} memory_events rows hold unrepresentable event_ts (left as-is)`);
@@ -1066,11 +1073,18 @@ export class VectorStore implements IMemoryStore {
           .all() as Array<{ record_id: string; v: string }>;
         const fix = this.db.prepare(`UPDATE ${table} SET ${col} = ? WHERE record_id = ?`);
         let fixed = 0, bad = 0;
-        for (const r of legacy) {
-          const canon = canonIsoTs(r.v);
-          if (canon === null) { bad += 1; continue; }
-          fix.run(canon, r.record_id);
-          fixed += 1;
+        this.db.exec("BEGIN");
+        try {
+          for (const r of legacy) {
+            const canon = canonIsoTs(r.v);
+            if (canon === null) { bad += 1; continue; }
+            fix.run(canon, r.record_id);
+            fixed += 1;
+          }
+          this.db.exec("COMMIT");
+        } catch (err) {
+          this.db.exec("ROLLBACK");
+          throw err;
         }
         if (fixed > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${fixed} legacy ${table}.${col} rows to canonical form`);
         if (bad > 0) this.logger?.warn?.(`[memory-tdai][sqlite] ${bad} ${table}.${col} rows hold unrepresentable instants (left as-is)`);
@@ -3748,8 +3762,8 @@ export class VectorStore implements IMemoryStore {
     pushIsoCond(conds, args, "agent_id", filter.agent_id);
     pushIsoCond(conds, args, "user_id", filter.user_id);
     if (filter.task_id !== undefined)           { conds.push("task_id = ?");           args.push(filter.task_id); }
-    if (filter.since !== undefined)             { conds.push("event_ts >= ?");         args.push(filter.since); }
-    if (filter.until !== undefined)             { conds.push("event_ts <= ?");         args.push(filter.until); }
+    if (filter.since !== undefined)             { conds.push("event_ts >= ?");         args.push(canonEventBound(filter.since)); }
+    if (filter.until !== undefined)             { conds.push("event_ts <= ?");         args.push(canonEventBound(filter.until)); }
 
     const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")}` : "";
     const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);

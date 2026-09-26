@@ -38,6 +38,16 @@ describe("tcvdb memory_events when degraded", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("reports an L1 upsert as failed instead of acknowledging a write that never landed", async () => {
+    const ts = "2026-03-01T10:00:00.000Z";
+    const ok = await store.upsertL1({
+      id: "m_x", content: "v2", type: "persona", priority: 50, scene_name: "",
+      source_message_ids: [], metadata: {}, timestamps: [ts], createdAt: ts, updatedAt: ts,
+      sessionKey: "sk", sessionId: "ses",
+    });
+    expect(ok).toBe(false);
+  });
+
   it("rejects appends so a failed write and a replay both keep the event pending", async () => {
     await expect(store.appendMemoryEvent(ev({ event_id: "evt-direct" }))).rejects.toThrow(/degraded/);
 

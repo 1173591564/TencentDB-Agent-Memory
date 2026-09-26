@@ -11,8 +11,9 @@ import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
-import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId } from "./event-ledger.js";
+import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, hasPendingLedgerEvent, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId } from "./event-ledger.js";
 import { LocalMemoryCleaner } from "../../utils/memory-cleaner.js";
+import { canonIsoTs, canonLegacyUntil } from "../store/memory-event-id.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "./l1-writer.js";
 
 const silent = { warn() {}, debug() {} };
@@ -113,6 +114,25 @@ describe("event ledger outbox", () => {
     const r = await replayLedgerEvents({ store, storage, logger: silent });
     expect(r).toMatchObject({ files: 2, scanned: 6, replayed: 2, malformed: 4, failed: 0 });
     expect(store.queryMemoryEvents({ limit: 10 }).map((e) => e.record_id)).toEqual(["m_a", "m_b"]);
+  });
+
+  it("rows with non-string content or isolation ids are malformed, never coerced into the store", async () => {
+    const good = ev({ event_id: eid(1) });
+    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+      JSON.stringify({ ...good, event_id: eid(2), team_id: 123 }),
+      JSON.stringify({ ...good, event_id: eid(3), content: { secret: "p" } }),
+      JSON.stringify({ ...good, event_id: eid(4), session_key: 5 }),
+      JSON.stringify({ ...good, event_id: eid(5), content: undefined }),
+      // Non-string-typed fields are shape-checked too: a scalar supersedes
+      // would crash the diff join iteration, a string version breaks compares.
+      JSON.stringify({ ...good, event_id: eid(6), supersedes: 5 }),
+      JSON.stringify({ ...good, event_id: eid(7), supersedes: "m_a" }),
+      JSON.stringify({ ...good, event_id: eid(8), version: "v3" }),
+      JSON.stringify(good),
+    ].join("\n") + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r).toMatchObject({ scanned: 8, replayed: 1, malformed: 7, failed: 0 });
+    expect(store.queryMemoryEvents({}).map((e) => e.event_id)).toEqual([eid(1)]);
   });
 
   it("rows with an unknown op or unparseable fields are malformed, not store failures", async () => {
@@ -291,6 +311,54 @@ describe("event ledger outbox", () => {
     expect((await outboxLines()).filter((l) => (l as unknown as { redact?: unknown }).redact)).toHaveLength(0);
   });
 
+  it("ledger health scope heals \"\" to \"default\" like every other isolation compare", async () => {
+    const bad = await appendLedgerEvent({ store, storage, event: ev({ team_id: "", agent_id: "", event_ts: "2026-02-30T00:00:00Z" }), logger: silent });
+    expect(bad.store).toBe(false);
+    expect(getLedgerHealth(store, { team_id: "", agent_id: "" })).toMatchObject({ degraded: true, pending_store_events: 1 });
+    expect(hasPendingLedgerEvent(store, "m_x", { team_id: "", agent_id: "" })).toBe(true);
+  });
+
+  it("a contract-rejected append or redaction degrades ledger health instead of vanishing", async () => {
+    const bad = await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-02-30T00:00:00Z" }), logger: silent });
+    expect(bad).toMatchObject({ jsonl: false, store: false });
+    expect(getLedgerHealth(store, { team_id: "t1", agent_id: "a1" })).toMatchObject({ degraded: true, pending_store_events: 1 });
+    resetLedgerHealth(store);
+    await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "next tuesday" }, logger: silent });
+    expect(getLedgerHealth(store, { team_id: "t1", agent_id: "a1" })).toMatchObject({ degraded: true, rejected_redactions: 1, pending_store_events: 0 });
+    expect(getLedgerHealth(store, { team_id: "t2", agent_id: "a1" }).degraded).toBe(false);
+    resetLedgerHealth(store);
+    // An unscoped (all-tenant) rejected redaction degrades every tenant's view.
+    await redactLedgerEvents({ store, storage, filter: { until: "next tuesday" }, logger: silent });
+    expect(getLedgerHealth(store, { team_id: "t1", agent_id: "a1" })).toMatchObject({ degraded: true, rejected_redactions: 1 });
+    expect(getLedgerHealth(store, { team_id: "t2", agent_id: "a1" }).degraded).toBe(true);
+    resetLedgerHealth(store);
+  });
+
+  it("replay canonicalizes a non-canonical since before the lexical event_ts compare", async () => {
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_ms", event_ts: "2026-03-01T10:00:00.250Z" }), logger: silent });
+    const r = await replayLedgerEvents({ store, storage, since: "2026-03-01T18:00:00+08:00", logger: silent });
+    expect(r.replayed).toBe(1);
+    expect(store.queryMemoryEvents({ record_id: "m_ms" })).toHaveLength(1);
+    await expect(replayLedgerEvents({ store, storage, since: "2026-02-30T00:00:00Z", logger: silent })).rejects.toThrow(/non-canonical/);
+  });
+
+  it("legacy marker untils (sub-ms, date-only) replay with the exact canonical bound", async () => {
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_in", event_ts: "2026-03-01T10:00:00.123Z", content: "s1" }), logger: silent });
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_out", event_ts: "2026-03-01T10:00:00.124Z", content: "s2" }), logger: silent });
+    await appendLedgerEvent({ store: undefined, storage, event: ev({ team_id: "t2", record_id: "m_day", event_ts: "2026-03-01T00:00:00.000Z", content: "s3" }), logger: silent });
+    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+      JSON.stringify({ redact: { team_id: "t1", agent_id: "a1", until: "2026-03-01T10:00:00.123999Z" }, marker_ts: "2026-03-01T10:00:01.000Z" }),
+      // date-only covered only events strictly before that day
+      JSON.stringify({ redact: { team_id: "t2", agent_id: "a1", until: "2026-03-01" }, marker_ts: "2026-03-01T10:00:02.000Z" }),
+    ].join("\n") + "\n");
+    const r = await replayLedgerEvents({ store, storage, logger: silent });
+    expect(r.malformed).toBe(0);
+    expect(r.redactions_applied).toBe(2);
+    expect(store.queryMemoryEvents({ record_id: "m_in" })[0]!.content).toBe("");
+    expect(store.queryMemoryEvents({ record_id: "m_out" })[0]!.content).toBe("s2");
+    expect(store.queryMemoryEvents({ record_id: "m_day" })[0]!.content).toBe("s3");
+  });
+
   it("rebuilding a store from the outbox reproduces writeMemory's events exactly", async () => {
     const base = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1", baseDir: dir, vectorStore: store, storage };
     await writeMemory({ ...base, memory: memory("salary 5000"), decision: decision("m_a", "store") });
@@ -367,6 +435,13 @@ describe("event ledger in-place outbox redaction", () => {
     expect(markers.map((m) => m.redact)).toContainEqual(filter);
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
     expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: false, pending_redactions: 0, pending_outbox_rewrites: 0 });
+  });
+
+  it("a covered outbox line with non-string plaintext is still skeletonized", async () => {
+    await storage.appendFile(StoragePaths.event("2026-03-01"),
+      JSON.stringify({ ...ev({ event_id: eid(9) }), content: { secret: "salary 5000" } }) + "\n");
+    await redactLedgerEvents({ store, storage, filter, logger: silent });
+    expect(await rawOutbox()).not.toContain("salary 5000");
   });
 
   it("persists the writer id in the data dir so a restarted process still owns its shards", async () => {
@@ -626,5 +701,29 @@ describe("event ledger in-place outbox redaction", () => {
     await replayLedgerEvents({ store, storage, scope, logger: silent });
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("");
     expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: false, pending_redactions: 0 });
+  });
+});
+
+describe("canonIsoTs strictness", () => {
+  it("rejects out-of-range fields instead of letting Date.parse roll them over", () => {
+    for (const v of [
+      "2026-02-30T00:00:00Z", "2026-02-29T00:00:00Z", "2026-13-01T00:00:00Z", "2026-00-10T00:00:00Z",
+      "2026-09-25T24:00:00Z", "2026-09-25T23:60:00Z", "2026-09-25T23:59:60Z", "2026-09-25T12:00:00+24:00",
+    ]) expect(canonIsoTs(v), v).toBeNull();
+    expect(canonIsoTs("2028-02-29T00:00:00Z")).toBe("2028-02-29T00:00:00.000Z");
+  });
+
+  it("rejects instants whose canonical form would leave the 4-digit year", () => {
+    expect(canonIsoTs("9999-12-31T23:59:59.999-01:00")).toBeNull();
+    expect(canonIsoTs("0000-01-01T00:30:00+01:00")).toBeNull();
+    expect(canonIsoTs("9999-12-31T23:59:59.999Z")).toBe("9999-12-31T23:59:59.999Z");
+  });
+
+  it("maps legacy marker untils without widening; others stay null", () => {
+    expect(canonLegacyUntil("2026-03-01T10:00:00.123999Z")).toBe("2026-03-01T10:00:00.123Z");
+    expect(canonLegacyUntil("2026-03-01")).toBe("2026-02-28T23:59:59.999Z");
+    expect(canonLegacyUntil("2026-02-30")).toBeNull();
+    expect(canonLegacyUntil("March 5, 2026")).toBeNull();
+    expect(canonLegacyUntil("2026-03-01T10:00:00")).toBeNull();
   });
 });

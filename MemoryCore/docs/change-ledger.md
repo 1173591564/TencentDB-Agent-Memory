@@ -18,6 +18,21 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - 历史数据的 `event_id` 为空（SQLite `''`、Mongo/TCVDB 缺字段），查询返回 `undefined`；
   调用方未传 `event_id` 时由 store 自动补生成。
 
+## 隔离 id 契约
+
+`team_id` / `user_id` / `agent_id` 的 `""`、缺失与 `"default"` 表示同一个逻辑值，
+写入一律收敛为 `"default"`（`task_id` 保持缺省，无 default 约定）：
+
+- `appendLedgerEvent` 与回放行归一化后落库（`""`/缺省 → `"default"`，task 缺省 → undefined）。
+- 比较双侧愈合：`healIsoId` 把 defined `""` → `"default"`，`undefined` 保持无约束；store
+  过滤对 `"default"` 同时匹配存量 `''` 与 `"default"` 两种形态
+  （SQLite `IN ('','default')`、Mongo `$in`、TCVDB `(x="" or x="default")`）——
+  外来写入的 `''` 行不会逃出 scope 查询或擦除覆盖。
+- 历史行在 init 迁移中由 `''` 回填为 `'default'`（SQLite / MongoDB 同款）。
+- 管理面镜像事件按**记录自身租户**归属：audit 行记请求方 IdFields（谁调的），ledger 事件
+  记 snapshot 里的记录 IdFields（改的是谁的数据）——请求缺 team 头的人工编辑不会把事件
+  错挂到 default 租户而绕过 revert 守卫。
+
 ## JSONL outbox
 
 - 路径：按 `event_ts` 的 UTC 日期、按写入进程（writer）分片，经 `StorageAdapter.appendFile` 写入，本地文件系统与 COS 后端均适用：
@@ -39,7 +54,9 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
      定向擦除（`store.redactMemoryEvents`），失败记 `pending_redactions`；
   4. 任一步失败只记 warn 与健康度计数，**不阻塞主写路径**。
 - 已知擦除标记集合（进程内）：本进程接受过的所有 clear/TTL filter + 回放时在 outbox
-  扫到的标记。被任一标记覆盖的追加永不携带明文——无论 append 与 redact 的相对时序如何，
+  扫到的标记，按 (team,agent,user) scope 去重——同 scope 只保留最大 `until`（后者严格
+  覆盖前者），容量界于不同 scope 数而非擦除次数（上限 10000，超出 FIFO 淘汰）。
+  被任一标记覆盖的追加永不携带明文——无论 append 与 redact 的相对时序如何，
   outbox 与 store 两条腿上都不会复活明文（跨进程时依赖对方节点回放后收敛）。
 - 接入点：L1 writer（created / superseded / updated / merged）、管理面 `recordAudit` 镜像、
   chat_memory clear 的 L1/L2/L3 deleted、`/memory/diff/revert` 的 reverted。
@@ -50,18 +67,25 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - 按逻辑 store（StorePool 建店时绑定 `backend:instanceId`，对象被 LRU 驱逐重建后记账延续）
   × 租户（team/agent，进程内）统计 `store_failures` / `jsonl_failures` / `last_failure_at`
   （不对外暴露后端原始错误文本），
-  以及 `pending_store_events`：已进 outbox、但尚未写入 store 的事件数。计数是进程级、重启清零，
+  以及 `pending_store_events`、`rejected_redactions`。计数是进程级、重启清零，
   多实例部署下各实例独立。
-- `degraded` 在 `pending_store_events > 0`、`pending_redactions > 0` 或出现不可恢复失败时为真。
+- `degraded` 在 `pending_store_events > 0`、`pending_redactions > 0`、
+  `rejected_redactions > 0` 或出现不可恢复失败时为真。
   backfill 成功回放后对应事件出队，补齐完成即自动解除降级。store 与 outbox 同时失败
   （或待补事件超过 10000 条上限）的事件无法回放，只能重启清零或 `reset`。
   仅 outbox 失败时 store 中的数据完整，不算降级，只计入 `jsonl_failures`。
+- **契约拒收也计入降级**（曾是静默消失）：`event_ts` 非法的 append 记为 unrecoverable
+  （并入 `pending_store_events`，无 outbox 副本可回放）；filter/`until` 非法的
+  redaction 记 `rejected_redactions`。区别：前者是真缺事件，`hasPendingLedgerEvent`
+  会闸住该 (team,agent) 租户的**所有** revert 直到 reset；后者没丢数据，不闸 revert。
+  scope 查询遵循同一隔离契约：defined `""` 读作 `"default"`；记入无租户桶的失败
+  （如无 scope 的被拒 redaction）对所有租户视角可见。
 - `POST /v3/memory/ledger/status` 返回 `{ supported, jsonl_outbox, backfill_enabled, health }`，
   `health` 含 `pending_redactions` / `pending_outbox_rewrites`。`{"reset": true}` 清零失败计数
   （运维手段，需 `TDAI_LEDGER_BACKFILL_ENABLED`）；**pending 擦除是未落地的工作项，不在 reset
   范围内**——只能由 backfill 真正落地或进程重启清除。
 - 出现过追加失败时，`/memory/diff`、`/memory/history` 与 `/memory/review/inbox` 响应附带
-  `ledger: { degraded: true, store_failures, jsonl_failures, pending_store_events, pending_redactions, last_failure_at }`，
+  `ledger: { degraded: true, store_failures, jsonl_failures, pending_store_events, pending_redactions, rejected_redactions, last_failure_at }`，
   MemoryPanel 审阅页据此显示“变更账降级”提示。
 - SQLite / TCVDB 的 `appendMemoryEvent` 在后端降级或写入失败时抛出，由 `appendLedgerEvent` 记为 pending，
   不影响主写路径。审阅路径（diff/history/inbox/revert）的查询失败一律 fail-closed，返回 503。
@@ -69,7 +93,8 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 ## 撤销守卫（revert）
 
 默认 fail-closed，以下情况返回 409：
-- 目标写入之后同 team/agent 有 `deleted`（clear/archive，`scope=agent`）或记录已不存在（含 TTL 清理）；
+- 目标写入之后同 team/agent 有管理面 `deleted`（`isManagementScopeDelete`：`scope==="agent"`；
+  旧版无 scope 事件仅在 `user_id` 为空时兼容）或记录已不存在（含 TTL 清理）；
 - 提取写入之后有 `source=api_mutation` 的人工编辑：先按 `event_id` 撤销该人工编辑层，或 `force:true` 覆盖；
 - 被恢复的旧记录还有其它存活后继（并发 session 分叉）；
 - 被恢复的旧记录没有可用快照（写入缺口或已被 clear/TTL 擦除）：默认 409，`force:true` 接受只删不恢复（响应带 `missing`）；
@@ -77,6 +102,11 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 
 管理面 update 事件带修改前的 `snapshot_json`，可按 `event_id` 逐层回退。`reviewer_id` 只取
 `x-tdai-reviewer-id` 请求头（MemoryPanel 以 `panelMeta.userId` 填入），忽略 body。
+
+撤销响应在 `reverted`/`restored`/`missing` 之外另带两个诚实标记（单条与批量 `results[]`
+每项一致）：`ledger_pending: true` —— `reverted` 事件只进了 outbox 未落 store，待
+backfill 补齐；`tombstone_pending: true` —— JSONL 墓碑未写成，回放可能复活该记录，
+需要重试撤销或人工补写墓碑。
 
 ## clear / TTL 擦除
 
@@ -102,6 +132,12 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - TTL 清理（L1 实际执行时）写一条 `source=retention`、`scope=retention`、`until=cutoff`、`record_id=retention-l1-<cutoff>`
   的批次 deleted 事件，然后走同一路径，filter 为不带租户的 `{ until: cutoff }`，覆盖所有租户的匹配行；
   过期的 outbox 分片按日期整体删除。批次事件不含逐条 record_id（`deleteL1Expired` 只返回数量），revert 依靠目标行不存在来拒绝。
+  retention 事件没有真实租户身份（归一化后落 `"default"`）：review inbox 按
+  `source/scope === "retention"` 显式排除，任何租户（含 default）都不会看到它。
+- review inbox 的管理面补查只认 `scope==="agent"` 的 `deleted`（旧版无 scope 事件仅在
+  `user_id` 为空时兼容）：4-id 契约下无 user 头的记录级删除同样落 `"default"`，按 user
+  判定会把它漏进同 team/agent 下所有 user 的收件箱。事件同时命中租户主查询与管理面
+  补查时按 `event_id` 去重只计一次。
 
 ### 明文何时真正消失
 
@@ -138,9 +174,14 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 回放范围限定在请求 isolation 的 team/agent，按文件日期与 `event_ts` 过滤。
 - 依赖 `event_id` 幂等，可安全重复执行；非 JSON、非对象（如 `null`、数组）或缺 `event_id` 的畸形行计入 `malformed` 并跳过，不影响后续行与分片。
 - store 拒绝写入（含降级状态）时回放计入 `failed`，事件保持 pending，直到真正写入成功。
-- 未知 `op`、非字符串 `event_id`/`record_id`、非毫秒精确的 `event_ts`（含可解析垃圾如自然语言、
-  无时区/超过毫秒精度的形态）同样计入 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
-  可无损归一的形态（`+08:00` 偏移、省略毫秒/秒）在落库前归一化为 `…ss.sssZ`；擦除标记的 `until` 同理。
+- 未知 `op`、非字符串字段（含 `content`、隔离 id、session 维度——后端会强转，如 SQLite 把
+  `123` 存成 `"123.0"` 篡改租户身份）、`version` 非 number、`supersedes` 非 string[]、
+  非毫秒精确的 `event_ts` 一律计 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
+  可无损归一的形态（`+08:00` 偏移、省略毫秒/秒）在落库前归一化为 `…ss.sssZ`。
+- 擦除标记的 `until` 额外兼容旧形态：亚毫秒小数向下取到毫秒（含 floor 到的那一格——
+  忠实于标记本意）、date-only `YYYY-MM-DD` 映射前一日 `23:59:59.999Z`（与原词法覆盖同集合）、
+  `…ssZ` 类无小数界欠覆盖（安全方向，重跑即补）；无法识别及带白名单外字段的 marker 计
+  `malformed` 不生效。回放 `since` 经 `canonEventBound` 归一，非法值直接抛错。
 - 回放先重试 pending 的标记追加 / 分片改写，再用扫描到的全部标记（含其它 writer 写的）改写本 writer 拥有的分片
   （计入 `outbox_redacted`；失败计入 `outbox_failed` 并保持 pending）。`redacted` 统计被标记覆盖、以骨架形式回放的事件数。
 - 回放会先把扫描到的 clear/TTL 擦除标记重新应用到 store（收窄到请求的 team/agent，幂等，计入 `redactions_applied`）。
@@ -161,9 +202,12 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
   完整收敛待真实例验证多列 sort 决胜键（`id` 作次级 sort 是否被服务端接受）。
 - `event_ts` 取写入实例的本机时钟；多实例部署需 NTP 同步，时钟漂移会影响跨实例事件的相对顺序
   与 `since` 过滤，但不会导致事件丢失或重复（身份由 `event_id` 决定）。
-- `event_ts` 契约：全链路词法比较要求规范形 `YYYY-MM-DDTHH:mm:ss.sssZ`。三个注入口强制归一——
-  HTTP 边界 schema（`isoDateString`：收任意毫秒精确 ISO 形态归一化，歧义/有损形态 400）、
-  `appendLedgerEvent` 写入门禁（不可归一则拒写）、回放入口（行级归一化，不可归一计 `malformed`）。
+- `event_ts` 契约：全链路词法比较要求规范形 `YYYY-MM-DDTHH:mm:ss.sssZ`。校验逐字段做范围
+  检查先于 `Date.parse`（`02-30`、`24:00`、越界偏移一律拒），输出必须仍是 4 位年规范形
+  （跨年溢出的 `+010000-…` 被拒）。五道门禁：HTTP 边界 schema（`isoDateString`）、
+  `appendLedgerEvent` 写入门禁（拒写并记 unrecoverable）、回放入口（行级归一化，不可归一
+  计 `malformed`）、三端 `appendMemoryEvent` store 层复检、store 查询 `since`/`until` 经
+  `canonEventBound`（非法边界抛错不错过滤）。
   回放写入的事件保留原时刻，diff/history 中的顺序与原始写入一致。
 
 ## conversation/add 幂等
@@ -175,6 +219,8 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 缓存未命中（跨实例 / 进程重启）时 L0 id 由作用域与消息序号确定性派生，并走 upsert 路径，
   L0 不会重复；但 pipeline 通知与 quota 上报可能再发生一次。需要跨实例严格幂等时，
   应在网关前置层按 key 做粘性路由或外部去重。
+- 任何一条 L0 落库失败（`upsertL0` 返回 false / 抛错）的响应**不**进幂等缓存——同 key
+  重试会真正重写而不是回放"假成功"。
 
 ## 进程内状态与已知限制
 
@@ -190,15 +236,23 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
   分片，那行明文不会被本次改写扫到（标记仍保证其不会进 store）。
 - `resetLedgerHealth` / `status {"reset":true}` 只清失败计数，不清 pending 擦除——后者是未完成的
   工作，丢弃它会让失败的 store 擦除永远不重试而账本却报健康。
-- 已知标记集是进程内状态且上限 10000 条（FIFO 淘汰）；另一进程的 in-flight 明文追加收敛于
-  该进程的下次 backfill，与本节“其它 writer 分片”语义一致。
+- 已知标记集是进程内状态：按 scope 去重、上限 10000 个不同 (team,agent,user) 组合
+  （FIFO 淘汰）；另一进程的 in-flight 明文追加收敛于该进程的下次 backfill，
+  与本节“其它 writer 分片”语义一致。
 - store 层查询/擦除语义（真 mongod 冒烟实测）：`queryMemoryEvents` 的 `limit` 被钳制到
   `[1, 1000]`（`0`/负数按 1 处理，不是空集）、`offset` 负值归零；`event_ts` 词法比较的正确性
-  由上条契约保证（SQLite 存量非规范行在 init 时一次性归一化；Mongo/TCVDB 账本为本特性新增，
-  无存量包袱）。
-- `redactMemoryEvents` 的 `until` 经 `canonIsoTs` 校验：毫秒精确形态归一化后比较，
-  不可无损归一的值返回 0 不擦除（与 `deleteL1Expired` 的 `isoToEpochMs` 护栏不同——
-  后者数字域比较天然消歧，词法比较必须严格）；不带 team/agent/user 过滤时按全租户擦除并 warn。
+  由上条契约保证（SQLite / MongoDB 存量非规范 `event_ts` 与 `''` 隔离 id 在 init 时一次性
+  归一化，失败仅告警不阻断启动；TCVDB 账本为本特性新增，无存量包袱；Mongo 仅匹配 `""`
+  值——字段整个缺失的外来 doc 不在迁移/双形态匹配范围内）。
+- `redactMemoryEvents` 的 filter 先过 `isValidRedactFilter` 白名单——仅
+  `team_id/agent_id/user_id/until`，未知字段（如运行时塞入的 `task_id`）整单拒绝；
+  `until` 经 `canonIsoTs` 校验：毫秒精确形态归一化后比较，不可无损归一的值返回 0 不擦除
+  （与 `deleteL1Expired` 的 `isoToEpochMs` 护栏不同——后者数字域比较天然消歧，词法比较
+  必须严格）；不带 team/agent/user 过滤时按全租户擦除并 warn。运行期
+  `redactLedgerEvents` 走同款校验，被拒的擦除记 `rejected_redactions`。
+- count 接口（`conversation/count`、`atomic/count`）的 `time_start`/`time_end` 保持
+  `z.string()`——与生成 schema 一致、不在本特性里夹带破坏性变更；这两个过滤仍是
+  裸字符串词法比较，信任调用方传规范形（基线行为，刻意不在本次收紧）。
 
 ## 保留期
 

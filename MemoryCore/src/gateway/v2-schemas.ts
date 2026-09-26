@@ -141,15 +141,15 @@ const isoDateString = z.string()
 
 export const conversationCountRequestSchema = z.object({
   session_id: z.string().min(1).optional(),
-  time_start: isoDateString.optional(),
-  time_end: isoDateString.optional(),
+  time_start: z.string().optional(),
+  time_end: z.string().optional(),
 });
 export type ConversationCountRequest = z.infer<typeof conversationCountRequestSchema>;
 
 export const atomicCountRequestSchema = z.object({
   type: z.string().optional(),
-  time_start: isoDateString.optional(),
-  time_end: isoDateString.optional(),
+  time_start: z.string().optional(),
+  time_end: z.string().optional(),
 });
 export type AtomicCountRequest = z.infer<typeof atomicCountRequestSchema>;
 

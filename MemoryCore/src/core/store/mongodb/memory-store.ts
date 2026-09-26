@@ -61,7 +61,7 @@ import type { MemoryRecord } from "../../record/l1-writer.js";
 import { DEFAULT_ISOLATION_ID } from "../isolation.js";
 import { mongoSearchScoreToScore } from "../tokenize.js";
 import { COLLECTIONS } from "./collections.js";
-import { canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
+import { canonEventBound, canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import {
   buildMemoryGenerationRefId,
   type MemoryGenerationLayer,
@@ -142,6 +142,7 @@ export class MongoMemoryStore implements IMemoryStore {
         );
       }
       await this.ensureSupportingIndexes(db);
+      await this.normalizeLegacyMemoryEvents(db);
       await this.ensureSearchIndexes(db);
       this.db = db;
       this.degraded = false;
@@ -156,6 +157,40 @@ export class MongoMemoryStore implements IMemoryStore {
       throw err;
     });
     return this.initPromise;
+  }
+
+  /**
+   * Same one-shot normalization as the sqlite store: event_ts is compared
+   * lexically, so pre-contract rows (`…ssZ`, `+08:00`) are rewritten to the
+   * canonical instant; unrepresentable ones are left and reported. Isolation
+   * ids converge on "default". Best-effort — filters already match both id
+   * forms, and a failure here must not block init.
+   */
+  private async normalizeLegacyMemoryEvents(db: Db): Promise<void> {
+    const coll = db.collection(COLLECTIONS.MEMORY_EVENTS);
+    try {
+      const legacy = coll.find(
+        { event_ts: { $not: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/ } } as never,
+        { projection: { _id: 1, event_ts: 1 } },
+      );
+      let fixed = 0, bad = 0;
+      for await (const d of legacy) {
+        const canon = typeof d.event_ts === "string" ? canonIsoTs(d.event_ts) : null;
+        if (canon === null) { bad += 1; continue; }
+        await coll.updateOne({ _id: d._id }, { $set: { event_ts: canon } });
+        fixed += 1;
+      }
+      if (fixed > 0) this.logger?.info?.(`${TAG} normalized ${fixed} legacy memory_events.event_ts docs to canonical form`);
+      if (bad > 0) this.logger?.warn?.(`${TAG} ${bad} memory_events docs hold unrepresentable event_ts (left as-is)`);
+      let migrated = 0;
+      for (const col of ["team_id", "user_id", "agent_id"]) {
+        const res = await coll.updateMany({ [col]: "" } as never, { $set: { [col]: DEFAULT_ISOLATION_ID } } as never);
+        migrated += res.modifiedCount;
+      }
+      if (migrated > 0) this.logger?.info?.(`${TAG} normalized ${migrated} legacy memory_events isolation ids to '${DEFAULT_ISOLATION_ID}'`);
+    } catch (err) {
+      this.logger?.warn?.(`${TAG} memory_events normalization failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async ensureSupportingIndexes(db: Db): Promise<void> {
@@ -981,8 +1016,8 @@ export class MongoMemoryStore implements IMemoryStore {
     // event_ts 是 ISO 8601 字符串，字典序即时间序（与 sqlite 实现一致）。
     if (filter.since !== undefined || filter.until !== undefined) {
       const range: Record<string, string> = {};
-      if (filter.since !== undefined) range.$gte = filter.since;
-      if (filter.until !== undefined) range.$lte = filter.until;
+      if (filter.since !== undefined) range.$gte = canonEventBound(filter.since);
+      if (filter.until !== undefined) range.$lte = canonEventBound(filter.until);
       q.event_ts = range;
     }
 

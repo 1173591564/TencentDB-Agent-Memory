@@ -214,6 +214,7 @@ describe("POST /memory/diff/revert", () => {
   let dir: string;
   let store: VectorStore;
   const writtenFiles = new Map<string, string>();
+  let failTombstone = false;
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     // Local capture, not a shared `captured` — concurrent calls (the revert
@@ -231,6 +232,7 @@ describe("POST /memory/diff/revert", () => {
       getEmbedding: () => undefined,
       getStorage: () => ({
         appendFile: async (key: string, content: string) => {
+          if (failTombstone && content.includes('"tombstone":"l1"')) throw new Error("cos down");
           writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content);
         },
       }) as never,
@@ -332,6 +334,20 @@ describe("POST /memory/diff/revert", () => {
   it("rejects an empty revert request", async () => {
     const { status } = await call("/v3/memory/diff/revert", { reason: "x" });
     expect(status).toBe(400);
+  });
+
+  it("a failed JSONL tombstone is reported (single and batch) instead of a clean success", async () => {
+    failTombstone = true;
+    try {
+      const single = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+      expect(single.status).toBe(200);
+      expect(single.data).toMatchObject({ reverted: true, tombstone_pending: true });
+      await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("salary 7000"), decision: decision("m_c", "store") });
+      const batch = await call("/v3/memory/diff/revert", { record_ids: ["m_c"] });
+      expect((batch.data!.results as Array<Record<string, unknown>>)[0]).toMatchObject({ reverted: true, tombstone_pending: true });
+    } finally {
+      failTombstone = false;
+    }
   });
 
   it("tombstone line is newline-terminated so the next append cannot glue onto it", async () => {
@@ -481,6 +497,16 @@ describe("POST /memory/diff/revert", () => {
     const undoExtraction = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     expect(undoExtraction.status).toBe(200);
     expect((await store.queryL1Records({ recordIds: ["m_a", "m_b"] })).map((r) => r.record_id)).toEqual(["m_a"]);
+  });
+
+  it("a manual edit made without the team header still blocks the owner's extraction revert", async () => {
+    const { "x-tdai-team-id": _team, ...noTeam } = ISO_HEADERS;
+    expect((await call("/v2/atomic/update", { id: "m_b", content: "salary 6500 (manual)" }, noTeam)).status).toBe(200);
+    const manual = store.queryMemoryEvents({ record_id: "m_b", source: "api_mutation" });
+    expect(manual).toHaveLength(1);
+    expect(manual[0]).toMatchObject({ team_id: "t1", user_id: "u1", agent_id: "a1" });
+    expect((await call("/v3/memory/diff/revert", { record_id: "m_b" })).status).toBe(409);
+    expect((await store.queryL1Records({ recordIds: ["m_b"] }))[0].content).toBe("salary 6500 (manual)");
   });
 
   it("reviewer identity comes from the x-tdai-reviewer-id header, never the body", async () => {
@@ -729,7 +755,7 @@ describe("POST /memory/review/inbox", () => {
     store.appendMemoryEvent({
       event_ts: new Date().toISOString(), session_key: "", session_id: "",
       team_id: "t1", agent_id: "a1", user_id: "default",
-      op: "deleted", record_id: "chat_memory-t1-a1", content: "",
+      op: "deleted", record_id: "chat_memory-t1-a1", content: "", scope: "agent",
       layer: "l1", source: "api_mutation",
     });
     const noUser = {
@@ -744,6 +770,22 @@ describe("POST /memory/review/inbox", () => {
     expect((adminBucket!.by_op as Record<string, number>).deleted).toBe(1); // 不是 2
   });
 
+  it("a default-user record-level mutation stays out of other users' inboxes", async () => {
+    // 不带 user 头的记录级编辑同样落 user_id="default"；只有 scope="agent" 的
+    // 管理面操作才进补充查询，否则会泄露进同 team/agent 下每个 user 的 inbox。
+    for (const op of ["updated", "deleted"] as const) {
+      store.appendMemoryEvent({
+        event_ts: new Date().toISOString(), session_key: "", session_id: "",
+        team_id: "t1", agent_id: "a1", user_id: "default",
+        op, record_id: `m_default_${op}`, content: "", layer: "l1", source: "api_mutation",
+      });
+    }
+    const { status, data } = await call("/v3/memory/review/inbox", {});
+    expect(status).toBe(200);
+    const sessions = data!.sessions as Array<Record<string, unknown>>;
+    expect(sessions.find((x) => x.session_id === "")).toBeUndefined();
+  });
+
   it("retention (TTL) events stay out of a real tenant's review inbox", async () => {
     // retention 事件没有租户身份——落到 "default" 桶，只对 default 范围的
     // 审阅可见；真实租户（t1/a1/u1）的 inbox 不含它（不跨租户泄漏）。
@@ -755,7 +797,24 @@ describe("POST /memory/review/inbox", () => {
     });
     const { status, data } = await call("/v3/memory/review/inbox", {});
     expect(status).toBe(200);
-    expect(JSON.stringify(data!.sessions)).not.toContain("retention-l1");
+    expect((data!.sessions as Array<Record<string, unknown>>).find((x) => x.session_id === "")).toBeUndefined();
+  });
+
+  it("retention events stay out of the default tenant's inbox too", async () => {
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "", session_id: "",
+      team_id: "default", agent_id: "default", user_id: "default",
+      op: "deleted", record_id: "retention-l1-2026-03-01", content: "",
+      layer: "l1", source: "retention", scope: "retention",
+    });
+    const defaults = {
+      authorization: "Bearer test-key", "x-tdai-service-id": "svc",
+      "x-tdai-team-id": "default", "x-tdai-agent-id": "default", "x-tdai-user-id": "default",
+    };
+    const { status, data } = await call("/v3/memory/review/inbox", {}, defaults);
+    expect(status).toBe(200);
+    // inbox 只输出 session 聚合（不含 record_id）——断言无 retention 形成的空 session 桶。
+    expect((data!.sessions as Array<Record<string, unknown>>).find((x) => x.session_id === "")).toBeUndefined();
   });
 });
 
@@ -1036,6 +1095,18 @@ describe("conversation/add idempotency", () => {
     expect(a).toHaveLength(2);
     expect(b).toEqual(a);
     expect(notified).toBe(1);
+    expect(countL0()).toBe(2);
+  });
+
+  it("a rejected write is not cached — a retry with the same key lands the rows", async () => {
+    const key = `k-${Math.random()}`;
+    const real = store.upsertL0.bind(store);
+    store.upsertL0 = () => false;
+    await call({ session_id: "ses-x", messages: msgs }, { "idempotency-key": key });
+    expect(countL0()).toBe(0);
+    store.upsertL0 = real;
+    const b = await call({ session_id: "ses-x", messages: msgs }, { "idempotency-key": key });
+    expect(b).toHaveLength(2);
     expect(countL0()).toBe(2);
   });
 

@@ -53,7 +53,7 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID } from "../types.js";
 import { TcvdbClient, TcvdbApiError } from "./client.js";
-import { canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
+import { canonEventBound, canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import type { BM25LocalEncoder } from "../bm25-local.js";
 import type { SparseVector } from "@tencentdb-agent-memory/tcvdb-text";
 import type {
@@ -739,7 +739,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   private async _upsertL1Async(record: MemoryRecord): Promise<void> {
     await this._ensureInit();
-    if (this.degraded) return;
+    if (this.degraded) throw new Error("L1 upsert rejected: tcvdb store is degraded");
     // created_time/updated_time feed the _ms TTL/cursor compares — canonical
     // instants or the "" sentinel only (same contract as sqlite/mongo).
     if (canonRecordTs(record.createdAt) === null || canonRecordTs(record.updatedAt) === null) {
@@ -1193,7 +1193,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   private async _upsertL0Async(record: L0Record): Promise<void> {
     await this._ensureInit();
-    if (this.degraded) return;
+    if (this.degraded) throw new Error("L0 upsert rejected: tcvdb store is degraded");
     if (canonRecordTs(record.recordedAt) === null) {
       throw new Error(`recordedAt "${record.recordedAt}" outside the instant contract`);
     }
@@ -2738,8 +2738,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
     if (userCond !== undefined) conds.push(userCond);
     if (filter.task_id !== undefined) conds.push(eqFilter("task_id", filter.task_id));
     // event_ts 是 ISO 8601 字符串，字典序即时间序（与 sqlite 实现一致）。
-    if (filter.since !== undefined) conds.push(`event_ts >= "${escapeFilterString(filter.since)}"`);
-    if (filter.until !== undefined) conds.push(`event_ts <= "${escapeFilterString(filter.until)}"`);
+    if (filter.since !== undefined) conds.push(`event_ts >= "${escapeFilterString(canonEventBound(filter.since))}"`);
+    if (filter.until !== undefined) conds.push(`event_ts <= "${escapeFilterString(canonEventBound(filter.until))}"`);
 
     const filterExpr = joinFilter(conds);
     const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);

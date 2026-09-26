@@ -30,7 +30,7 @@ import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
 import { DEFAULT_ISOLATION_ID } from "../store/isolation.js";
-import { canonIsoTs, EVENT_ID_RE, healIsoId, isValidRedactFilter, newMemoryEventId, withMemoryEventId } from "../store/memory-event-id.js";
+import { canonEventBound, canonIsoTs, canonLegacyUntil, EVENT_ID_RE, healIsoId, isValidRedactFilter, newMemoryEventId, withMemoryEventId } from "../store/memory-event-id.js";
 import type { Logger } from "../types.js";
 
 /** The store capabilities the ledger needs; health is tracked per store object and tenant. */
@@ -51,6 +51,8 @@ export interface LedgerHealth {
   pending_redactions: number;
   /** Of `pending_redactions`, those whose outbox marker or shard rewrite is still outstanding. */
   pending_outbox_rewrites: number;
+  /** Redactions refused by contract validation (bad `until`/filter shape): never applied, nothing to retry. */
+  rejected_redactions: number;
 }
 
 export interface LedgerAppendResult {
@@ -107,6 +109,7 @@ interface TenantHealth {
   pending: Map<string, string>;
   /** Store failures that cannot be cleared by replay (no outbox copy, or pending overflowed). */
   unrecoverable: number;
+  rejected_redactions: number;
 }
 
 const healthByStore = new Map<object | string, Map<string, TenantHealth>>();
@@ -151,6 +154,7 @@ export function bindLedgerStoreKey(store: object, key: string): void {
       if (cur) {
         cur.store_failures += v.store_failures; cur.jsonl_failures += v.jsonl_failures;
         cur.unrecoverable += v.unrecoverable;
+        cur.rejected_redactions += v.rejected_redactions;
         for (const [id, rid] of v.pending) cur.pending.set(id, rid);
         if (v.last_failure_at && (!cur.last_failure_at || v.last_failure_at > cur.last_failure_at)) cur.last_failure_at = v.last_failure_at;
       } else target.set(k, v);
@@ -161,7 +165,10 @@ export function bindLedgerStoreKey(store: object, key: string): void {
   if (known) {
     knownRedactionsByStore.delete(store);
     const target = knownRedactionsByStore.get(key) ?? new Map<string, MemoryEventRedactFilter>();
-    for (const [k, v] of known) target.set(k, v);
+    for (const [k, v] of known) {
+      const prev = target.get(k);
+      if (!prev || prev.until < v.until) target.set(k, v);
+    }
     knownRedactionsByStore.set(key, target);
   }
 }
@@ -224,10 +231,14 @@ function registerKnownRedaction(store: LedgerStore | undefined, filter: MemoryEv
     m = new Map();
     knownRedactionsByStore.set(key, m);
   }
-  if (!m.has(redactionKey(filter))) {
-    if (m.size >= MAX_PENDING_TRACKED) m.delete(m.keys().next().value!); // FIFO evict, bounded
-    m.set(redactionKey(filter), filter);
-  }
+  // Keyed by tenant dimensions only: a later `until` for the same dimensions
+  // subsumes earlier ones, so the map is bounded by distinct scopes rather
+  // than by redaction count.
+  const k = redactionScopeKey(filter);
+  const prev = m.get(k);
+  if (prev && prev.until >= until) return;
+  if (!prev && m.size >= MAX_PENDING_TRACKED) m.delete(m.keys().next().value!); // FIFO evict, bounded
+  m.set(k, filter);
 }
 
 /** Filters (pending or applied) that cover this event — content must not be persisted. */
@@ -235,6 +246,10 @@ function coveringRedactions(store: LedgerStore | undefined, event: MemoryEvent):
   const m = knownRedactionsByStore.get(storeKeyOf(store));
   if (!m) return [];
   return [...m.values()].filter((f) => markerCovers(f, event));
+}
+
+function redactionScopeKey(f: MemoryEventRedactFilter): string {
+  return JSON.stringify([healIsoId(f.team_id) ?? null, healIsoId(f.agent_id) ?? null, healIsoId(f.user_id) ?? null]);
 }
 
 function redactionKey(f: MemoryEventRedactFilter): string {
@@ -328,17 +343,29 @@ function tenantHealth(store: LedgerStore | undefined, event: Pick<MemoryEvent, "
   const k = tenantKey(team, agent);
   let h = tenants.get(k);
   if (!h) {
-    h = { team_id: team, agent_id: agent, store_failures: 0, jsonl_failures: 0, pending: new Map(), unrecoverable: 0 };
+    h = { team_id: team, agent_id: agent, store_failures: 0, jsonl_failures: 0, pending: new Map(), unrecoverable: 0, rejected_redactions: 0 };
     tenants.set(k, h);
   }
   return h;
 }
 
+/** Scope dims follow the isolation-id contract: a defined "" reads as "default". */
+function healScope(scope?: LedgerScope): LedgerScope | undefined {
+  if (!scope) return scope;
+  return {
+    ...scope,
+    team_id: healIsoId(scope.team_id),
+    agent_id: healIsoId(scope.agent_id),
+    user_id: healIsoId(scope.user_id),
+  };
+}
+
+/** A "" bucket dim is an unscoped (all-tenant) redaction failure and matches every scope. */
 function matchingTenants(store: LedgerStore | undefined, scope?: LedgerScope): TenantHealth[] {
   const out: TenantHealth[] = [];
   eachTenantHealth(store, (h) => {
-    if ((scope?.team_id === undefined || h.team_id === scope.team_id) &&
-        (scope?.agent_id === undefined || h.agent_id === scope.agent_id)) out.push(h);
+    if ((scope?.team_id === undefined || h.team_id === "" || h.team_id === scope.team_id) &&
+        (scope?.agent_id === undefined || h.agent_id === "" || h.agent_id === scope.agent_id)) out.push(h);
   });
   return out;
 }
@@ -361,6 +388,21 @@ function recordFailure(
 }
 
 /**
+ * A redaction refused by the contract checks never ran: its plaintext stays
+ * in place with nothing to retry. Count it on the tenant it named so the
+ * ledger reports degraded instead of healthy (no event is missing, so it does
+ * not gate reverts the way an unrecoverable store gap does).
+ */
+function recordRejectedRedaction(store: LedgerStore | undefined, filter: MemoryEventRedactFilter): void {
+  const h = tenantHealth(store, {
+    team_id: typeof filter.team_id === "string" ? healIsoId(filter.team_id) : undefined,
+    agent_id: typeof filter.agent_id === "string" ? healIsoId(filter.agent_id) : undefined,
+  });
+  h.rejected_redactions += 1;
+  h.last_failure_at = new Date().toISOString();
+}
+
+/**
  * Snapshot of this process's ledger health for the given store, restricted to
  * the tenants matching `scope` (a tenant only sees its own failures). Raw
  * backend errors are logged, never returned. `degraded` stays set while
@@ -371,18 +413,21 @@ function recordFailure(
  */
 export function getLedgerHealth(
   store: LedgerStore | undefined,
-  scope?: LedgerScope,
+  rawScope?: LedgerScope,
 ): LedgerHealth & { degraded: boolean } {
+  const scope = healScope(rawScope);
   let store_failures = 0;
   let jsonl_failures = 0;
   let pending = 0;
   let unrecoverable = 0;
+  let rejectedRedactions = 0;
   let last: string | undefined;
   for (const h of matchingTenants(store, scope)) {
     store_failures += h.store_failures;
     jsonl_failures += h.jsonl_failures;
     pending += h.pending.size;
     unrecoverable += h.unrecoverable;
+    rejectedRedactions += h.rejected_redactions;
     if (h.last_failure_at && (!last || h.last_failure_at > last)) last = h.last_failure_at;
   }
   const pendingR: PendingRedaction[] = [];
@@ -396,7 +441,8 @@ export function getLedgerHealth(
     pending_store_events: pending + unrecoverable,
     pending_redactions: redactions,
     pending_outbox_rewrites: outboxRewrites,
-    degraded: pending > 0 || unrecoverable > 0 || redactions > 0,
+    rejected_redactions: rejectedRedactions,
+    degraded: pending > 0 || unrecoverable > 0 || redactions > 0 || rejectedRedactions > 0,
   };
 }
 
@@ -406,7 +452,7 @@ export function getLedgerHealth(
  * depend on the full event history of the record must not proceed.
  */
 export function hasPendingLedgerEvent(store: LedgerStore | undefined, recordId: string, scope?: LedgerScope): boolean {
-  for (const h of matchingTenants(store, scope)) {
+  for (const h of matchingTenants(store, healScope(scope))) {
     if (h.unrecoverable > 0) return true;
     for (const rid of h.pending.values()) if (rid === recordId) return true;
   }
@@ -573,7 +619,8 @@ function redactOutboxContent(content: string, filters: readonly MemoryEventRedac
     if (typeof value !== "object" || value === null || Array.isArray(value)) return line;
     const e = value as MemoryEvent & Partial<RedactionMarker>;
     if (e.redact !== undefined || typeof e.event_ts !== "string") return line;
-    const hasPlaintext = (typeof e.content === "string" && e.content !== "") || (e.snapshot_json !== undefined && e.snapshot_json !== "");
+    const hasPlaintext = (e.content !== undefined && e.content !== null && e.content !== "") ||
+      (e.snapshot_json !== undefined && e.snapshot_json !== null && e.snapshot_json !== "");
     if (!hasPlaintext || !filters.some((f) => markerCovers(f, e))) return line;
     lines += 1;
     const { snapshot_json: _dropped, ...skeleton } = e;
@@ -665,6 +712,13 @@ export async function appendLedgerEvent(params: {
       `${TAG} append rejected: event_ts "${event.event_ts}" is not a millisecond-exact ISO instant ` +
       `event_id=${event.event_id} record_id=${event.record_id}`,
     );
+    // The event is missing from both legs and backfill cannot restore it:
+    // surface it as an unrecoverable store gap rather than a silent drop.
+    recordFailure(store, "store", {
+      ...event,
+      team_id: event.team_id || DEFAULT_ISOLATION_ID,
+      agent_id: event.agent_id || DEFAULT_ISOLATION_ID,
+    }, false);
     return { event_id: event.event_id, jsonl: false, store: false };
   }
   // Isolation ids converge on the record-store form: "default" for
@@ -771,6 +825,7 @@ export async function redactLedgerEvents(params: {
   const until = canonIsoTs(params.filter.until);
   if (until === null) {
     logger?.warn?.(`${TAG} redaction rejected: until "${params.filter.until}" is not a millisecond-exact ISO instant`);
+    recordRejectedRedaction(store, params.filter);
     return { jsonl: false };
   }
   // "" ids heal to "default" on defined fields — the marker written to the
@@ -790,6 +845,7 @@ export async function redactLedgerEvents(params: {
   // reject (plaintext then re-appends = un-redaction). Refuse outright.
   if (!isValidRedactFilter(filter)) {
     logger?.warn?.(`${TAG} redaction rejected: filter carries fields outside {team_id,agent_id,user_id,until}`);
+    recordRejectedRedaction(store, params.filter);
     return { jsonl: false };
   }
   const out: { jsonl: boolean; rewritten?: number; redacted?: number } = { jsonl: false };
@@ -865,8 +921,21 @@ function isReplayableEvent(e: Partial<Record<keyof MemoryEvent, unknown>>): e is
   return typeof e.event_id === "string" && EVENT_ID_RE.test(e.event_id) &&
     typeof e.record_id === "string" && e.record_id !== "" &&
     typeof e.op === "string" && MEMORY_EVENT_OPS.has(e.op) &&
-    typeof e.event_ts === "string" && canonIsoTs(e.event_ts) !== null;
+    typeof e.event_ts === "string" && canonIsoTs(e.event_ts) !== null &&
+    typeof e.content === "string" &&
+    (e.version === undefined || typeof e.version === "number") &&
+    (e.supersedes === undefined || (Array.isArray(e.supersedes) && e.supersedes.every((s) => typeof s === "string"))) &&
+    OPTIONAL_STRING_FIELDS.every((k) => e[k] === undefined || typeof e[k] === "string");
 }
+
+// Backends coerce non-string values (sqlite stores 123 as "123.0"), which would
+// silently change tenant identity or persist non-string plaintext.
+const OPTIONAL_STRING_FIELDS = [
+  "session_key", "session_id", "origin_session_id", "origin_session_key",
+  "team_id", "user_id", "agent_id", "task_id", "reviewer_id", "memory_type",
+  "superseded_by", "snapshot_json", "layer", "source", "request_id", "reason",
+  "target_event_id", "scope", "until",
+] as const satisfies readonly (keyof MemoryEvent)[];
 
 /**
  * A marker line is trusted to drive store wipes — validated by the shared
@@ -914,7 +983,10 @@ export async function replayLedgerEvents(params: {
   scope?: LedgerScope;
   logger?: LedgerLogger;
 }): Promise<LedgerReplayResult> {
-  const { store, storage, since, scope, logger } = params;
+  const { store, storage, logger } = params;
+  const scope = healScope(params.scope);
+  // Compared lexically against canonical event_ts below — canonicalize first.
+  const since = params.since === undefined ? undefined : canonEventBound(params.since);
   const out: LedgerReplayResult = {
     files: 0, scanned: 0, replayed: 0, skipped: 0, malformed: 0, failed: 0, redacted: 0, redactions_applied: 0,
     outbox_redacted: 0, outbox_failed: 0,
@@ -967,6 +1039,10 @@ export async function replayLedgerEvents(params: {
       if (parsed.redact !== undefined) {
         // A redact object that fails validation must not silently act as an
         // event; it is not replayable either way — count it malformed.
+        // Pre-contract markers may carry a sub-ms or date-only until; map it
+        // to the canonical bound covering the same events before validating.
+        const legacyUntil = typeof parsed.redact.until === "string" ? canonLegacyUntil(parsed.redact.until) : null;
+        if (legacyUntil !== null) parsed.redact.until = legacyUntil;
         if (!isValidRedactFilter(parsed.redact)) {
           out.malformed += 1;
           continue;

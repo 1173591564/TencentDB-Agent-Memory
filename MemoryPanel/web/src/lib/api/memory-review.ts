@@ -34,6 +34,10 @@ export interface MemoryDiffChange {
   reverted?: boolean;
   /** 驳回者身份（reverted 事件的 reviewer_id，审核时的 isolation user）。 */
   reverted_by?: string;
+  /** 孤儿 superseded 卡：取代它的新 record_id。 */
+  superseded_by?: string;
+  /** 本卡不是完整变更组（伙伴被 op 过滤掉，或账本缺行）——撤销决策前应查看历史。 */
+  incomplete_group?: boolean;
   replaced: Array<{
     record_id: string;
     content: string;

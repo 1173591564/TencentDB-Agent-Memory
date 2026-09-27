@@ -6,6 +6,7 @@
  *  - updated → 新记录 + replaced[]（superseded 快照 join，含 origin_session_id）
  *  - orphan superseded（其 superseded_by 不在事件流）单独成组
  *  - op 过滤发生在事件层
+ *  - 被页边界 / op 过滤拆开的变更组：补查拼回，缺伙伴时标 incomplete_group
  *  - 租户隔离：跨 team 查询返回空；v3 缺三元组 → 422
  *  - 缺 session_id → 400；store 不支持 queryMemoryEvents → 501
  */
@@ -110,7 +111,7 @@ describe("POST /memory/diff", () => {
     });
     const { data } = await call("/v3/memory/diff", { session_id: "ses-x" });
     const orphan = data!.changes.find((c) => c.record_id === "m_orph");
-    expect(orphan).toMatchObject({ op: "superseded", content: "old" });
+    expect(orphan).toMatchObject({ op: "superseded", content: "old", superseded_by: "m_ghost", incomplete_group: true });
   });
 
   it("exposes event-level pagination fields", async () => {
@@ -120,6 +121,45 @@ describe("POST /memory/diff", () => {
     expect(data!.has_more).toBe(true);
     expect(data!.next_offset).toBe(1);
     expect(data!.count).toBe(data!.changes.length);
+  });
+
+  const replacedIds = (c: Record<string, unknown>) => (c.replaced as Array<Record<string, unknown>>).map((r) => r.record_id);
+
+  it("reassembles a group split by the page boundary (superseded row first)", async () => {
+    // writeMemory 先写 superseded(m_a) 再写 updated(m_b)：limit 1 恰好把组切开。
+    const p1 = await call("/v3/memory/diff", { session_id: "ses-y", limit: 1 });
+    expect(p1.data!).toMatchObject({ changes: [], count: 0, has_more: true, next_offset: 1 });
+    const p2 = await call("/v3/memory/diff", { session_id: "ses-y", limit: 1, offset: 1 });
+    expect(p2.data!.changes).toHaveLength(1);
+    expect(p2.data!.changes[0]).toMatchObject({ op: "updated", record_id: "m_b" });
+    expect(replacedIds(p2.data!.changes[0])).toEqual(["m_a"]);
+    expect(p2.data!.changes[0].incomplete_group).toBeUndefined();
+  });
+
+  it("reassembles a group split by the page boundary (write event first, as TCVDB id-order ties allow)", async () => {
+    const base = { event_ts: "2026-03-01T00:00:00.000Z", session_key: "sk-r", session_id: "ses-r", team_id: "t1", user_id: "u1", agent_id: "a1", source: "extraction" as const };
+    store.appendMemoryEvent({ ...base, op: "updated", record_id: "m_new", content: "new", supersedes: ["m_old"] });
+    store.appendMemoryEvent({ ...base, op: "superseded", record_id: "m_old", content: "old", superseded_by: "m_new" });
+    const p1 = await call("/v3/memory/diff", { session_id: "ses-r", limit: 1 });
+    expect(p1.data!.changes).toHaveLength(1);
+    expect(p1.data!.changes[0]).toMatchObject({ op: "updated", record_id: "m_new" });
+    expect(replacedIds(p1.data!.changes[0])).toEqual(["m_old"]);
+    expect(p1.data!.changes[0].incomplete_group).toBeUndefined();
+    const p2 = await call("/v3/memory/diff", { session_id: "ses-r", limit: 1, offset: 1 });
+    expect(p2.data!).toMatchObject({ changes: [], has_more: false, next_offset: 2 });
+  });
+
+  it("flags writes whose declared superseded rows are missing — not writes that declare none", async () => {
+    const base = { session_key: "sk-g", session_id: "ses-g", team_id: "t1", user_id: "u1", agent_id: "a1" };
+    store.appendMemoryEvent({ ...base, event_ts: "2026-03-02T00:00:00.000Z", op: "updated", record_id: "m_gap", content: "new", supersedes: ["m_lost"], source: "extraction" });
+    store.appendMemoryEvent({ ...base, event_ts: "2026-03-02T00:00:01.000Z", op: "updated", record_id: "m_api", content: "edited", source: "api_mutation" });
+    // reverted 的 supersedes 是"恢复了哪些"，不是组成员声明。
+    store.appendMemoryEvent({ ...base, event_ts: "2026-03-02T00:00:02.000Z", op: "reverted", record_id: "m_rev", content: "", supersedes: ["m_restored"], source: "review" });
+    const { data } = await call("/v3/memory/diff", { session_id: "ses-g" });
+    const byId = new Map(data!.changes.map((c) => [c.record_id, c]));
+    expect(byId.get("m_gap")).toMatchObject({ incomplete_group: true, replaced: [] });
+    expect(byId.get("m_api")!.incomplete_group).toBeUndefined();
+    expect(byId.get("m_rev")!.incomplete_group).toBeUndefined();
   });
 
   it("returns nothing for a different tenant", async () => {
@@ -147,12 +187,19 @@ describe("POST /memory/diff", () => {
 
   it("op filter applies at the event layer", async () => {
     // ses-y has superseded(m_a) + updated(m_b). op=updated drops the
-    // superseded row → the updated change has no replaced[] join target.
+    // superseded row from the page; the group join still restores replaced[].
     const { status, data } = await call("/v3/memory/diff", { session_id: "ses-y", op: "updated" });
     expect(status).toBe(200);
     expect(data!.changes).toHaveLength(1);
     expect(data!.changes[0]).toMatchObject({ op: "updated", record_id: "m_b" });
-    expect(data!.changes[0].replaced).toEqual([]);
+    expect(replacedIds(data!.changes[0])).toEqual(["m_a"]);
+    expect(data!.changes[0].incomplete_group).toBeUndefined();
+
+    // op=superseded filters the partner out → standalone card, marked as half a group.
+    const sup = await call("/v3/memory/diff", { session_id: "ses-y", op: "superseded" });
+    expect(sup.data!.changes).toEqual([
+      expect.objectContaining({ op: "superseded", record_id: "m_a", superseded_by: "m_b", incomplete_group: true }),
+    ]);
 
     const created = await call("/v3/memory/diff", { session_id: "ses-y", op: "created" });
     expect(created.data!.changes).toHaveLength(0);

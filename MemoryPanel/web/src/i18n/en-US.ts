@@ -1819,6 +1819,8 @@ export const enUS = {
   'memoryReview.loadFailed': 'Failed to load changes',
   'memoryReview.revertedBadge': 'Reverted',
   'memoryReview.replacedTitle': 'Replaced records',
+  'memoryReview.incompleteGroup': 'Incomplete change group',
+  'memoryReview.supersededBy': 'superseded by {{id}}',
   'memoryReview.fromSession': 'from session',
   'memoryReview.adminOps': 'Management-plane ops (no session)',
 };

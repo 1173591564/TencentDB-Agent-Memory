@@ -1794,6 +1794,8 @@ export const zhCN = {
   'memoryReview.loadFailed': '加载变更集失败',
   'memoryReview.revertedBadge': '已撤销',
   'memoryReview.replacedTitle': '替代了以下记录',
+  'memoryReview.incompleteGroup': '变更组不完整',
+  'memoryReview.supersededBy': '被 {{id}} 取代',
   'memoryReview.fromSession': '来自会话',
   'memoryReview.adminOps': '管理面操作（无会话归属）',
 };

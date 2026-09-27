@@ -1454,8 +1454,9 @@ async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, r
  * 返回聚合视图：每次写入操作一组 { op, record, replaced[] }。
  *   - created          → 新增记忆，replaced 恒空
  *   - updated / merged → 新记录 + replaced[]（被 superseded 的旧记录快照）
- *   - superseded 孤儿（其 superseded_by 指向的新记录不在本批事件流中，即追加
- *     只成功了一半、或新记录事件被分页切到另一页的场景）单独成组，保证不丢信息
+ *   - superseded 孤儿（伙伴写入事件不会出现在本查询结果流中：被 op 过滤掉，
+ *     或账本里根本没有）单独成组并带 superseded_by，保证不丢信息
+ *   - 声明的伙伴不在本卡里（supersedes 未被 replaced 覆盖 / 孤儿卡）→ incomplete_group:true
  *
  * 隔离沿用 requestIsolation 的 team/user/agent/task —— 不能跨租户看别人的 diff；
  * body.session_id 是要查询的目标 session（不是 requestIsolation.sessionId，
@@ -1463,8 +1464,7 @@ async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, r
  * MemoryEventFilter 在 store 层支持 op/session_key/时间窗过滤；endpoint 暴露
  * op / since / until（session_key 不暴露——外部一律用 session_id 定位）。
  * 响应分页字段：count=本页变更组数、has_more、next_offset —— 分页以原始事件
- * 为单位，变更组可能被页边界拆开（拆出的 superseded 行以孤儿组形式落在它
- * 所在的那一页）。
+ * 为单位；被页边界拆开的变更组由补查拼回写入事件所在的那一页。
  */
 async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = memoryDiffRequestSchema.safeParse(body);
@@ -1497,9 +1497,6 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   const hasMore = fetched.length > limit || (limit >= 1000 && fetched.length === limit);
   const events = fetched.slice(0, limit);
 
-  // Join superseded rows onto their replacing record (superseded_by → record_id).
-  const supersededByNew = new Map<string, typeof events>();
-  const newRecordIds = new Set(events.filter((e) => e.op !== "superseded").map((e) => e.record_id));
   // reverted 事件的 record_id 是被撤销的新 record —— 给对应 change 打标记，
   // 并带上驳回者身份（reviewer_id，审核操作发生时的 isolation user）。
   // 注意必须查全量 reverted 事件而非只看本页：reverted 标记落在后一页时，
@@ -1531,8 +1528,36 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     if (revertedByRecord.has(e.record_id)) return { by: revertedByRecord.get(e.record_id) };
     return undefined;
   };
-  for (const e of events) {
-    if (e.op === "superseded" && e.superseded_by) {
+  // 变更组 = 一条写入事件 + 它 supersedes 的 superseded 行，整组共享同一个
+  // event_ts（l1-writer 用同一个 now 写入）。分页切的是原始事件、op 过滤也在
+  // 事件层，组的另一半可能不在本页——按未闭合事件的时间窗补查一次再 join。
+  const isWrite = (e: MemoryEvent) => e.op === "created" || e.op === "updated" || e.op === "merged";
+  const pageSupersededBy = (newId: string) => events.filter((s) => s.op === "superseded" && s.superseded_by === newId);
+  const pageWriteIds = new Set(events.filter(isWrite).map((e) => e.record_id));
+  const unresolvedTs = events.filter((e) => e.op === "superseded"
+    ? !e.superseded_by || !pageWriteIds.has(e.superseded_by)
+    : isWrite(e) && (e.supersedes ?? []).some((id) => !pageSupersededBy(e.record_id).some((s) => s.record_id === id)),
+  ).map((e) => e.event_ts).sort();
+  const partners = unresolvedTs.length === 0 ? [] : await store.queryMemoryEvents({
+    session_id: parsed.data.session_id,
+    since: unresolvedTs[0],
+    until: unresolvedTs[unresolvedTs.length - 1],
+    // 窗口超过 1000 行时伙伴可能仍缺——下面按实际 join 结果标 incomplete_group，不会假装完整。
+    limit: 1000,
+    team_id: iso?.teamId,
+    user_id: iso?.userId,
+    agent_id: iso?.agentId,
+    task_id: iso?.taskId,
+  });
+  const supersededByNew = new Map<string, typeof events>();
+  const writeById = new Map<string, MemoryEvent>();
+  const seenEvents = new Set<string>();
+  for (const e of [...events, ...partners]) {
+    const key = e.event_id || `${e.op}\u0000${e.record_id}\u0000${e.superseded_by ?? ""}\u0000${e.event_ts}`;
+    if (seenEvents.has(key)) continue;
+    seenEvents.add(key);
+    if (isWrite(e)) writeById.set(e.record_id, e);
+    else if (e.op === "superseded" && e.superseded_by) {
       const arr = supersededByNew.get(e.superseded_by) ?? [];
       arr.push(e);
       supersededByNew.set(e.superseded_by, arr);
@@ -1563,6 +1588,10 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     reverted?: boolean;
     /** 驳回者身份（reverted 事件的 reviewer_id）。 */
     reverted_by?: string;
+    /** 孤儿 superseded 卡：取代它的新 record_id。 */
+    superseded_by?: string;
+    /** 本卡不是完整变更组：声明的伙伴不在本响应里（被 op 过滤、超出补查窗口，或账本缺行）。 */
+    incomplete_group?: boolean;
     replaced: Array<{
       record_id: string; content: string; memory_type?: string;
       version: number; event_ts: string; origin_session_id?: string; origin_session_key?: string;
@@ -1571,22 +1600,31 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
 
   for (const e of events) {
     if (e.op === "superseded") {
-      // Orphan: the updated/merged event for this superseded row never landed.
-      if (!e.superseded_by || !newRecordIds.has(e.superseded_by)) {
-        changes.push({ op: "superseded", ...eventShape(e), replaced: [] });
-      }
+      // 伙伴写入事件会出现在本查询的结果流里（同 session/租户/时刻，未被 op
+      // 过滤掉）→ 快照由它的 replaced 承载，这里不再成卡，"加载更多"拼页后
+      // 同一快照不会出现两次。否则单独成卡并标明它只是半个变更组。
+      const partner = e.superseded_by ? writeById.get(e.superseded_by) : undefined;
+      if (partner && (!parsed.data.op || parsed.data.op === partner.op)) continue;
+      changes.push({
+        op: "superseded",
+        ...eventShape(e),
+        ...(e.superseded_by ? { superseded_by: e.superseded_by } : {}),
+        incomplete_group: true,
+        replaced: [],
+      });
       continue;
     }
     // replaced 只挂在写入类 op 上——reverted/deleted 事件的 record_id 恰好
     // 命中 superseded_by 时会错继承别人的快照列表，显示成重复变更卡。
-    const replaced = (e.op === "created" || e.op === "updated" || e.op === "merged"
-      ? (supersededByNew.get(e.record_id) ?? [])
-      : []).map((s) => eventShape(s));
+    const replaced = (isWrite(e) ? (supersededByNew.get(e.record_id) ?? []) : []).map((s) => eventShape(s));
+    // reverted 的 supersedes 是"恢复了哪些"，不是组成员声明——只核对写入类 op。
+    const incomplete = isWrite(e) && (e.supersedes ?? []).some((id) => !replaced.some((r) => r.record_id === id));
     const revert = e.op !== "reverted" ? revertOf(e) : undefined;
     changes.push({
       op: e.op,
       ...eventShape(e),
       replaced,
+      ...(incomplete ? { incomplete_group: true } : {}),
       // reverted 事件自身是驳回动作的账，不是"被撤销的变更"——不给它打标，
       // 否则它还会继承原写入的 replaced 列表显示成一张重复的变更卡。
       ...(revert ? { reverted: true } : {}),
@@ -1598,7 +1636,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     changes,
     // `count` is the change groups on this page (not a session-wide total):
     // pagination happens at the raw-event level, aggregation at the change
-    // level, so a page boundary can split an update from its superseded rows.
+    // level, so a page may carry fewer groups than events (or none at all).
     count: changes.length,
     has_more: hasMore,
     next_offset: offset + events.length,

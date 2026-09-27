@@ -62,6 +62,12 @@ function ChangeCard({
           <span style={{ fontSize: 12, color: '#888' }}>{change.event_ts}</span>
           {change.memory_type ? <Tag theme="default" variant="soft" size="sm">{change.memory_type}</Tag> : null}
           {change.reverted ? <Tag theme="error" variant="soft" size="sm">{t('memoryReview.revertedBadge', '已撤销')}</Tag> : null}
+          {change.incomplete_group ? <Tag theme="warning" variant="soft" size="sm">{t('memoryReview.incompleteGroup', '变更组不完整')}</Tag> : null}
+          {change.superseded_by ? (
+            <span style={{ fontSize: 12, color: '#888' }}>
+              {t('memoryReview.supersededBy', '被 {{id}} 取代', { id: change.superseded_by })}
+            </span>
+          ) : null}
           {change.reverted_by ? (
             <span style={{ fontSize: 12, color: '#888' }}>
               {t('memoryReview.revertedBy', '由 {{user}} 驳回', { user: change.reverted_by })}

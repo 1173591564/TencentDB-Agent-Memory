@@ -123,6 +123,22 @@ describe("POST /memory/diff", () => {
     expect(data!.count).toBe(data!.changes.length);
   });
 
+  it("reverted status survives >1000 revert markers in the session (lookup is page-scoped)", async () => {
+    const t0 = Date.parse("2026-02-01T00:00:00.000Z");
+    const eid = (i: number) => `evt-${i.toString(16).padStart(32, "0")}`;
+    const base = { session_key: "sk-big", session_id: "ses-big", team_id: "t1", user_id: "u1", agent_id: "a1" };
+    for (let i = 0; i < 1001; i++) {
+      store.appendMemoryEvent({ ...base, event_id: eid(i), event_ts: new Date(t0 + i).toISOString(), op: "created", record_id: `m_r${i}`, content: `fact ${i}`, source: "extraction" });
+    }
+    // Markers land oldest-write-first, so m_r0's is the oldest of 1001 — outside any newest-1000 window.
+    for (let i = 0; i < 1001; i++) {
+      store.appendMemoryEvent({ ...base, event_id: eid(10_000 + i), event_ts: new Date(t0 + 60_000 + i).toISOString(), op: "reverted", record_id: `m_r${i}`, content: "", target_event_id: eid(i), reviewer_id: "u1", source: "review" });
+    }
+    const { data } = await call("/v3/memory/diff", { session_id: "ses-big", op: "created", limit: 1 });
+    expect(data!.changes).toHaveLength(1);
+    expect(data!.changes[0]).toMatchObject({ record_id: "m_r0", reverted: true, reverted_by: "u1" });
+  });
+
   const replacedIds = (c: Record<string, unknown>) => (c.replaced as Array<Record<string, unknown>>).map((r) => r.record_id);
 
   it("reassembles a group split by the page boundary (superseded row first)", async () => {
@@ -478,6 +494,108 @@ describe("POST /memory/diff/revert", () => {
     const retry = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     expect(retry.status).toBe(200);
     expect(retry.data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
+  });
+
+  it("diff cards carry event_id; reverting an older write of the record never reverts a newer one", async () => {
+    // Production mints a fresh record id per extracted memory; this pins the contract regardless.
+    await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("v1"), decision: decision("m_c", "store") });
+    await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("v2"), decision: decision("m_c", "store") });
+    const [e1, e2] = store.queryMemoryEvents({ record_id: "m_c", op: "created" });
+    const diff = await call("/v3/memory/diff", { session_id: "ses-z" });
+    const cards = ((diff.data?.changes ?? []) as Array<Record<string, unknown>>).filter((c) => c.record_id === "m_c");
+    expect(cards.map((c) => c.event_id)).toEqual([e1.event_id, e2.event_id]);
+
+    const older = await call("/v3/memory/diff/revert", { record_id: "m_c", event_id: e1.event_id });
+    expect(older.status).toBe(409);
+    expect(store.queryMemoryEvents({ record_id: "m_c", op: "reverted" })).toHaveLength(0);
+    expect((await store.queryL1Records({ recordIds: ["m_c"] }))[0].content).toBe("v2");
+
+    const newer = await call("/v3/memory/diff/revert", { record_id: "m_c", event_id: e2.event_id });
+    expect(newer.status).toBe(200);
+    expect(newer.data).toMatchObject({ target_event_id: e2.event_id });
+  });
+
+  // m_m merges m_b + m_c: reverting it restores two snapshots, then deletes m_m.
+  const mergeTwo = async () => {
+    await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("bonus 100"), decision: decision("m_c", "store") });
+    await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("pay"), decision: decision("m_m", "merge", ["m_b", "m_c"], "salary 6000 + bonus 100") });
+  };
+  const withStore = (over: Record<string, unknown>) => {
+    const real = store;
+    store = new Proxy(real, {
+      get(t, p) {
+        if (typeof p === "string" && p in over) return over[p];
+        const v = Reflect.get(t, p);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    }) as VectorStore;
+    return { real, restore: () => { store = real; } };
+  };
+  const liveIds = async (ids: string[]) => (await store.queryL1Records({ recordIds: ids })).map((r) => r.record_id).sort();
+
+  it("a failed second restore rolls back the first — the 500 means nothing changed", async () => {
+    await mergeTwo();
+    const { real, restore } = withStore({
+      upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_c" ? false : real.upsertL1(...a)),
+    });
+    const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    restore();
+    expect(r.status).toBe(500);
+    expect(r.data).toBeUndefined();
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_m"]);
+    expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(0);
+
+    const retry = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    expect(retry.status).toBe(200);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
+  });
+
+  it("an incomplete rollback reports the still-live restores; retry finishes the revert", async () => {
+    await mergeTwo();
+    const { real, restore } = withStore({
+      upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_c" ? false : real.upsertL1(...a)),
+      deleteL1: (...a: Parameters<VectorStore["deleteL1"]>) => {
+        if (a[0] === "m_b") throw new Error("vdb down");
+        return real.deleteL1(...a);
+      },
+    });
+    const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    restore();
+    expect(r.status).toBe(500);
+    expect(r.data).toMatchObject({ partial: { restored: ["m_b"], verified: true } });
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_m"]);
+
+    const retry = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    expect(retry.status).toBe(200);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
+  });
+
+  it("a failed delete of the new record rolls back the restores it would have left alive beside it", async () => {
+    await mergeTwo();
+    const { real, restore } = withStore({
+      deleteL1: (...a: Parameters<VectorStore["deleteL1"]>) => (a[0] === "m_m" ? false : real.deleteL1(...a)),
+    });
+    const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    restore();
+    expect(r.status).toBe(500);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_m"]);
+    expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(0);
+  });
+
+  it("a delete that errors after committing completes the revert instead of rolling back into data loss", async () => {
+    await mergeTwo();
+    const { real, restore } = withStore({
+      deleteL1: (...a: Parameters<VectorStore["deleteL1"]>) => {
+        const ok = real.deleteL1(...a);
+        if (a[0] === "m_m") throw new Error("timeout after commit");
+        return ok;
+      },
+    });
+    const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    restore();
+    expect(r.status).toBe(200);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
+    expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(1);
   });
 
   it("clear of the agent after the write blocks the revert (no resurrection of cleared data)", async () => {

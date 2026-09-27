@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
-import type { IMemoryStore, L0Record, L1RecordRow, MemoryEvent, ProfileSyncRecord } from "../core/store/types.js";
+import type { IMemoryStore, L0Record, L1RecordRow, MemoryEvent, MemoryEventFilter, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
@@ -1500,6 +1500,29 @@ async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, r
   return successEnvelope({ ...result, health: getLedgerHealth(store, ledgerScope(iso)) }, requestId);
 }
 
+const REVERT_MARKER_CHUNK = 100;
+
+/**
+ * 给定记录的全部 reverted 标记：按 record_id 分块 IN 查询、块内翻页到底——
+ * 工作量随页面卡片数走，不把全局事件上限当成完整状态。
+ */
+async function revertMarkersFor(
+  query: NonNullable<IMemoryStore["queryMemoryEvents"]>,
+  recordIds: string[],
+  scope: Omit<MemoryEventFilter, "record_ids" | "op" | "limit" | "offset">,
+): Promise<MemoryEvent[]> {
+  const out: MemoryEvent[] = [];
+  for (let i = 0; i < recordIds.length; i += REVERT_MARKER_CHUNK) {
+    const record_ids = recordIds.slice(i, i + REVERT_MARKER_CHUNK);
+    for (let offset = 0; ; offset += 1000) {
+      const batch = await query({ ...scope, record_ids, op: "reverted", limit: 1000, offset });
+      out.push(...batch);
+      if (batch.length < 1000) break;
+    }
+  }
+  return out;
+}
+
 /**
  * POST /memory/diff — 某个 session 的 L1 变更集。
  *
@@ -1517,6 +1540,8 @@ async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, r
  * op / since / until（session_key 不暴露——外部一律用 session_id 定位）。
  * 响应分页字段：count=本页变更组数、has_more、next_offset —— 分页以原始事件
  * 为单位；被页边界拆开的变更组由补查拼回写入事件所在的那一页。
+ * 每张卡带 event_id（历史事件缺省）：同一 record 可有多次写入，撤销单条
+ * 变更时回传它精确定位，record_id 不足以唯一标识一次操作。
  */
 async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = memoryDiffRequestSchema.safeParse(body);
@@ -1551,22 +1576,22 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
 
   // reverted 事件的 record_id 是被撤销的新 record —— 给对应 change 打标记，
   // 并带上驳回者身份（reviewer_id，审核操作发生时的 isolation user）。
-  // 注意必须查全量 reverted 事件而非只看本页：reverted 标记落在后一页时，
-  // 本页的 change 会显示成"未撤销"，UI 继续放出 Revert 按钮 → 核心 409。
-  const revertedEvents = await store.queryMemoryEvents({
-    session_id: parsed.data.session_id,
-    op: "reverted",
-    // 倒序取最新标记：>1000 条 reverted 时最新的才是当前状态，最旧的截掉无妨
-    //（升序会漏掉最新标记，复刻"Revert 按钮还在 → 核心 409"的老问题）。
-    order: "desc",
-    limit: 1000,
-    team_id: iso?.teamId,
-    user_id: iso?.userId,
-    agent_id: iso?.agentId,
-    task_id: iso?.taskId,
-    // 不带 since/until：撤销状态是"当前是否已驳回"的时点事实，窗口外的
-    // reverted 事件同样有效——窗口过滤会让卡片显示未撤销 → UI 放按钮 → 409。
-  });
+  // 标记可能落在任意一页（撤销发生在写入之后），所以按本页卡片的 record_id
+  // 反查它们的全部标记；取 session 内最新 N 条会在 >N 条 reverted 时截掉旧
+  // 写入的标记 → 卡片显示"未撤销"，UI 继续放出 Revert 按钮 → 核心 409。
+  const revertedEvents = await revertMarkersFor(
+    store.queryMemoryEvents.bind(store),
+    [...new Set(events.filter((e) => e.op !== "reverted" && e.op !== "superseded").map((e) => e.record_id))],
+    {
+      session_id: parsed.data.session_id,
+      team_id: iso?.teamId,
+      user_id: iso?.userId,
+      agent_id: iso?.agentId,
+      task_id: iso?.taskId,
+      // 不带 since/until：撤销状态是"当前是否已驳回"的时点事实，窗口外的
+      // reverted 事件同样有效——窗口过滤会让卡片显示未撤销 → UI 放按钮 → 409。
+    },
+  );
   // 新版 reverted 事件用 target_event_id 精确指向被撤销的那次写入（同一
   // record 的人工编辑可单独撤销）；旧版事件无此字段，按 record_id 命中。
   const revertedByEvent = new Map<string, string | undefined>();
@@ -1633,6 +1658,8 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   const changes: Array<{
     op: string;
     record_id: string;
+    /** 本卡对应的账本事件——撤销单条变更时回传以精确定位（历史事件无 id 时缺省）。 */
+    event_id?: string;
     content: string;
     memory_type?: string;
     version: number;
@@ -1665,6 +1692,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
       changes.push({
         op: "superseded",
         ...eventShape(e),
+        ...(e.event_id ? { event_id: e.event_id } : {}),
         ...(e.superseded_by ? { superseded_by: e.superseded_by } : {}),
         incomplete_group: true,
         replaced: [],
@@ -1680,6 +1708,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     changes.push({
       op: e.op,
       ...eventShape(e),
+      ...(e.event_id ? { event_id: e.event_id } : {}),
       replaced,
       ...(incomplete ? { incomplete_group: true } : {}),
       // reverted 事件自身是驳回动作的账，不是"被撤销的变更"——不给它打标，
@@ -1712,9 +1741,10 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
  * 幂等：同一 record_id 已存在 reverted 事件 → 409。
  * 撤销动作本身追加一条 reverted 事件（record_id=被撤销的新 record，
  * supersedes=本次恢复的旧 record_id 列表），保持事件流 append-only。
- * 部分恢复失败（旧记录 upsert 抛错）时返回 500 且**不追加** reverted
- * 事件——delete/upsert 均幂等，客户端可安全重试；否则 409 会永久挡住
- * 那次失败的恢复。
+ * 恢复或删除失败时返回 500 且**不追加** reverted 事件（否则 409 会永久挡住
+ * 重试），并回滚本次已恢复的旧记录：确认回滚干净 = 什么都没改；否则
+ * data.partial 列出仍存活的恢复行（verified=false 表示读不到行状态）。
+ * delete/upsert 均幂等，重试即续完撤销。
  *
  * 批量：body 可传 record_ids[]（≤50）。逐条独立处理互不影响——单条失败
  * 不阻塞其他记录；批量响应恒为 200 + results[]，每项携带各自的
@@ -1750,9 +1780,12 @@ interface RevertOptions {
   reviewerId?: string;
 }
 
+/** 撤销失败且回滚未确认干净：本次恢复、仍（或可能仍）存活的旧记录；verified=false 表示读不到行状态。 */
+type RevertPartial = { restored: string[]; verified: boolean };
+
 type RevertOutcome =
   | { ok: true; record_id: string; restored: string[]; missing?: string[]; target_event_id?: string; ledger_pending?: boolean; tombstone_pending?: boolean }
-  | { ok: false; record_id: string; status: number; error: string };
+  | { ok: false; record_id: string; status: number; error: string; partial?: RevertPartial };
 
 type RevertPlan =
   | { ok: false; status: number; error: string }
@@ -1814,6 +1847,27 @@ async function liveRecordIds(
     out.push(...rows.map((r) => r.record_id));
   }
   return out;
+}
+
+/**
+ * 撤销失败时回滚本次恢复的旧记录——它们不能与仍存活的新记录共存（链/分叉
+ * 守卫保证撤销前它们都不存在，删掉即回到原状）。返回回滚后仍存活的 id，
+ * 读不到行状态时返回 undefined。只兜后端报错，兜不住进程在中途崩溃。
+ */
+async function rollbackRestores(
+  store: RevertStore,
+  ids: string[],
+  rowFilter: { teamId?: string; userId?: string; agentId?: string; taskId?: string } | undefined,
+  logger: V2RouterDeps["logger"],
+): Promise<string[] | undefined> {
+  for (const id of ids) {
+    try {
+      await store.deleteL1(id, rowFilter);
+    } catch (err) {
+      logger.warn(`${TAG} revert rollback failed for ${id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return liveRecordIds(store, ids, rowFilter ?? {}).catch(() => undefined);
 }
 
 const SCOPE_DELETE_PAGE = 1000;
@@ -1979,8 +2033,8 @@ const withRevertLock = createKeyedMutex();
 /**
  * 撤销单条记录的一次写入（只读守卫 → 恢复旧记录 → 删新记录 → reverted 事件 + JSONL 墓碑）。
  *
- * 先恢复再删除：恢复失败时新记录仍在，重试走同一条路径；删除失败时已恢复
- * 的行 upsert 幂等，重试同样安全。任一步失败都不追加 reverted 事件。
+ * 先恢复再删除。任一步失败都不追加 reverted 事件，并回滚本次已恢复的行
+ *（rollbackRestores）；重试走同一条幂等路径。
  */
 async function revertOneL1Record(
   recordId: string,
@@ -2001,7 +2055,7 @@ async function revertOneL1RecordInner(
   iso: V2RouterDeps["requestIsolation"],
   deps: V2RouterDeps,
 ): Promise<RevertOutcome> {
-  const fail = (status: number, error: string): RevertOutcome => ({ ok: false, record_id: recordId, status, error });
+  const fail = (status: number, error: string, partial?: RevertPartial): RevertOutcome => ({ ok: false, record_id: recordId, status, error, ...(partial ? { partial } : {}) });
   // pending 守卫：该记录有事件只进了 outbox 未进 store（含上次的 reverted
   // 标记），此时账面不完整，任何判定都可能基于缺失的历史 → 先 backfill。
   if (hasPendingLedgerEvent(ledgerStore, recordId, ledgerScope(iso))) {
@@ -2038,6 +2092,16 @@ async function revertOneL1RecordInner(
       return fail(500, `Failed to restore pre-edit snapshot of ${recordId} — retry is allowed`);
     }
   } else {
+    // filter 只用 team/user/agent/task 做租户隔离——revert 按 record_id 定位，
+    // 目标可能属于别的 session（跨 session supersede 是正常场景）。
+    const deleteFilter = iso ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId } : undefined;
+    // 回滚后按实际行状态作答：确认干净才能说"什么都没改"。
+    const failRolledBack = async (ids: string[], cause: string): Promise<RevertOutcome> => {
+      const live = await rollbackRestores(store, ids, deleteFilter, deps.logger);
+      return live?.length === 0
+        ? fail(500, `Revert of ${recordId} ${cause}; rolled back — nothing was changed, retry is allowed`)
+        : fail(500, `Revert of ${recordId} ${cause}; rollback incomplete — retry to finish the revert`, { restored: live ?? ids, verified: live !== undefined });
+    };
     for (const { targetId, snap } of restores) {
       if (!snap?.snapshot_json) {
         // superseded 快照缺失（best-effort 写入缺口 / 已被 clear/TTL 擦除），重试也无法恢复。
@@ -2052,17 +2116,24 @@ async function revertOneL1RecordInner(
       }
     }
     if (failedIds.length > 0) {
-      return fail(500, `Revert incomplete for ${recordId}: failed to restore [${failedIds.join(", ")}] — retry is allowed (no revert marker was recorded)`);
+      // 失败的 upsert 也可能已落库（超时后提交）——连同已恢复的一起回滚。
+      return failRolledBack([...restoredIds, ...failedIds], `failed to restore [${failedIds.join(", ")}]`);
     }
-    // filter 只用 team/user/agent/task 做租户隔离——revert 按 record_id 定位，
-    // 目标可能属于别的 session（跨 session supersede 是正常场景）。
-    const deleteFilter = iso ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId } : undefined;
+    let deleteError: string | undefined;
     try {
-      const deleted = await store.deleteL1(recordId, deleteFilter);
-      if (!deleted) return fail(500, `Failed to delete record ${recordId}: store returned false — retry is allowed`);
+      if (!(await store.deleteL1(recordId, deleteFilter))) deleteError = "store returned false";
     } catch (err) {
       deps.logger.warn(`${TAG} revert delete failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
-      return fail(500, `Failed to delete record ${recordId} — retry is allowed`);
+      deleteError = "store error";
+    }
+    if (deleteError) {
+      // 删除报错不等于没删成：新记录已不在时再回滚恢复行，新旧会全部消失——
+      // 此时按成功继续记账；读不到行状态则不回滚，如实报告。
+      const newLive = await liveRecordIds(store, [recordId], deleteFilter ?? {}).then((ids) => ids.length > 0, () => undefined);
+      if (newLive === undefined) {
+        return fail(500, `Revert of ${recordId} failed to delete it (${deleteError}) and its state could not be verified — retry to finish the revert`, { restored: restoredIds, verified: false });
+      }
+      if (newLive) return failRolledBack(restoredIds, `failed to delete ${recordId} (${deleteError})`);
     }
   }
 
@@ -2138,7 +2209,7 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
   // 单条调用保持原响应形态；传了 record_ids（哪怕只有一个元素）就是批量调用。
   if (!record_ids && recordIds.length === 1) {
     const outcome = await revertOneL1Record(recordIds[0], opts, ledgerStore, store, iso, deps);
-    if (!outcome.ok) return errorEnvelope(outcome.status, outcome.error, requestId);
+    if (!outcome.ok) return errorEnvelope(outcome.status, outcome.error, requestId, outcome.partial ? { partial: outcome.partial } : undefined);
     return successEnvelope({
       record_id: outcome.record_id,
       reverted: true,
@@ -2152,7 +2223,7 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
 
   const results = [] as Array<
     | { record_id: string; reverted: true; restored: string[]; missing?: string[]; ledger_pending?: boolean; tombstone_pending?: boolean }
-    | { record_id: string; reverted: false; status: number; error: string }
+    | { record_id: string; reverted: false; status: number; error: string; partial?: RevertPartial }
   >;
   for (const id of recordIds) {
     const outcome = await revertOneL1Record(id, opts, ledgerStore, store, iso, deps);
@@ -2164,7 +2235,7 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
           ...(outcome.ledger_pending ? { ledger_pending: true } : {}),
           ...(outcome.tombstone_pending ? { tombstone_pending: true } : {}),
         }
-        : { record_id: id, reverted: false, status: outcome.status, error: outcome.error },
+        : { record_id: id, reverted: false, status: outcome.status, error: outcome.error, ...(outcome.partial ? { partial: outcome.partial } : {}) },
     );
   }
   const succeeded = results.filter((r) => r.reverted).length;

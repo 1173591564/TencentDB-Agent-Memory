@@ -1004,6 +1004,7 @@ export class MongoMemoryStore implements IMemoryStore {
   }
 
   async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
+    if (filter.record_ids?.length === 0) return [];
     const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
     const q: Record<string, unknown> = {};
     if (filter.session_id !== undefined) q.session_id = filter.session_id;
@@ -1011,6 +1012,11 @@ export class MongoMemoryStore implements IMemoryStore {
     if (filter.origin_session_id !== undefined) q.origin_session_id = filter.origin_session_id;
     if (filter.origin_session_key !== undefined) q.origin_session_key = filter.origin_session_key;
     if (filter.record_id !== undefined) q.record_id = filter.record_id;
+    if (filter.record_ids !== undefined) {
+      q.record_id = filter.record_id !== undefined
+        ? { $eq: filter.record_id, $in: filter.record_ids }
+        : { $in: filter.record_ids };
+    }
     if (filter.op !== undefined) q.op = filter.op;
     if (filter.layer !== undefined) q.layer = filter.layer;
     if (filter.source !== undefined) q.source = filter.source;

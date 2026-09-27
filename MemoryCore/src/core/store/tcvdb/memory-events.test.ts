@@ -118,3 +118,30 @@ describe("tcvdb L1 delete honours the isolation filter", () => {
     expect(calls[0]!.filter).toContain('team_id = "t2"');
   });
 });
+
+describe("tcvdb memory_events record_ids filter", () => {
+  function makeStore() {
+    const calls: Array<{ filter?: string }> = [];
+    const store = new TcvdbMemoryStore({
+      url: "http://stub", username: "u", apiKey: "k", database: "db",
+      embeddingModel: "none", timeout: 1000, logger: silent,
+    });
+    (store as unknown as { client: unknown }).client = {
+      query: async (_c: string, p: { filter?: string }) => { calls.push(p); return { documents: [] }; },
+    };
+    return { store, calls };
+  }
+
+  it("emits an escaped string `in (...)` condition on the record_id filter index", async () => {
+    const { store, calls } = makeStore();
+    await store.queryMemoryEvents({ record_ids: ["m_1", 'm_"q'], op: "reverted" });
+    expect(calls[0]!.filter).toContain('record_id in ("m_1", "m_\\"q")');
+    expect(calls[0]!.filter).toContain('op = "reverted"');
+  });
+
+  it("an empty record_ids set matches nothing without querying", async () => {
+    const { store, calls } = makeStore();
+    expect(await store.queryMemoryEvents({ record_ids: [] })).toEqual([]);
+    expect(calls).toHaveLength(0);
+  });
+});

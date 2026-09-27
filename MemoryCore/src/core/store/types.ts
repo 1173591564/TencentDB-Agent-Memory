@@ -701,6 +701,8 @@ export interface MemoryEventFilter {
   origin_session_id?: string;
   origin_session_key?: string;
   record_id?: string;
+  /** record_id 属于该集合（IN）；空数组不匹配任何事件。与 record_id 同时给出时取交集。 */
+  record_ids?: string[];
   op?: MemoryEvent["op"];
   layer?: MemoryEvent["layer"];
   source?: MemoryEvent["source"];

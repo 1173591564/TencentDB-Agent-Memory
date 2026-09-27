@@ -2728,6 +2728,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
     await this._ensureInit();
     if (this.degraded) throw new Error("memory_events query rejected: tcvdb store is degraded");
+    if (filter.record_ids?.length === 0) return [];
 
     const conds: string[] = [];
     if (filter.session_id !== undefined) conds.push(eqFilter("session_id", filter.session_id));
@@ -2735,6 +2736,9 @@ export class TcvdbMemoryStore implements IMemoryStore {
     if (filter.origin_session_id !== undefined) conds.push(eqFilter("origin_session_id", filter.origin_session_id));
     if (filter.origin_session_key !== undefined) conds.push(eqFilter("origin_session_key", filter.origin_session_key));
     if (filter.record_id !== undefined) conds.push(eqFilter("record_id", filter.record_id));
+    if (filter.record_ids !== undefined) {
+      conds.push(`record_id in (${filter.record_ids.map((v) => `"${escapeFilterString(v)}"`).join(", ")})`);
+    }
     if (filter.op !== undefined) conds.push(eqFilter("op", filter.op));
     if (filter.layer !== undefined) conds.push(eqFilter("layer", filter.layer));
     if (filter.source !== undefined) conds.push(eqFilter("source", filter.source));

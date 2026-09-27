@@ -3781,6 +3781,7 @@ export class VectorStore implements IMemoryStore {
 
   queryMemoryEvents(filter: MemoryEventFilter): MemoryEvent[] {
     if (this.degraded) throw new Error("memory_events query rejected: sqlite store is degraded");
+    if (filter.record_ids?.length === 0) return [];
     const conds: string[] = [];
     const args: SQLInputValue[] = [];
     if (filter.session_id !== undefined)        { conds.push("session_id = ?");        args.push(filter.session_id); }
@@ -3788,6 +3789,7 @@ export class VectorStore implements IMemoryStore {
     if (filter.origin_session_id !== undefined)  { conds.push("origin_session_id = ?");  args.push(filter.origin_session_id); }
     if (filter.origin_session_key !== undefined) { conds.push("origin_session_key = ?"); args.push(filter.origin_session_key); }
     if (filter.record_id !== undefined)         { conds.push("record_id = ?");         args.push(filter.record_id); }
+    if (filter.record_ids !== undefined)        { conds.push(`record_id IN (${filter.record_ids.map(() => "?").join(", ")})`); args.push(...filter.record_ids); }
     if (filter.op !== undefined)                { conds.push("op = ?");                args.push(filter.op); }
     if (filter.layer !== undefined)             { conds.push("layer = ?");             args.push(filter.layer); }
     if (filter.source !== undefined)            { conds.push("source = ?");            args.push(filter.source); }

@@ -118,6 +118,18 @@ describe("memory_events", () => {
     expect(superseded).toHaveLength(1);
   });
 
+  it("filters by a record_ids set (IN), ANDed with the other filters", () => {
+    store.appendMemoryEvent(makeEvent({ record_id: "m_1" }));
+    store.appendMemoryEvent(makeEvent({ record_id: "m_2" }));
+    store.appendMemoryEvent(makeEvent({ record_id: "m_3" }));
+    store.appendMemoryEvent(makeEvent({ op: "reverted", record_id: "m_3" }));
+
+    expect(store.queryMemoryEvents({ record_ids: ["m_1", "m_3"] }).map((r) => r.record_id)).toEqual(["m_1", "m_3", "m_3"]);
+    expect(store.queryMemoryEvents({ record_ids: ["m_1", "m_3"], op: "reverted" }).map((r) => r.record_id)).toEqual(["m_3"]);
+    expect(store.queryMemoryEvents({ record_ids: ["m_1", "m_3"], record_id: "m_1" }).map((r) => r.record_id)).toEqual(["m_1"]);
+    expect(store.queryMemoryEvents({ record_ids: [] })).toEqual([]);
+  });
+
   it("filters by time window (ISO 8601 string order)", () => {
     store.appendMemoryEvent(makeEvent({ record_id: "m_1", event_ts: "2026-01-01T10:00:00.000Z" }));
     store.appendMemoryEvent(makeEvent({ record_id: "m_2", event_ts: "2026-01-02T10:00:00.000Z" }));

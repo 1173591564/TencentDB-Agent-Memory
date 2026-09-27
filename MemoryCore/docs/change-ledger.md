@@ -111,10 +111,20 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - 提取写入之后有 `source=api_mutation` 的人工编辑：先按 `event_id` 撤销该人工编辑层，或 `force:true` 覆盖；
 - 被恢复的旧记录还有其它存活后继（并发 session 分叉）；
 - 被恢复的旧记录没有可用快照（写入缺口或已被 clear/TTL 擦除）：默认 409，`force:true` 接受只删不恢复（响应带 `missing`）；
-- 该记录的 `reverted` 事件仍在 pending（未进 store）时返回 503，补齐后再判断。
+- 该记录（或本次要恢复的记录）有事件仍在 pending（未进 store）时返回 503，补齐后再判断。
+  **该判断基于进程内 pending 集合**，只在记下失败的那个进程、重启前有效，见“进程内状态与已知限制”。
 
 管理面 update 事件带修改前的 `snapshot_json`，可按 `event_id` 逐层回退。`reviewer_id` 只取
 `x-tdai-reviewer-id` 请求头（MemoryPanel 以 `panelMeta.userId` 填入），忽略 body。
+
+`/memory/diff` 每张卡带 `event_id`（历史事件缺省）。同一 record 可有多次写入，单条撤销应回传它：
+Core 只撤该事件或显式拒绝，不会改撤同记录的其它写入；不传时缺省为该记录最后一次提取写入。
+卡片的撤销状态按本页卡片的 `record_id` 反查 `reverted` 标记，不受 session 内标记总数影响。
+
+恢复或删除失败返回 500、不追加 `reverted`，并回滚本次已恢复的旧记录后按实际行状态作答：
+回滚干净即未改动；否则 `data.partial = { restored, verified }` 列出仍存活（`verified:false` 时为可能存活）
+的恢复行，重试即续完。删除报错但新记录实际已删时按成功记账（回滚会让新旧全部消失）。
+回滚只覆盖后端报错，不覆盖进程在恢复与删除之间崩溃。
 
 撤销响应在 `reverted`/`restored`/`missing` 之外另带两个诚实标记（单条与批量 `results[]`
 每项一致）：`ledger_pending: true` —— `reverted` 事件只进了 outbox 未落 store，待
@@ -250,6 +260,10 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 健康度与 `pending_redactions` 是进程内状态：重启后清零，未完成的改写不再自动重试，
   直到下一次 backfill 用 outbox 中的标记重新扫一遍本 writer 分片；期间标记保证不会回放进 store。
 - 多实例各自统计，状态接口只反映收到请求的那个实例。
+- 撤销的 pending 守卫同样是进程内状态：其它副本、或同一副本重启后，看不到此前的追加失败，会基于
+  不完整的历史判定。粘性路由无法规避——提取写入由各副本的 PipelineWorker 从共享队列消费，可能发生在
+  任意副本。多副本部署或重启后出现过 store 追加失败时，须先 backfill 覆盖相应时间段再审阅/撤销。
+  ⏸ 跨副本、跨重启的共享 pending 登记另开 PR。
 - 每次 clear 会读取本 writer 所有日期 ≤ `until` 的分片，开销与 outbox 大小成正比。
 - 回放一次性把 `since` 之后的分片读入内存，超大 outbox 需按 `since` 分段执行。
 - 回放只使用扫描范围内（`since` 之后分片里）的标记；早于 `since` 的标记不参与回放，其覆盖的事件在原 store 中已擦除，

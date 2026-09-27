@@ -38,7 +38,7 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - 路径：按 `event_ts` 的 UTC 日期、按写入进程（writer）分片，经 `StorageAdapter.appendFile` 写入，本地文件系统与 COS 后端均适用：
   - `events/YYYY-MM-DD.<writerId>.jsonl`：本 writer 追加的活动分片；
   - `events/YYYY-MM-DD[.<writerId>]~<gen>.jsonl`：擦除改写生成的封存分片（内容已脱敏，此后不再追加，再次改写时换新 `<gen>`）；
-  - `events/YYYY-MM-DD.jsonl`：旧版无后缀分片（本改动之前写入），继续可回放、可改写。
+  - `events/YYYY-MM-DD.jsonl`：未设置 writer id 的进程（`setLedgerWriterId(undefined)`）写入的无后缀分片；可回放，仅该类进程拥有并改写。
 - COS 部署前置：目标桶**不得开启多 AZ 特性**——官方限制为 MAZ 桶不支持 Append Object
   （追加请求返回 405 MethodNotAllowed），而 outbox 的 live 分片、擦除标记、封存分片全部依赖
   `appendObject`。多 AZ 开启后无法关闭，必须建桶时选择单 AZ（已在真实 COS 桶冒烟验证）。
@@ -58,13 +58,13 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
   覆盖前者），容量界于不同 scope 数而非擦除次数（上限 10000，超出 FIFO 淘汰）。
   被任一标记覆盖的追加永不携带明文——无论 append 与 redact 的相对时序如何，
   outbox 与 store 两条腿上都不会复活明文（跨进程时依赖对方节点回放后收敛）。
-- 接入点：L1 writer（created / superseded / updated / merged）、管理面 `recordAudit` 镜像、
+- 接入点：L1 writer（created / superseded / updated / merged）、管理面 `recordMutation`（审计 + ledger 镜像）、
   chat_memory clear 的 L1/L2/L3 deleted、`/memory/diff/revert` 的 reverted。
 - 未配置 storage 时只写 store（行为与之前一致，但无法回放）。
 
 ## 健康度与降级提示
 
-- 按逻辑 store（StorePool 建店时绑定 `backend:instanceId`，对象被 LRU 驱逐重建后记账延续）
+- 按逻辑 store（StorePool 建店时以 `backend:instanceId` 注册 `LedgerState`，对象被 LRU 驱逐重建后记账延续）
   × 租户（team/agent，进程内）统计 `store_failures` / `jsonl_failures` / `last_failure_at`
   （不对外暴露后端原始错误文本），
   以及 `pending_store_events`、`rejected_redactions`。计数是进程级、重启清零，
@@ -114,7 +114,7 @@ backfill 补齐；`tombstone_pending: true` —— JSONL 墓碑未写成，回�
 
 1. **擦除标记**：向本 writer 活动分片追加 `{"redact": filter, "marker_ts": ...}`。标记行永不修改、永不删除，
    只随所在分片按日期整体删除。
-2. **outbox 行改写**：对本 writer 拥有的分片（本 writer 后缀，含其封存分片；以及旧版无后缀分片）中日期 ≤ `until` 的分片，
+2. **outbox 行改写**：对本 writer 拥有的分片（本 writer 后缀，含其封存分片）中日期 ≤ `until` 的分片，
    将匹配事件行的 `content` 置空、删除 `snapshot_json`；`event_id`、`op`、`event_ts`、record/scope 元数据原样保留，
    与 `store.redactMemoryEvents` 的骨架语义一致。标记行、畸形行、不匹配的行逐字节保留。
    封存分片通过 `appendObject` 写到全新的 `~<gen>` key（单次 append 落完整内容），随后才删除原分片——
@@ -143,11 +143,10 @@ backfill 补齐；`tombstone_pending: true` —— JSONL 墓碑未写成，回�
 
 store 擦除成功，且所有含匹配行的分片都已改写之后：
 
-- 本 writer 的分片与旧版无后缀分片：`redactLedgerEvents` 返回时（改写成功的前提下）即已消失。
+- 本 writer 的分片：`redactLedgerEvents` 返回时（改写成功的前提下）即已消失。
 - 其它 writer（其它节点 / 数据目录）的分片：本进程**不会**改写——改写是读-改-写，不能与对方的追加竞争。
   对方下一次 backfill 读到标记后，会改写自己分片中被覆盖的行；在此之前明文仍留在对方分片里，最迟随分片 TTL 删除。
   writer 已永久下线（如 pod 重建且数据目录未持久化）时，其分片没有 owner，只能靠 TTL 删除。
-- 旧版无后缀分片视为任何进程都可改写的共享文件，属尽力而为：若仍有旧版进程向其追加，改写可能丢失并发追加的行。
 - 同一进程内，同一分片的追加与改写经 per-shard 队列串行，改写期间到达的追加不会丢失。
 
 ### 失败处理
@@ -178,10 +177,8 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
   `123` 存成 `"123.0"` 篡改租户身份）、`version` 非 number、`supersedes` 非 string[]、
   非毫秒精确的 `event_ts` 一律计 `malformed`（而非 `failed`），`failed` 只反映 store 不可用。
   可无损归一的形态（`+08:00` 偏移、省略毫秒/秒）在落库前归一化为 `…ss.sssZ`。
-- 擦除标记的 `until` 额外兼容旧形态：亚毫秒小数向下取到毫秒（含 floor 到的那一格——
-  忠实于标记本意）、date-only `YYYY-MM-DD` 映射前一日 `23:59:59.999Z`（与原词法覆盖同集合）、
-  `…ssZ` 类无小数界欠覆盖（安全方向，重跑即补）；无法识别及带白名单外字段的 marker 计
-  `malformed` 不生效。回放 `since` 经 `canonEventBound` 归一，非法值直接抛错。
+- 擦除标记的 `until` 须能经 `canonIsoTs` 无损归一（`+08:00` 偏移、省略毫秒/秒归一化为 `…ss.sssZ`）；
+  无法识别及带白名单外字段的 marker 计 `malformed` 不生效。回放 `since` 经 `canonEventBound` 归一，非法值直接抛错。
 - 回放先重试 pending 的标记追加 / 分片改写，再用扫描到的全部标记（含其它 writer 写的）改写本 writer 拥有的分片
   （计入 `outbox_redacted`；失败计入 `outbox_failed` 并保持 pending）。`redacted` 统计被标记覆盖、以骨架形式回放的事件数。
 - 回放会先把扫描到的 clear/TTL 擦除标记重新应用到 store（收窄到请求的 team/agent，幂等，计入 `redactions_applied`）。

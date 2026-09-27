@@ -63,7 +63,8 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
-import { canonEventBound, canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
+import { decodeMemoryEvent, parseSupersedesJson } from "../event-codec.js";
+import { canonEventBound, canonIsoTs, canonRecordInstants, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import type { Logger } from "../../types.js";
 import type {
   MemoryPromptListFilter,
@@ -172,7 +173,7 @@ function requireNodeSqlite(): typeof import("node:sqlite") {
  */
 function pushIsoCond(conds: string[], args: SQLInputValue[], col: string, v: string | undefined): void {
   if (v === undefined) return;
-  const healed = v || DEFAULT_ISOLATION_ID;
+  const healed = healIsoId(v);
   if (healed === DEFAULT_ISOLATION_ID) conds.push(`${col} IN ('','${DEFAULT_ISOLATION_ID}')`);
   else { conds.push(`${col} = ?`); args.push(healed); }
 }
@@ -1443,15 +1444,15 @@ export class VectorStore implements IMemoryStore {
     // incremental cursors, ORDER BY) — only the canonical instant or the ""
     // sentinel may persist; anything else is rejected rather than written
     // as an uncomparable value.
-    const createdAt = canonRecordTs(record.createdAt);
-    const updatedAt = canonRecordTs(record.updatedAt);
-    if (createdAt === null || updatedAt === null) {
+    const ts = canonRecordInstants(record, ["createdAt", "updatedAt"]);
+    if (ts === null) {
       this.logger?.warn(
         `${TAG} [L1-upsert] REJECTED id=${record.id}: timestamps outside the instant contract ` +
         `(createdAt="${record.createdAt}" updatedAt="${record.updatedAt}")`,
       );
       return false;
     }
+    const { createdAt, updatedAt } = ts;
     try {
       const { id: recordId, timestamps } = record;
       const tsStr = timestamps[0] ?? "";
@@ -1996,13 +1997,14 @@ export class VectorStore implements IMemoryStore {
       return false;
     }
     // recorded_at drives the lexical TTL sweep — same contract as above.
-    const recordedAt = canonRecordTs(record.recordedAt);
-    if (recordedAt === null) {
+    const ts = canonRecordInstants(record, ["recordedAt"]);
+    if (ts === null) {
       this.logger?.warn(
         `${TAG} [L0-upsert] REJECTED id=${record.id}: recordedAt "${record.recordedAt}" outside the instant contract`,
       );
       return false;
     }
+    const { recordedAt } = ts;
     try {
       const skipVec = !embedding || embedding.every(v => v === 0) || !this.vecTablesReady;
 
@@ -3808,38 +3810,7 @@ export class VectorStore implements IMemoryStore {
       scope: string;
       until_ts: string;
     }>;
-    return rows.map((r) => {
-      let supersedes: string[] = [];
-      try { supersedes = JSON.parse(r.supersedes) as string[]; } catch { /* malformed column → treat as none */ }
-      return {
-        event_id: r.event_id || undefined,
-        event_ts: r.event_ts,
-        session_key: r.session_key,
-        session_id: r.session_id,
-        origin_session_id: r.origin_session_id || undefined,
-        origin_session_key: r.origin_session_key || undefined,
-        team_id: r.team_id || undefined,
-        user_id: r.user_id || undefined,
-        agent_id: r.agent_id || undefined,
-        task_id: r.task_id || undefined,
-        op: r.op,
-        record_id: r.record_id,
-        content: r.content,
-        memory_type: r.memory_type || undefined,
-        version: r.version,
-        supersedes: supersedes.length ? supersedes : undefined,
-        superseded_by: r.superseded_by || undefined,
-        snapshot_json: r.snapshot_json || undefined,
-        reviewer_id: r.reviewer_id || undefined,
-        layer: (r.layer || "l1") as MemoryEvent["layer"],
-        source: (r.source || undefined) as MemoryEvent["source"],
-        request_id: r.request_id || undefined,
-        reason: r.reason || undefined,
-        target_event_id: r.target_event_id || undefined,
-        scope: (r.scope || undefined) as MemoryEvent["scope"],
-        until: r.until_ts || undefined,
-      };
-    });
+    return rows.map((r) => decodeMemoryEvent({ ...r, until: r.until_ts }, parseSupersedesJson(r.supersedes)));
   }
 
   redactMemoryEvents(filter: MemoryEventRedactFilter): number {

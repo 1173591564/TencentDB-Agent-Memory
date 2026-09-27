@@ -61,7 +61,8 @@ import type { MemoryRecord } from "../../record/l1-writer.js";
 import { DEFAULT_ISOLATION_ID } from "../isolation.js";
 import { mongoSearchScoreToScore } from "../tokenize.js";
 import { COLLECTIONS } from "./collections.js";
-import { canonEventBound, canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
+import { decodeMemoryEvent } from "../event-codec.js";
+import { canonEventBound, canonIsoTs, canonRecordInstants, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import {
   buildMemoryGenerationRefId,
   type MemoryGenerationLayer,
@@ -309,9 +310,8 @@ export class MongoMemoryStore implements IMemoryStore {
   async upsertL1(record: MemoryRecord, _embedding?: Float32Array): Promise<boolean> {
     // created_time/updated_time feed the _ms TTL/cursor compares — canonical
     // instants or the "" sentinel only (same contract as sqlite).
-    const createdAt = canonRecordTs(record.createdAt);
-    const updatedAt = canonRecordTs(record.updatedAt);
-    if (createdAt === null || updatedAt === null) {
+    const ts = canonRecordInstants(record, ["createdAt", "updatedAt"]);
+    if (ts === null) {
       this.logger?.warn?.(
         `${TAG} [L1-upsert] REJECTED id=${record.id}: timestamps outside the instant contract ` +
         `(createdAt="${record.createdAt}" updatedAt="${record.updatedAt}")`,
@@ -319,7 +319,7 @@ export class MongoMemoryStore implements IMemoryStore {
       return false;
     }
     const coll = await this.coll(COLLECTIONS.L1);
-    const doc = l1RecordToDoc({ ...record, createdAt, updatedAt });
+    const doc = l1RecordToDoc({ ...record, ...ts });
     // Filter carries the designated shard key prefix (team_id, agent_id) so the
     // upsert stays legal if the collection is ever sharded — on a sharded
     // collection an upsert without the full shard key fails with
@@ -452,15 +452,15 @@ export class MongoMemoryStore implements IMemoryStore {
   // ════════════════════════════════════════════════════════
 
   async upsertL0(record: L0Record, _embedding?: Float32Array): Promise<boolean> {
-    const recordedAt = canonRecordTs(record.recordedAt);
-    if (recordedAt === null) {
+    const ts = canonRecordInstants(record, ["recordedAt"]);
+    if (ts === null) {
       this.logger?.warn?.(
         `${TAG} [L0-upsert] REJECTED id=${record.id}: recordedAt "${record.recordedAt}" outside the instant contract`,
       );
       return false;
     }
     const coll = await this.coll(COLLECTIONS.L0);
-    const doc = l0RecordToDoc({ ...record, recordedAt });
+    const doc = l0RecordToDoc({ ...record, ...ts });
     // Shard-key-safe upsert: see upsertL1.
     await coll.replaceOne(
       { _id: doc._id, team_id: doc.team_id, agent_id: doc.agent_id } as never,
@@ -486,14 +486,14 @@ export class MongoMemoryStore implements IMemoryStore {
     const coll = await this.coll(COLLECTIONS.L0);
     const docs = records
       .map((r) => {
-        const recordedAt = canonRecordTs(r.recordedAt);
-        if (recordedAt === null) {
+        const ts = canonRecordInstants(r, ["recordedAt"]);
+        if (ts === null) {
           this.logger?.warn?.(
             `${TAG} [L0-batch] SKIPPED id=${r.id}: recordedAt "${r.recordedAt}" outside the instant contract`,
           );
           return null;
         }
-        return l0RecordToDoc({ ...r, recordedAt });
+        return l0RecordToDoc({ ...r, ...ts });
       })
       .filter((d): d is L0Doc => d !== null);
     if (docs.length === 0) return 0;
@@ -1034,35 +1034,7 @@ export class MongoMemoryStore implements IMemoryStore {
   }
 
   private docToMemoryEvent(d: Record<string, unknown>): MemoryEvent {
-    const supersedes = Array.isArray(d.supersedes) ? (d.supersedes as string[]) : [];
-    return {
-      event_id: String(d.event_id ?? "") || undefined,
-      event_ts: String(d.event_ts ?? ""),
-      session_key: String(d.session_key ?? ""),
-      session_id: String(d.session_id ?? ""),
-      origin_session_id: String(d.origin_session_id ?? "") || undefined,
-      origin_session_key: String(d.origin_session_key ?? "") || undefined,
-      team_id: String(d.team_id ?? "") || undefined,
-      user_id: String(d.user_id ?? "") || undefined,
-      agent_id: String(d.agent_id ?? "") || undefined,
-      task_id: String(d.task_id ?? "") || undefined,
-      op: d.op as MemoryEvent["op"],
-      record_id: String(d.record_id ?? ""),
-      content: String(d.content ?? ""),
-      memory_type: String(d.memory_type ?? "") || undefined,
-      version: Number(d.version ?? 0),
-      supersedes: supersedes.length ? supersedes : undefined,
-      superseded_by: String(d.superseded_by ?? "") || undefined,
-      snapshot_json: String(d.snapshot_json ?? "") || undefined,
-      reviewer_id: String(d.reviewer_id ?? "") || undefined,
-      layer: (String(d.layer ?? "l1") || "l1") as MemoryEvent["layer"],
-      source: (String(d.source ?? "") || undefined) as MemoryEvent["source"],
-      request_id: String(d.request_id ?? "") || undefined,
-      reason: String(d.reason ?? "") || undefined,
-      target_event_id: String(d.target_event_id ?? "") || undefined,
-      scope: (String(d.scope ?? "") || undefined) as MemoryEvent["scope"],
-      until: String(d.until ?? "") || undefined,
-    };
+    return decodeMemoryEvent(d, Array.isArray(d.supersedes) ? (d.supersedes as string[]) : []);
   }
 
   // ════════════════════════════════════════════════════════

@@ -184,8 +184,25 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/memory/ledger/backfill",
 ]);
 
+/** 管理面 mutation 的审计 + 变更账镜像参数。 */
+interface MutationRecord {
+  record_id: string;
+  layer: "L1" | "L2" | "L3";
+  action: "update" | "delete";
+  iso?: { teamId?: string; userId?: string; agentId?: string; sessionId?: string; taskId?: string };
+  version: number;
+  requestId: string;
+  logger?: { warn?: (msg: string) => void };
+  storage?: StorageAdapter;
+  /** L1 update：编辑后的新内容。 */
+  content?: string;
+  /** L1 update/delete：变更前的行快照（管理面编辑可审可撤）。 */
+  snapshot?: L1RecordRow;
+}
+
 /**
- * 写一条审计事件到 store.appendAudit。失败不阻塞主请求（容忍 audit 丢失）。
+ * 记录一次管理面 mutation：写审计（appendMutationAudit）并镜像到统一变更账
+ * （mirrorMutationToLedger）。两者均 best-effort，失败不阻塞主请求。
  *
  * 调用约定（per user 决策）：
  *   - 原始 L0/L1/L2/L3 表完全不动，本函数只追加事件
@@ -198,23 +215,13 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
  * 让 diff/history/inbox 的审阅面能看到管理面变更。audit（API 访问日志）
  * 与 events（变更事实流）双写并行，互不依赖、各自 best-effort。
  */
-async function recordAudit(
-  store: IMemoryStore | undefined,
-  args: {
-    record_id: string;
-    layer: "L1" | "L2" | "L3";
-    action: "update" | "delete";
-    iso?: { teamId?: string; userId?: string; agentId?: string; sessionId?: string; taskId?: string };
-    version: number;
-    requestId: string;
-    logger?: { warn?: (msg: string) => void };
-    storage?: StorageAdapter;
-    /** L1 update：编辑后的新内容。 */
-    content?: string;
-    /** L1 update/delete：变更前的行快照（管理面编辑可审可撤）。 */
-    snapshot?: L1RecordRow;
-  },
-): Promise<void> {
+async function recordMutation(store: IMemoryStore | undefined, args: MutationRecord): Promise<void> {
+  await appendMutationAudit(store, args);
+  await mirrorMutationToLedger(store, args);
+}
+
+/** 写一条审计事件到 store.appendAudit。失败只告警（容忍 audit 丢失）。 */
+async function appendMutationAudit(store: IMemoryStore | undefined, args: MutationRecord): Promise<void> {
   if (store?.appendAudit) {
     try {
       await store.appendAudit({
@@ -236,6 +243,10 @@ async function recordAudit(
       );
     }
   }
+}
+
+/** 镜像一条 memory_events（source=api_mutation）。失败只告警。 */
+async function mirrorMutationToLedger(store: IMemoryStore | undefined, args: MutationRecord): Promise<void> {
   if (store?.appendMemoryEvent || args.storage) {
     try {
       await appendLedgerEvent({ store, storage: args.storage, logger: { warn: (m: string) => args.logger?.warn?.(m) }, event: {
@@ -1256,9 +1267,9 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
     return errorEnvelope(503, `Atomic note ${id} update failed — store rejected the write (degraded?)`, requestId);
   }
 
-  // 审计：L1 update — audit 行记请求方 IdFields（谁调的）；recordAudit 内的
+  // 审计：L1 update — audit 行记请求方 IdFields（谁调的）；recordMutation 内的
   // ledger 镜像事件则按记录自身租户归属（snapshot 里的 IdFields），两者语义不同层。
-  await recordAudit(store, {
+  await recordMutation(store, {
     record_id: id,
     layer: "L1",
     action: "update",
@@ -1736,11 +1747,8 @@ async function planRevert(
   const writes = events.filter((e) => WRITE_OPS.has(e.op));
   const reverts = events.filter((e) => e.op === "reverted");
   const revertedEventIds = new Set(reverts.map((e) => e.target_event_id).filter((id): id is string => !!id));
-  // 旧版 reverted 事件没有 target_event_id：视为撤销了该记录的提取写入。
-  const legacyRevert = reverts.some((e) => !e.target_event_id);
   const isExtraction = (e: MemoryEvent) => e.source !== "api_mutation";
-  const isReverted = (e: MemoryEvent) =>
-    (e.event_id !== undefined && revertedEventIds.has(e.event_id)) || (legacyRevert && isExtraction(e));
+  const isReverted = (e: MemoryEvent) => e.event_id !== undefined && revertedEventIds.has(e.event_id);
 
   const target = opts.eventId
     ? writes.find((e) => e.event_id === opts.eventId)
@@ -2338,7 +2346,7 @@ async function handleAtomicDelete(body: unknown, auth: V2AuthContext, requestId:
 
   // 审计：L1 delete — 每条删除一行 audit
   for (const id of deletedIds) {
-    await recordAudit(store, {
+    await recordMutation(store, {
       record_id: id,
       layer: "L1",
       action: "delete",
@@ -2992,7 +3000,7 @@ async function handleScenarioWrite(body: unknown, _auth: V2AuthContext, requestI
   await refreshSceneIndex(storage, deps.logger);
 
   // 审计：L2 update — record_id 用 path（L2 主键 = 文件路径）
-  await recordAudit(store, {
+  await recordMutation(store, {
     record_id: path,
     layer: "L2",
     action: "update",
@@ -3042,7 +3050,7 @@ async function handleScenarioRm(body: unknown, _auth: V2AuthContext, requestId: 
 
   // 审计：L2 delete — 每个被删的 path 一行
   for (const fname of removedFilenames) {
-    await recordAudit(store, {
+    await recordMutation(store, {
       record_id: fname,
       layer: "L2",
       action: "delete",
@@ -3139,7 +3147,7 @@ async function handleCoreWrite(body: unknown, _auth: V2AuthContext, requestId: s
   const version = await syncProfileToVdb(store, "l3", StoragePaths.persona, personaBody, deps.logger, undefined, deps.requestIsolation);
 
   // 审计：L3 update — record_id 用 persona 的 storage path
-  await recordAudit(store, {
+  await recordMutation(store, {
     record_id: StoragePaths.persona,
     layer: "L3",
     action: "update",

@@ -345,7 +345,7 @@ export async function clearChatMemoryContentResilient(args: {
 
 /**
  * 写清空审计。L1/L2/L3 各一条 delete 事件，record_id 用 memory_id（asset_id），
- * 不写任何原内容。审计失败不阻塞主流程（与 v2-router recordAudit 语义一致）。
+ * 不写任何原内容。审计失败不阻塞主流程（与 v2-router recordMutation 语义一致）。
  * 同时镜像到 memory_events（source=api_mutation, scope=agent，统一变更账），
  * 并擦除该 team+agent 截至清空时刻的事件 content/snapshot（保留元数据骨架），
  * 使 revert / backfill 都无法复活已清空的内容。

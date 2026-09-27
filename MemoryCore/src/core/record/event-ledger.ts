@@ -17,8 +17,8 @@
  * writes cleared content back. A filter is registered the moment a redaction
  * is accepted: appends covered by a known marker are written as skeletons, so
  * an in-flight append can never resurrect plaintext after the wipe. Shards
- * are only ever rewritten by the writer that appends to them (plus legacy
- * unsuffixed shards), so a rewrite never races another node's append;
+ * are only ever rewritten by the writer that appends to them, so a rewrite
+ * never races another node's append;
  * in-process appends and rewrites of a shard are serialized, and whole-scan
  * rewrites are serialized against each other by a global rewrite lock.
  */
@@ -29,8 +29,7 @@ import { join } from "node:path";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
-import { DEFAULT_ISOLATION_ID } from "../store/isolation.js";
-import { canonEventBound, canonIsoTs, canonLegacyUntil, EVENT_ID_RE, healIsoId, isValidRedactFilter, newMemoryEventId, withMemoryEventId } from "../store/memory-event-id.js";
+import { canonEventBound, canonIsoTs, EVENT_ID_RE, healIsoId, isValidRedactFilter, newMemoryEventId, withMemoryEventId } from "../store/memory-event-id.js";
 import type { Logger } from "../types.js";
 
 /** The store capabilities the ledger needs; health is tracked per store object and tenant. */
@@ -112,65 +111,85 @@ interface TenantHealth {
   rejected_redactions: number;
 }
 
-const healthByStore = new Map<object | string, Map<string, TenantHealth>>();
-
 /**
- * Stable ledger identity for a store object. StorePool recreates store objects
- * on LRU eviction / config change — keyed bookkeeping must follow the logical
- * store, not the object. Pool creation sites bind `${backend}:${instanceId}`;
- * unbound stores fall back to object identity (standalone: one store per
- * process, eviction cannot orphan anything).
+ * Per-logical-store ledger bookkeeping: tenant health, pending redaction work
+ * (each carrying its applied `cleared` dims) and known redaction filters.
+ * StorePool recreates store objects on LRU eviction / config change, so pool
+ * creation sites register the object under a stable `${backend}:${instanceId}`
+ * key and get the same state back; unregistered stores own a private state
+ * (standalone: one store per process, eviction cannot orphan anything).
  */
-const ledgerKeyByStore = new WeakMap<object, string>();
+export class LedgerState {
+  readonly health = new Map<string, TenantHealth>();
+  /** Failed redaction legs keyed by their canonical filter. */
+  readonly pendingRedactions = new Map<string, PendingRedaction>();
+  /**
+   * Redaction filters this process has accepted (pending or landed). Appends
+   * covered by a known filter are written as skeletons so a redaction racing an
+   * in-flight append can never resurrect plaintext in the store or outbox
+   * (fail-closed: the filter is registered before any leg is attempted).
+   */
+  readonly knownRedactions = new Map<string, MemoryEventRedactFilter>();
 
-function storeKeyOf(store: LedgerStore | undefined): object | string {
-  if (store === undefined) return UNBOUND_STORE;
-  return ledgerKeyByStore.get(store) ?? store;
-}
-
-export function bindLedgerStoreKey(store: object, key: string): void {
-  ledgerKeyByStore.set(store, key);
-  // Migrate bookkeeping recorded under object identity before the binding
-  // existed (early init writes can race the first getStore call).
-  const pending = pendingRedactionsByStore.get(store);
-  if (pending) {
-    pendingRedactionsByStore.delete(store);
-    const target = pendingRedactionsByStore.get(key) ?? new Map<string, PendingRedaction>();
-    for (const [k, v] of pending) {
-      const cur = target.get(k);
+  /** Fold bookkeeping recorded under another state into this one. */
+  adopt(other: LedgerState): void {
+    for (const [k, v] of other.pendingRedactions) {
+      const cur = this.pendingRedactions.get(k);
       if (cur) { // same filter failed under both identities — union the legs
         cur.store ||= v.store; cur.outbox ||= v.outbox; cur.marker ??= v.marker;
         for (const c of v.cleared) cur.cleared.add(c);
-      } else target.set(k, v);
+      } else this.pendingRedactions.set(k, v);
     }
-    pendingRedactionsByStore.set(key, target);
-  }
-  const health = healthByStore.get(store);
-  if (health) {
-    healthByStore.delete(store);
-    const target = healthByStore.get(key) ?? new Map<string, TenantHealth>();
-    for (const [k, v] of health) {
-      const cur = target.get(k);
+    for (const [k, v] of other.health) {
+      const cur = this.health.get(k);
       if (cur) {
         cur.store_failures += v.store_failures; cur.jsonl_failures += v.jsonl_failures;
         cur.unrecoverable += v.unrecoverable;
         cur.rejected_redactions += v.rejected_redactions;
         for (const [id, rid] of v.pending) cur.pending.set(id, rid);
         if (v.last_failure_at && (!cur.last_failure_at || v.last_failure_at > cur.last_failure_at)) cur.last_failure_at = v.last_failure_at;
-      } else target.set(k, v);
+      } else this.health.set(k, v);
     }
-    healthByStore.set(key, target);
-  }
-  const known = knownRedactionsByStore.get(store);
-  if (known) {
-    knownRedactionsByStore.delete(store);
-    const target = knownRedactionsByStore.get(key) ?? new Map<string, MemoryEventRedactFilter>();
-    for (const [k, v] of known) {
-      const prev = target.get(k);
-      if (!prev || prev.until < v.until) target.set(k, v);
+    for (const [k, v] of other.knownRedactions) {
+      const prev = this.knownRedactions.get(k);
+      if (!prev || prev.until < v.until) this.knownRedactions.set(k, v);
     }
-    knownRedactionsByStore.set(key, target);
   }
+}
+
+const statesByKey = new Map<string, LedgerState>();
+const stateByStore = new WeakMap<object, LedgerState>();
+const keyedStates = new WeakSet<LedgerState>();
+/** Writes attempted before a store was attached; visible from every store's health. */
+const unboundState = new LedgerState();
+
+function stateOf(store: LedgerStore | undefined): LedgerState {
+  if (store === undefined) return unboundState;
+  let state = stateByStore.get(store);
+  if (!state) {
+    state = new LedgerState();
+    stateByStore.set(store, state);
+  }
+  return state;
+}
+
+/**
+ * Attach `store` to the ledger state of logical store `key`, creating it on
+ * first use. Bookkeeping recorded under the object before its first
+ * registration (early init writes can race the first getStore call) is
+ * adopted; another logical store's state is never merged in.
+ */
+export function registerLedgerState(store: object, key: string): LedgerState {
+  let state = statesByKey.get(key);
+  if (!state) {
+    state = new LedgerState();
+    statesByKey.set(key, state);
+    keyedStates.add(state);
+  }
+  const prior = stateByStore.get(store);
+  if (prior && !keyedStates.has(prior)) state.adopt(prior);
+  stateByStore.set(store, state);
+  return state;
 }
 
 interface PendingRedaction {
@@ -207,17 +226,6 @@ function settlePending(m: Map<string, PendingRedaction>, p: PendingRedaction): v
   if (!p.store && !p.outbox && !p.marker && m.get(redactionKey(p.filter)) === p) m.delete(redactionKey(p.filter));
 }
 
-/** Per store: failed store redactions keyed by their canonical filter. */
-const pendingRedactionsByStore = new Map<object | string, Map<string, PendingRedaction>>();
-
-/**
- * Redaction filters this process has accepted (pending or landed). Appends
- * covered by a known filter are written as skeletons so a redaction racing an
- * in-flight append can never resurrect plaintext in the store or outbox
- * (fail-closed: the filter is registered before any leg is attempted).
- */
-const knownRedactionsByStore = new Map<object | string, Map<string, MemoryEventRedactFilter>>();
-
 function registerKnownRedaction(store: LedgerStore | undefined, filter: MemoryEventRedactFilter): void {
   // markerCovers compares event_ts <= until lexically — every registered
   // filter must carry a canonical until (defense-in-depth: callers already
@@ -225,12 +233,7 @@ function registerKnownRedaction(store: LedgerStore | undefined, filter: MemoryEv
   const until = canonIsoTs(filter.until);
   if (until === null) return;
   filter = { ...filter, until };
-  const key = storeKeyOf(store);
-  let m = knownRedactionsByStore.get(key);
-  if (!m) {
-    m = new Map();
-    knownRedactionsByStore.set(key, m);
-  }
+  const m = stateOf(store).knownRedactions;
   // Keyed by tenant dimensions only: a later `until` for the same dimensions
   // subsumes earlier ones, so the map is bounded by distinct scopes rather
   // than by redaction count.
@@ -243,9 +246,7 @@ function registerKnownRedaction(store: LedgerStore | undefined, filter: MemoryEv
 
 /** Filters (pending or applied) that cover this event — content must not be persisted. */
 function coveringRedactions(store: LedgerStore | undefined, event: MemoryEvent): MemoryEventRedactFilter[] {
-  const m = knownRedactionsByStore.get(storeKeyOf(store));
-  if (!m) return [];
-  return [...m.values()].filter((f) => markerCovers(f, event));
+  return [...stateOf(store).knownRedactions.values()].filter((f) => markerCovers(f, event));
 }
 
 function redactionScopeKey(f: MemoryEventRedactFilter): string {
@@ -257,27 +258,20 @@ function redactionKey(f: MemoryEventRedactFilter): string {
 }
 
 function pendingRedactions(store: LedgerStore | undefined): Map<string, PendingRedaction> {
-  const key = storeKeyOf(store);
-  let m = pendingRedactionsByStore.get(key);
-  if (!m) {
-    m = new Map();
-    pendingRedactionsByStore.set(key, m);
-  }
-  return m;
+  return stateOf(store).pendingRedactions;
 }
 
 /**
  * All pending redactions reachable from `store`: its own bucket plus the
- * UNBOUND bucket (writes attempted before a store was attached — they still
+ * unbound state (writes attempted before a store was attached — they still
  * need retries and must show up in health).
  */
 function eachPendingRedaction(
   store: LedgerStore | undefined,
   fn: (m: Map<string, PendingRedaction>, p: PendingRedaction) => void,
 ): void {
-  for (const key of [UNBOUND_STORE, storeKeyOf(store)]) {
-    const m = pendingRedactionsByStore.get(key);
-    if (!m) continue;
+  for (const state of [unboundState, stateOf(store)]) {
+    const m = state.pendingRedactions;
     for (const p of m.values()) fn(m, p);
   }
 }
@@ -308,31 +302,22 @@ function storeRedactionPendingFor(p: PendingRedaction, scope?: LedgerScope): boo
 function outboxRedactionPendingFor(p: PendingRedaction, scope?: LedgerScope): boolean {
   return (p.outbox || p.marker !== undefined) && redactionTouches(p.filter, scope);
 }
-const UNBOUND_STORE = {};
 
 function tenantKey(team: string, agent: string): string {
   return `${team}\u0001${agent}`;
 }
 
 function tenantsFor(store: LedgerStore | undefined): Map<string, TenantHealth> {
-  const key = storeKeyOf(store);
-  let m = healthByStore.get(key);
-  if (!m) {
-    m = new Map();
-    healthByStore.set(key, m);
-  }
-  return m;
+  return stateOf(store).health;
 }
 
-/** Health buckets reachable from `store`: its own plus the UNBOUND bucket. */
+/** Health buckets reachable from `store`: its own plus the unbound state. */
 function eachTenantHealth(
   store: LedgerStore | undefined,
   fn: (h: TenantHealth) => void,
 ): void {
-  for (const key of [UNBOUND_STORE, storeKeyOf(store)]) {
-    const m = healthByStore.get(key);
-    if (!m) continue;
-    for (const h of m.values()) fn(h);
+  for (const state of [unboundState, stateOf(store)]) {
+    for (const h of state.health.values()) fn(h);
   }
 }
 
@@ -460,15 +445,15 @@ export function hasPendingLedgerEvent(store: LedgerStore | undefined, recordId: 
 }
 
 /**
- * Test/ops hook: clear the failure counters (also the shared UNBOUND bucket).
+ * Test/ops hook: clear the failure counters (also the shared unbound state).
  * Pending redactions are deliberately NOT cleared — they are un-applied work,
  * not bookkeeping. Resetting them would let a failed store wipe silently never
  * retry while the ledger reports healthy; they clear only by actually landing
  * (backfill) or process restart.
  */
 export function resetLedgerHealth(store: LedgerStore | undefined): void {
-  healthByStore.delete(storeKeyOf(store));
-  if (store !== undefined) healthByStore.delete(UNBOUND_STORE);
+  stateOf(store).health.clear();
+  if (store !== undefined) unboundState.health.clear();
 }
 
 function shardDateOf(ts: string): string {
@@ -478,7 +463,7 @@ function shardDateOf(ts: string): string {
 
 // ── Outbox shards ──
 //
-//   events/YYYY-MM-DD.jsonl                  legacy / no writer id configured
+//   events/YYYY-MM-DD.jsonl                  no writer id configured
 //   events/YYYY-MM-DD.<writerId>.jsonl       live shard this writer appends to
 //   events/YYYY-MM-DD[.<writerId>]~<gen>.jsonl  sealed shard produced by a rewrite
 //
@@ -494,8 +479,7 @@ let ledgerWriterId: string | undefined = newLedgerWriterId();
 /**
  * Set this process's outbox writer id (stable per node/boot). New events go
  * to `events/YYYY-MM-DD.<writerId>.jsonl`; rewrites only touch shards with
- * this suffix (and legacy unsuffixed shards). `undefined` restores the legacy
- * single-writer naming.
+ * this suffix. `undefined` restores the single-writer naming.
  */
 export function setLedgerWriterId(id: string | undefined): void {
   if (id !== undefined && !WRITER_ID_RE.test(id)) throw new Error(`invalid ledger writer id: ${JSON.stringify(id)}`);
@@ -553,9 +537,9 @@ export function parseLedgerShardName(name: string): ShardName | undefined {
   return m ? { name, date: m[1]!, ...(m[2] ? { writer: m[2] } : {}) } : undefined;
 }
 
-/** Shards this process may rewrite: its own, plus legacy unsuffixed shards (best-effort shared). */
+/** Shards this process may rewrite: only the ones it appends to. */
 function ownsShard(s: ShardName): boolean {
-  return s.writer === undefined || s.writer === ledgerWriterId;
+  return s.writer === ledgerWriterId;
 }
 
 async function listShards(storage: StorageAdapter): Promise<ShardName[]> {
@@ -716,8 +700,8 @@ export async function appendLedgerEvent(params: {
     // surface it as an unrecoverable store gap rather than a silent drop.
     recordFailure(store, "store", {
       ...event,
-      team_id: event.team_id || DEFAULT_ISOLATION_ID,
-      agent_id: event.agent_id || DEFAULT_ISOLATION_ID,
+      team_id: healIsoId(event.team_id ?? ""),
+      agent_id: healIsoId(event.agent_id ?? ""),
     }, false);
     return { event_id: event.event_id, jsonl: false, store: false };
   }
@@ -728,9 +712,9 @@ export async function appendLedgerEvent(params: {
   event = {
     ...event,
     event_ts: eventTs,
-    team_id: event.team_id || DEFAULT_ISOLATION_ID,
-    agent_id: event.agent_id || DEFAULT_ISOLATION_ID,
-    user_id: event.user_id || DEFAULT_ISOLATION_ID,
+    team_id: healIsoId(event.team_id ?? ""),
+    agent_id: healIsoId(event.agent_id ?? ""),
+    user_id: healIsoId(event.user_id ?? ""),
     task_id: event.task_id || undefined,
   };
   // Redaction race guard: an append that lands after a clear/TTL must never
@@ -948,9 +932,9 @@ function markerCovers(m: MemoryEventRedactFilter, e: MemoryEvent): boolean {
   // Legacy rows may still carry ""/missing ids — read them through the same
   // normalization writes use ("default") so coverage is form-independent.
   const tenantMatch =
-    (m.team_id === undefined || (e.team_id || DEFAULT_ISOLATION_ID) === healIsoId(m.team_id)) &&
-    (m.agent_id === undefined || (e.agent_id || DEFAULT_ISOLATION_ID) === healIsoId(m.agent_id)) &&
-    (m.user_id === undefined || (e.user_id || DEFAULT_ISOLATION_ID) === healIsoId(m.user_id));
+    (m.team_id === undefined || healIsoId(e.team_id ?? "") === healIsoId(m.team_id)) &&
+    (m.agent_id === undefined || healIsoId(e.agent_id ?? "") === healIsoId(m.agent_id)) &&
+    (m.user_id === undefined || healIsoId(e.user_id ?? "") === healIsoId(m.user_id));
   // Compare canonical instants: a foreign-writer line may carry `+08:00` or
   // omitted-millis event_ts that lexically escapes a canonical until. An
   // unevaluable timestamp is treated as in-window — a corrupt ts must not
@@ -962,9 +946,9 @@ function markerCovers(m: MemoryEventRedactFilter, e: MemoryEvent): boolean {
 function inScope(scope: LedgerScope | undefined, e: MemoryEvent): boolean {
   // Same legacy-form healing as markerCovers, on BOTH sides: ""/missing ids
   // read as the write-side normalization target ("default"; task stays bare).
-  return (scope?.team_id === undefined || (e.team_id || DEFAULT_ISOLATION_ID) === healIsoId(scope.team_id)) &&
-    (scope?.agent_id === undefined || (e.agent_id || DEFAULT_ISOLATION_ID) === healIsoId(scope.agent_id)) &&
-    (scope?.user_id === undefined || (e.user_id || DEFAULT_ISOLATION_ID) === healIsoId(scope.user_id)) &&
+  return (scope?.team_id === undefined || healIsoId(e.team_id ?? "") === healIsoId(scope.team_id)) &&
+    (scope?.agent_id === undefined || healIsoId(e.agent_id ?? "") === healIsoId(scope.agent_id)) &&
+    (scope?.user_id === undefined || healIsoId(e.user_id ?? "") === healIsoId(scope.user_id)) &&
     (scope?.task_id === undefined || (e.task_id ?? "") === scope.task_id);
 }
 
@@ -1039,10 +1023,6 @@ export async function replayLedgerEvents(params: {
       if (parsed.redact !== undefined) {
         // A redact object that fails validation must not silently act as an
         // event; it is not replayable either way — count it malformed.
-        // Pre-contract markers may carry a sub-ms or date-only until; map it
-        // to the canonical bound covering the same events before validating.
-        const legacyUntil = typeof parsed.redact.until === "string" ? canonLegacyUntil(parsed.redact.until) : null;
-        if (legacyUntil !== null) parsed.redact.until = legacyUntil;
         if (!isValidRedactFilter(parsed.redact)) {
           out.malformed += 1;
           continue;
@@ -1071,9 +1051,9 @@ export async function replayLedgerEvents(params: {
       events.push({
         ...parsed,
         event_ts: canonIsoTs(parsed.event_ts)!,
-        team_id: parsed.team_id || DEFAULT_ISOLATION_ID,
-        agent_id: parsed.agent_id || DEFAULT_ISOLATION_ID,
-        user_id: parsed.user_id || DEFAULT_ISOLATION_ID,
+        team_id: healIsoId(parsed.team_id ?? ""),
+        agent_id: healIsoId(parsed.agent_id ?? ""),
+        user_id: healIsoId(parsed.user_id ?? ""),
         task_id: parsed.task_id || undefined,
       });
     }

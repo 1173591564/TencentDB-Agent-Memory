@@ -21,6 +21,7 @@ import { DEFAULT_ISOLATION_ID, type IMemoryStore } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
+import { healIsoId } from "../store/memory-event-id.js";
 import { appendLedgerEvent } from "./event-ledger.js";
 import type { Logger } from "../types.js";
 
@@ -467,7 +468,7 @@ export async function writeMemory(params: {
         event_ts: now,
         session_key: sessionKey,
         session_id: record.sessionId,
-        team_id: record.teamId || "default",
+        team_id: healIsoId(record.teamId ?? ""),
         user_id: record.userId ?? "",
         agent_id: record.agentId ?? "",
         task_id: record.taskId ?? "",

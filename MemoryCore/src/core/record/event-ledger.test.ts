@@ -11,9 +11,9 @@ import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
-import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, hasPendingLedgerEvent, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId } from "./event-ledger.js";
+import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, hasPendingLedgerEvent, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, registerLedgerState, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId } from "./event-ledger.js";
 import { LocalMemoryCleaner } from "../../utils/memory-cleaner.js";
-import { canonIsoTs, canonLegacyUntil } from "../store/memory-event-id.js";
+import { canonIsoTs } from "../store/memory-event-id.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "./l1-writer.js";
 
 const silent = { warn() {}, debug() {} };
@@ -84,6 +84,37 @@ describe("event ledger outbox", () => {
     const events = store.queryMemoryEvents({ record_id: "m_x" });
     expect(events).toHaveLength(1);
     expect(events[0]!.event_id).toBe(r.event_id);
+  });
+
+  it("a recreated store registered under the same key keeps the logical store's ledger state", async () => {
+    const failing = () => ({ appendMemoryEvent: () => { throw new Error("vdb down"); } }) as unknown as IMemoryStore;
+    const early = failing();
+    await appendLedgerEvent({ store: early, storage, event: ev(), logger: silent });
+    registerLedgerState(early, "sqlite:pool-test");
+    expect(getLedgerHealth(early).store_failures).toBe(1);
+
+    const recreated = failing();
+    registerLedgerState(recreated, "sqlite:pool-test");
+    expect(getLedgerHealth(recreated)).toMatchObject({ degraded: true, store_failures: 1 });
+    expect(getLedgerHealth(failing()).store_failures).toBe(0);
+    resetLedgerHealth(recreated);
+  });
+
+  it("re-registering a store under another key does not carry the first key's state over", async () => {
+    const store = {
+      appendMemoryEvent: () => { throw new Error("vdb down"); },
+    } as unknown as IMemoryStore;
+    registerLedgerState(store, "sqlite:key-a");
+    await appendLedgerEvent({ store, storage, event: ev(), logger: silent });
+    expect(getLedgerHealth(store).store_failures).toBe(1);
+
+    registerLedgerState(store, "sqlite:key-b");
+    expect(getLedgerHealth(store).store_failures).toBe(0);
+
+    const other = {} as unknown as IMemoryStore;
+    registerLedgerState(other, "sqlite:key-a");
+    expect(getLedgerHealth(other).store_failures).toBe(1);
+    resetLedgerHealth(other);
   });
 
   it("outbox failure does not block the store write", async () => {
@@ -342,23 +373,6 @@ describe("event ledger outbox", () => {
     await expect(replayLedgerEvents({ store, storage, since: "2026-02-30T00:00:00Z", logger: silent })).rejects.toThrow(/non-canonical/);
   });
 
-  it("legacy marker untils (sub-ms, date-only) replay with the exact canonical bound", async () => {
-    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_in", event_ts: "2026-03-01T10:00:00.123Z", content: "s1" }), logger: silent });
-    await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_out", event_ts: "2026-03-01T10:00:00.124Z", content: "s2" }), logger: silent });
-    await appendLedgerEvent({ store: undefined, storage, event: ev({ team_id: "t2", record_id: "m_day", event_ts: "2026-03-01T00:00:00.000Z", content: "s3" }), logger: silent });
-    await storage.appendFile(StoragePaths.event("2026-03-01"), [
-      JSON.stringify({ redact: { team_id: "t1", agent_id: "a1", until: "2026-03-01T10:00:00.123999Z" }, marker_ts: "2026-03-01T10:00:01.000Z" }),
-      // date-only covered only events strictly before that day
-      JSON.stringify({ redact: { team_id: "t2", agent_id: "a1", until: "2026-03-01" }, marker_ts: "2026-03-01T10:00:02.000Z" }),
-    ].join("\n") + "\n");
-    const r = await replayLedgerEvents({ store, storage, logger: silent });
-    expect(r.malformed).toBe(0);
-    expect(r.redactions_applied).toBe(2);
-    expect(store.queryMemoryEvents({ record_id: "m_in" })[0]!.content).toBe("");
-    expect(store.queryMemoryEvents({ record_id: "m_out" })[0]!.content).toBe("s2");
-    expect(store.queryMemoryEvents({ record_id: "m_day" })[0]!.content).toBe("s3");
-  });
-
   it("rebuilding a store from the outbox reproduces writeMemory's events exactly", async () => {
     const base = { sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1", baseDir: dir, vectorStore: store, storage };
     await writeMemory({ ...base, memory: memory("salary 5000"), decision: decision("m_a", "store") });
@@ -438,7 +452,7 @@ describe("event ledger in-place outbox redaction", () => {
   });
 
   it("a covered outbox line with non-string plaintext is still skeletonized", async () => {
-    await storage.appendFile(StoragePaths.event("2026-03-01"),
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01", getLedgerWriterId()),
       JSON.stringify({ ...ev({ event_id: eid(9) }), content: { secret: "salary 5000" } }) + "\n");
     await redactLedgerEvents({ store, storage, filter, logger: silent });
     expect(await rawOutbox()).not.toContain("salary 5000");
@@ -552,33 +566,6 @@ describe("event ledger in-place outbox redaction", () => {
     await replayLedgerEvents({ store, storage, scope, logger: silent });
     expect((await outboxRows()).filter((r) => r.redact)).toHaveLength(1);
     expect(getLedgerHealth(store, scope)).toMatchObject({ degraded: false, pending_redactions: 0 });
-  });
-
-  it("mixed legacy (unsuffixed) and per-writer shards replay and redact correctly", async () => {
-    await storage.appendFile(StoragePaths.event("2026-03-01"), JSON.stringify(ev({ event_id: eid(4), record_id: "m_l", content: "legacy secret" })) + "\n");
-    await storage.appendFile("events/2026-03-02.w9.jsonl", JSON.stringify(ev({ event_id: eid(5), event_ts: "2026-03-02T10:00:00.000Z", team_id: "t2", record_id: "m_o", content: "other" })) + "\n");
-    await appendLedgerEvent({ store, storage, event: ev({ event_ts: "2026-03-03T10:00:00.000Z", record_id: "m_new", content: "new" }), logger: silent });
-    expect(await shardNames()).toEqual(["2026-03-01.jsonl", "2026-03-02.w9.jsonl", "2026-03-03.w1.jsonl"]);
-
-    const fresh = new VectorStore(path.join(dir, "fresh.db"), 0);
-    fresh.init();
-    try {
-      const r = await replayLedgerEvents({ store: fresh, storage, logger: silent });
-      expect(r).toMatchObject({ files: 3, replayed: 3, malformed: 0, failed: 0 });
-      expect(fresh.queryMemoryEvents({ record_id: "m_l" })[0]!.content).toBe("legacy secret");
-      const since = await replayLedgerEvents({ store: fresh, storage, since: "2026-03-02T00:00:00.000Z", logger: silent });
-      expect(since.files).toBe(2);
-    } finally {
-      fresh.close();
-    }
-
-    await redactLedgerEvents({ store, storage, filter: { team_id: "t1", agent_id: "a1", until: "2026-03-02T00:00:00.000Z" }, logger: silent });
-    const raw = await rawOutbox();
-    expect(raw).not.toContain("legacy secret");
-    expect(raw).toContain("\"new\"");
-    expect(raw).toContain("\"other\"");
-    expect((await shardNames()).some((n) => /^2026-03-01~[a-z0-9]+\.jsonl$/.test(n))).toBe(true);
-    expect(await storage.readFile("events/2026-03-02.w9.jsonl")).not.toBeNull();
   });
 
   it("TTL cleanup writes an unscoped retention marker and rewrites matching shard lines", async () => {
@@ -717,13 +704,5 @@ describe("canonIsoTs strictness", () => {
     expect(canonIsoTs("9999-12-31T23:59:59.999-01:00")).toBeNull();
     expect(canonIsoTs("0000-01-01T00:30:00+01:00")).toBeNull();
     expect(canonIsoTs("9999-12-31T23:59:59.999Z")).toBe("9999-12-31T23:59:59.999Z");
-  });
-
-  it("maps legacy marker untils without widening; others stay null", () => {
-    expect(canonLegacyUntil("2026-03-01T10:00:00.123999Z")).toBe("2026-03-01T10:00:00.123Z");
-    expect(canonLegacyUntil("2026-03-01")).toBe("2026-02-28T23:59:59.999Z");
-    expect(canonLegacyUntil("2026-02-30")).toBeNull();
-    expect(canonLegacyUntil("March 5, 2026")).toBeNull();
-    expect(canonLegacyUntil("2026-03-01T10:00:00")).toBeNull();
   });
 });

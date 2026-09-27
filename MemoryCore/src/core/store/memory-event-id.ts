@@ -55,31 +55,6 @@ export function canonIsoTs(v: string): string | null {
 }
 
 /**
- * Pre-contract redaction markers carried any `Date.parse`-able `until` and
- * were compared lexically against event_ts. Maps legacy shapes to a canonical
- * bound preserving the marker's intent at ms granularity: a sub-ms fraction
- * floors to its millisecond (which lexically covers that boundary instant —
- * wider than the raw bound by exactly the floored ms, matching author intent);
- * a date-only `YYYY-MM-DD` covered everything strictly before that day and
- * maps to the previous day's last millisecond; `…ssZ`-style bounds under-cover
- * (raw lexical reach included the whole trailing second/minute) — safe
- * direction, re-running the redaction closes the gap. Anything else stays null.
- */
-export function canonLegacyUntil(v: string): string | null {
-  const exact = canonIsoTs(v);
-  if (exact !== null) return exact;
-  const subMs = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\d+Z$/.exec(v);
-  if (subMs) return canonIsoTs(`${subMs[1]}Z`);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
-    const dayStart = canonIsoTs(`${v}T00:00:00.000Z`);
-    if (dayStart === null) return null;
-    const prev = new Date(Date.parse(dayStart) - 1).toISOString();
-    return CANON_ISO_RE.test(prev) ? prev : null;
-  }
-  return null;
-}
-
-/**
  * `since`/`until` bound for a store-level event_ts compare. Store queries are
  * reachable without the gateway schema (planRevert, replay, direct callers),
  * so the bound is canonicalized here too; an unrepresentable bound throws
@@ -106,11 +81,32 @@ export function canonRecordTs(v: string | undefined): string | null {
 }
 
 /**
+ * Write-path gate over a record's instant columns: the canonical value of
+ * each named field, or null when any of them breaks the contract (the
+ * whole write is then rejected).
+ */
+export function canonRecordInstants<K extends string>(
+  record: Partial<Record<K, string>>,
+  keys: readonly K[],
+): Record<K, string> | null {
+  const out = {} as Record<K, string>;
+  for (const k of keys) {
+    const c = canonRecordTs(record[k]);
+    if (c === null) return null;
+    out[k] = c;
+  }
+  return out;
+}
+
+/**
  * Isolation-id contract: "" and "default" denote the same logical "no
  * value" (writes converge on "default"; legacy/foreign rows may still
  * carry ""). A defined filter value heals "" → "default"; undefined stays
- * undefined (unconstrained). Row-side healing is plain `v || "default"`.
+ * undefined (unconstrained). Row-side values, where missing also means
+ * "no value", heal via `healIsoId(v ?? "")`.
  */
+export function healIsoId(v: string): string;
+export function healIsoId(v: string | undefined): string | undefined;
 export function healIsoId(v: string | undefined): string | undefined {
   return v === undefined ? undefined : v || DEFAULT_ISOLATION_ID;
 }

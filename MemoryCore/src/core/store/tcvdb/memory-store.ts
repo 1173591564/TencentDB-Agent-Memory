@@ -53,7 +53,8 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID } from "../types.js";
 import { TcvdbClient, TcvdbApiError } from "./client.js";
-import { canonEventBound, canonIsoTs, canonRecordTs, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
+import { decodeMemoryEvent, parseSupersedesJson } from "../event-codec.js";
+import { canonEventBound, canonIsoTs, canonRecordInstants, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
 import type { BM25LocalEncoder } from "../bm25-local.js";
 import type { SparseVector } from "@tencentdb-agent-memory/tcvdb-text";
 import type {
@@ -742,7 +743,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     if (this.degraded) throw new Error("L1 upsert rejected: tcvdb store is degraded");
     // created_time/updated_time feed the _ms TTL/cursor compares — canonical
     // instants or the "" sentinel only (same contract as sqlite/mongo).
-    if (canonRecordTs(record.createdAt) === null || canonRecordTs(record.updatedAt) === null) {
+    if (canonRecordInstants(record, ["createdAt", "updatedAt"]) === null) {
       throw new Error(
         `timestamps outside the instant contract (createdAt="${record.createdAt}" updatedAt="${record.updatedAt}")`,
       );
@@ -799,7 +800,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       if (this.degraded) return 0;
 
       const ok = records.filter((record) => {
-        if (canonRecordTs(record.createdAt) === null || canonRecordTs(record.updatedAt) === null) {
+        if (canonRecordInstants(record, ["createdAt", "updatedAt"]) === null) {
           this.logger?.warn?.(
             `${TAG} [L1-batch] SKIPPED id=${record.id}: timestamps outside the instant contract`,
           );
@@ -1194,7 +1195,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
   private async _upsertL0Async(record: L0Record): Promise<void> {
     await this._ensureInit();
     if (this.degraded) throw new Error("L0 upsert rejected: tcvdb store is degraded");
-    if (canonRecordTs(record.recordedAt) === null) {
+    if (canonRecordInstants(record, ["recordedAt"]) === null) {
       throw new Error(`recordedAt "${record.recordedAt}" outside the instant contract`);
     }
 
@@ -1234,7 +1235,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       if (this.degraded) return 0;
 
       const ok = records.filter((record) => {
-        if (canonRecordTs(record.recordedAt) === null) {
+        if (canonRecordInstants(record, ["recordedAt"]) === null) {
           this.logger?.warn?.(
             `${TAG} [L0-batch] SKIPPED id=${record.id}: recordedAt "${record.recordedAt}" outside the instant contract`,
           );
@@ -2764,38 +2765,12 @@ export class TcvdbMemoryStore implements IMemoryStore {
       });
       const page = docs.slice(offset, offset + limit);
 
-      return page.map((doc) => {
-        let supersedes: string[] = [];
-        try { supersedes = JSON.parse(String(doc.supersedes ?? "[]")) as string[]; } catch { /* keep [] */ }
-        return {
-          event_id: String(doc.event_id ?? "") || String(doc.id ?? "") || undefined,
-          event_ts: String(doc.event_ts ?? ""),
-          session_key: String(doc.session_key ?? ""),
-          session_id: String(doc.session_id ?? ""),
-          origin_session_id: String(doc.origin_session_id ?? "") || undefined,
-          origin_session_key: String(doc.origin_session_key ?? "") || undefined,
-          team_id: String(doc.team_id ?? "") || undefined,
-          agent_id: String(doc.agent_id ?? "") || undefined,
-          user_id: String(doc.user_id ?? "") || undefined,
-          task_id: String(doc.task_id ?? "") || undefined,
-          op: doc.op as MemoryEvent["op"],
-          record_id: String(doc.record_id ?? ""),
-          content: String(doc.content ?? ""),
-          memory_type: String(doc.memory_type ?? "") || undefined,
-          version: Number(doc.version ?? 0),
-          supersedes: supersedes.length ? supersedes : undefined,
-          superseded_by: String(doc.superseded_by ?? "") || undefined,
-          snapshot_json: String(doc.snapshot_json ?? "") || undefined,
-          reviewer_id: String(doc.reviewer_id ?? "") || undefined,
-          layer: (String(doc.layer ?? "l1") || "l1") as MemoryEvent["layer"],
-          source: (String(doc.source ?? "") || undefined) as MemoryEvent["source"],
-          request_id: String(doc.request_id ?? "") || undefined,
-          reason: String(doc.reason ?? "") || undefined,
-          target_event_id: String(doc.target_event_id ?? "") || undefined,
-          scope: (String(doc.scope ?? "") || undefined) as MemoryEvent["scope"],
-          until: String(doc.until ?? "") || undefined,
-        };
-      });
+      return page.map((doc) =>
+        decodeMemoryEvent(
+          { ...doc, event_id: String(doc.event_id ?? "") || String(doc.id ?? "") },
+          parseSupersedesJson(String(doc.supersedes ?? "[]")),
+        ),
+      );
     } catch (err) {
       this.logger?.warn?.(
         `${TAG} [events-query] FAILED: ${err instanceof Error ? err.message : String(err)}`,

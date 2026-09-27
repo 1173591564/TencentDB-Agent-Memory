@@ -19,7 +19,7 @@ import path from "node:path";
 import { existsSync, mkdirSync } from "node:fs";
 import type { MemoryTdaiConfig } from "../../config.js";
 import type { IMemoryStore, StoreLogger } from "./types.js";
-import { bindLedgerStoreKey } from "../record/event-ledger.js";
+import { registerLedgerState } from "../record/event-ledger.js";
 import type { EmbeddingService } from "./embedding.js";
 import { createEmbeddingService, NoopEmbeddingService } from "./embedding.js";
 import { VectorStore } from "./sqlite/memory-store.js";
@@ -239,9 +239,9 @@ export class StorePool {
     }
 
     // Ledger health/pending must follow the logical store, not this object —
-    // eviction/config-change recreates the object; binding lets the ledger
-    // adopt the prior object's pending bookkeeping instead of orphaning it.
-    bindLedgerStoreKey(pooledStore.store, `${backend}:${instanceId}`);
+    // eviction/config-change recreates the object; registering under the
+    // logical key hands the new object the same ledger state.
+    registerLedgerState(pooledStore.store, `${backend}:${instanceId}`);
 
     return pooledStore;
   }

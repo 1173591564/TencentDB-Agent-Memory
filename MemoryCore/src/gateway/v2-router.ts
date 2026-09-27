@@ -1876,6 +1876,32 @@ async function rollbackRestores(
 const SCOPE_DELETE_PAGE = 1000;
 /** Upper bound on the scope-delete scan (50k later deletions); beyond it the revert fails closed. */
 const SCOPE_DELETE_MAX_PAGES = 50;
+const RECORD_EVENTS_PAGE = 1000;
+/** Upper bound on one record's event history (50k events); beyond it the revert fails closed. */
+const RECORD_EVENTS_MAX_PAGES = 50;
+
+/**
+ * Fetch a record's full event history, paging past the per-request cap. A
+ * single capped page drops the newest events (asc order) — the revert plan
+ * (latest-write target, reverted/deleted/later guards) must not be built on
+ * a truncated history. Past the page cap we throw: callers map store
+ * failures to 503 (fail-closed).
+ */
+async function queryRecordEvents(
+  store: RevertStore,
+  recordId: string,
+  isoScope: { team_id?: string; user_id?: string; agent_id?: string; task_id?: string },
+): Promise<MemoryEvent[]> {
+  const out: MemoryEvent[] = [];
+  for (let page = 0; ; page++) {
+    if (page >= RECORD_EVENTS_MAX_PAGES) {
+      throw new Error(`Record ${recordId} has more than ${RECORD_EVENTS_PAGE * RECORD_EVENTS_MAX_PAGES} events — refusing to plan a revert on truncated history`);
+    }
+    const batch = await store.queryMemoryEvents({ record_id: recordId, ...isoScope, limit: RECORD_EVENTS_PAGE, offset: page * RECORD_EVENTS_PAGE });
+    out.push(...batch);
+    if (batch.length < RECORD_EVENTS_PAGE) return out;
+  }
+}
 
 /** agent 级管理面删除（clear/archive）；旧事件无 scope 时要求 user_id 为空。 */
 function isManagementScopeDelete(e: MemoryEvent): boolean {
@@ -1899,7 +1925,7 @@ async function planRevert(
   const rowFilter = iso ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId } : {};
   const fail = (status: number, error: string): RevertPlan => ({ ok: false, status, error });
 
-  const events = await store.queryMemoryEvents({ record_id: recordId, ...isoScope, limit: 1000 });
+  const events = await queryRecordEvents(store, recordId, isoScope);
   const writes = events.filter((e) => WRITE_OPS.has(e.op));
   const reverts = events.filter((e) => e.op === "reverted");
   const revertedEventIds = new Set(reverts.map((e) => e.target_event_id).filter((id): id is string => !!id));
@@ -1997,7 +2023,7 @@ async function planRevert(
     }
     for (const id of chunk) {
       visited.add(id);
-      const evs = await store.queryMemoryEvents({ record_id: id, ...isoScope, limit: 1000 });
+      const evs = await queryRecordEvents(store, id, isoScope);
       for (const e of evs) {
         if (e.op === "superseded" && e.superseded_by && !visited.has(e.superseded_by)) frontier.push(e.superseded_by);
       }
@@ -2009,7 +2035,7 @@ async function planRevert(
   const restores: Array<{ targetId: string; snap?: MemoryEvent }> = [];
   if (target.op !== "created") {
     for (const targetId of target.supersedes ?? []) {
-      const targetEvents = await store.queryMemoryEvents({ record_id: targetId, ...isoScope, limit: 1000 });
+      const targetEvents = await queryRecordEvents(store, targetId, isoScope);
       const superseded = targetEvents.filter((e) => e.op === "superseded");
       const siblings = [...new Set(superseded.map((e) => e.superseded_by).filter((id): id is string => !!id && id !== recordId))];
       if (siblings.length > 0) {

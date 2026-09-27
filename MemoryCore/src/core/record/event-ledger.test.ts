@@ -628,6 +628,28 @@ describe("event ledger in-place outbox redaction", () => {
     expect(await rawOutbox()).not.toContain("late plaintext");
   });
 
+  it("an in-flight append whose plaintext lives only in snapshot_json is still re-redacted", async () => {
+    // superseded / management-update events may carry snapshot_json with empty
+    // content — the late-marker recheck must treat the snapshot as plaintext
+    // too, or the row keeps a restorable copy of wiped data.
+    const realAppend = store.appendMemoryEvent.bind(store);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    store.appendMemoryEvent = async (e: MemoryEvent) => { await gate; return realAppend(e); };
+
+    const snap = JSON.stringify({ content: "snapshot secret" });
+    const pendingAppend = appendLedgerEvent({
+      store, storage, logger: silent,
+      event: ev({ op: "superseded", content: "", snapshot_json: snap }),
+    });
+    await redactLedgerEvents({ store, storage, filter, logger: silent });
+    release();
+    await pendingAppend;
+
+    expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.snapshot_json).toBeUndefined();
+    expect(await rawOutbox()).not.toContain("snapshot secret");
+  });
+
   it("two concurrent redactions cannot leave a sealed shard un-swept", async () => {
     // Two overlapping filters share one shard; the second redaction's shard
     // snapshot can go stale behind the first seal — the global rewrite lock

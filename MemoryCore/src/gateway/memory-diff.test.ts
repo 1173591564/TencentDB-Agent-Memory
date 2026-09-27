@@ -586,6 +586,28 @@ describe("POST /memory/diff/revert", () => {
     expect(card).toMatchObject({ reverted: true });
   });
 
+  it("a reverted marker beyond the first event page still blocks the revert", async () => {
+    // 一条记录的事件史超过单页上限（1000）：record 级查询必须翻页取全，
+    // 否则最新事件（含 reverted 标记）被截掉，已撤销的写入会被再次撤销。
+    const iso = { team_id: "t1", user_id: "u1", agent_id: "a1" };
+    const targetId = `evt-${(999).toString(16).padStart(32, "0")}`;
+    for (let i = 0; i < 1000; i++) {
+      store.appendMemoryEvent({
+        event_ts: "2026-03-01T10:00:00.000Z", session_key: "sk", session_id: "ses-p",
+        ...iso, op: "created", record_id: "m_p", content: `v${i}`,
+        event_id: `evt-${i.toString(16).padStart(32, "0")}`,
+      });
+    }
+    store.appendMemoryEvent({
+      event_ts: "2026-03-01T10:00:01.000Z", session_key: "", session_id: "",
+      ...iso, op: "reverted", record_id: "m_p", content: "", reviewer_id: "u1",
+      source: "review", target_event_id: targetId,
+    });
+    const res = await call("/v3/memory/diff/revert", { record_id: "m_p" });
+    expect(res.status).toBe(409);
+    expect(res.message).toContain("already been reverted");
+  });
+
   it("a retry after a partial revert never deletes restore rows that were already live", async () => {
     await mergeTwo();
     // Attempt 1: m_c's restore fails and rollback can't remove m_b → partial

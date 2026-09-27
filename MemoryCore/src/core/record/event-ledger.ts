@@ -42,7 +42,7 @@ export interface LedgerHealth {
   store_failures: number;
   jsonl_failures: number;
   last_failure_at?: string;
-  /** Events that reached the outbox but not the store and have not been replayed yet. */
+  /** Events missing from the store: outbox-pending (replayable) plus unrecoverable failures with no outbox copy. */
   pending_store_events: number;
   /**
    * Clear/TTL redactions not fully landed: the store wipe and/or the outbox
@@ -824,10 +824,12 @@ export async function appendLedgerEvent(params: {
     // Late-marker convergence: a clear/TTL may have registered while our
     // insert was in flight, letting the row slip past its filter-update. The
     // outbox side is already sealed (per-writer shard lock), so a covered
-    // append reaching this point with plaintext means the store leg missed it
-    // — re-apply the covering markers' filter-update ourselves. Idempotent,
-    // and failures are tracked as pending store redactions.
-    if (storeErr === undefined && event.content !== "") {
+    // append reaching this point with plaintext (content or snapshot — a
+    // superseded/management-update event may carry snapshot_json with empty
+    // content) means the store leg missed it — re-apply the covering
+    // markers' filter-update ourselves. Idempotent, and failures are tracked
+    // as pending store redactions.
+    if (storeErr === undefined && (event.content !== "" || event.snapshot_json)) {
       for (const m of coveringRedactions(store, event)) {
         try {
           await store.redactMemoryEvents?.(m);
@@ -1056,9 +1058,11 @@ export async function replayLedgerEvents(params: {
   /**
    * Latest date of a shard we could not read. A marker lives in the shard of
    * its `marker_ts` and only covers events with `event_ts <= until <=
-   * marker_ts`, so an unreadable shard dated D may hide a marker for any
-   * event dated <= D: those events are held back (kept pending) instead of
-   * being replayed with possibly-cleared plaintext.
+   * marker_ts` (all current callers bind `until` to the wipe moment — no
+   * future-until markers exist; if one ever does, later-dated covered events
+   * would slip this guard), so an unreadable shard dated D may hide a marker
+   * for any event dated <= D: those events are held back (kept pending)
+   * instead of being replayed with possibly-cleared plaintext.
    */
   let unreadableUpTo: string | undefined;
   /** Parse one marker line; malformed markers are counted and ignored. */

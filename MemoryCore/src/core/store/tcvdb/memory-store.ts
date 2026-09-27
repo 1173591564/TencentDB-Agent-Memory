@@ -978,16 +978,22 @@ export class TcvdbMemoryStore implements IMemoryStore {
       }
       const filterExpr = joinFilter(conditions);
 
-      // Primary key lookup: use documentIds (fast, no full scan)
+      // Primary key lookup: use documentIds (fast, no full scan). TCVDB caps
+      // documentIds at 20 per query — callers (e.g. writeMemory with a merge
+      // decision naming >20 targets) pass arbitrarily long lists, so chunk
+      // here rather than pushing the limit into every caller.
       if (filter?.recordIds && filter.recordIds.length > 0) {
-        const queryParams: Record<string, unknown> = {
-          retrieveVector: false,
-          documentIds: filter.recordIds,
-          outputFields: L1_OUTPUT_FIELDS,
-        };
-        if (filterExpr) queryParams.filter = filterExpr;
-        const resp = await this.client.query(this.l1Collection, queryParams);
-        const docs = resp.documents ?? [];
+        const docs: Array<Record<string, unknown>> = [];
+        for (let i = 0; i < filter.recordIds.length; i += 20) {
+          const queryParams: Record<string, unknown> = {
+            retrieveVector: false,
+            documentIds: filter.recordIds.slice(i, i + 20),
+            outputFields: L1_OUTPUT_FIELDS,
+          };
+          if (filterExpr) queryParams.filter = filterExpr;
+          const resp = await this.client.query(this.l1Collection, queryParams);
+          docs.push(...(resp.documents ?? []));
+        }
         return docs.map((doc: Record<string, unknown>) => ({
           record_id: String(doc.id ?? ""),
           content: String(doc.text ?? ""),
@@ -2667,8 +2673,10 @@ export class TcvdbMemoryStore implements IMemoryStore {
     // 幂等语义必须与 sqlite（ON CONFLICT DO NOTHING）/ mongo（11000 = 已写入）
     // 一致：先写为准。TCVDB 只有 upsert（整行替换），因此先按主键探测，已存在
     // 即 no-op——否则一次重放（截断扫描、看不到别节点 marker 的本地存储部署等）
-    // 会用明文整行覆盖已被 clear/TTL 擦成骨架的行。探测与写入之间的竞态只可能
-    // 发生在同一 event_id 的两次并发写之间，二者内容相同（或后者是骨架），无害。
+    // 会用明文整行覆盖已被 clear/TTL 擦成骨架的行。探测与写入之间的竞态有两类：
+    // 同一 event_id 的并发写（内容相同或后者为骨架，无害），以及并发 store 擦除
+    // 在探测缺席后插入（wipe 扫不到尚不存在的行）——后者由 appendLedgerEvent
+    // 落库后的晚到标记复查兜底（本进程内）。
     // Defense-in-depth (same as sqlite/mongo): non-canonical event_ts must
     // never reach a lexical compare.
     const eventTs = canonIsoTs(event.event_ts);

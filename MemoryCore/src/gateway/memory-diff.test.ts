@@ -586,6 +586,38 @@ describe("POST /memory/diff/revert", () => {
     expect(card).toMatchObject({ reverted: true });
   });
 
+  it("a reverted marker written under another task still gates the revert", async () => {
+    // 守卫读事件账按 (team,user,agent) 收敛、不按 task：同一记录的写入/标记
+    // 可能挂在不同 task_id 下（跨 task dedup / 管理面编辑）。按 task 过滤会让
+    // 撤销标记对守卫隐身——标记必须跨 task 可见。
+    const [write] = store.queryMemoryEvents({ record_id: "m_b", op: "updated" });
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-y",
+      team_id: "t1", user_id: "u1", agent_id: "a1", task_id: "task-a",
+      op: "reverted", record_id: "m_b", content: "", reviewer_id: "u1",
+      source: "review", target_event_id: write.event_id,
+    });
+    const res = await call("/v3/memory/diff/revert", { record_id: "m_b" }, { ...ISO_HEADERS, "x-tdai-task-id": "task-b" });
+    expect(res.status).toBe(409);
+    expect(res.message).toContain("already been reverted");
+  });
+
+  it("a supersession chain deeper than the hop limit fails closed instead of silently passing", async () => {
+    // m_b → m_c1 → … → m_c6：超过链守卫的 5 跳上限时，最深后代是否存活
+    // 无法确认——与其它守卫一样 fail closed，不能当作"无存活后代"放行。
+    const iso = { team_id: "t1", user_id: "u1", agent_id: "a1" };
+    const recs = ["m_b", "m_c1", "m_c2", "m_c3", "m_c4", "m_c5"];
+    recs.forEach((rec, i) => {
+      store.appendMemoryEvent({
+        event_ts: `2026-03-01T10:00:0${i}.000Z`, session_key: "sk-x", session_id: "ses-y",
+        ...iso, op: "superseded", record_id: rec, superseded_by: `m_c${i + 1}`, content: "",
+      });
+    });
+    const res = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(res.status).toBe(503);
+    expect(res.message).toContain("deeper than 5 hops");
+  });
+
   it("a reverted marker beyond the first event page still blocks the revert", async () => {
     // 一条记录的事件史超过单页上限（1000）：record 级查询必须翻页取全，
     // 否则最新事件（含 reverted 标记）被截掉，已撤销的写入会被再次撤销。

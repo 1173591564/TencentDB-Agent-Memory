@@ -1782,8 +1782,8 @@ interface RevertOptions {
   reviewerId?: string;
 }
 
-/** 撤销失败且回滚未确认干净：仍存活（或可能仍存活）的恢复行，含尝试前已存活的；verified=false 表示读不到行状态。 */
-type RevertPartial = { restored: string[]; verified: boolean };
+/** 撤销失败且回滚未确认干净：仍存活（或可能仍存活）的恢复行，含尝试前已存活的；verified=false 表示读不到行状态；missing 为无快照而放弃的恢复目标。 */
+type RevertPartial = { restored: string[]; verified: boolean; missing?: string[] };
 
 type RevertOutcome =
   | { ok: true; record_id: string; restored: string[]; missing?: string[]; target_event_id?: string; ledger_pending?: boolean; tombstone_pending?: boolean }
@@ -1919,8 +1919,12 @@ async function planRevert(
   store: RevertStore,
   iso: V2RouterDeps["requestIsolation"],
 ): Promise<RevertPlan> {
+  // 守卫读的是事件账：历史完整性优先于 task 维度的收敛——同一记录的
+  // 写入/标记可能挂在不同 task_id 下（跨 task 的 dedup 合并、管理面编辑），
+  // 按 task 过滤会让 deleted/reverted 标记对守卫隐身。行级读写仍带完整
+  // 租户四元组（rowFilter/deleteFilter）：看不见的行本来就不可撤销。
   const isoScope = iso
-    ? { team_id: iso.teamId, user_id: iso.userId, agent_id: iso.agentId, task_id: iso.taskId }
+    ? { team_id: iso.teamId, user_id: iso.userId, agent_id: iso.agentId }
     : {};
   const rowFilter = iso ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId } : {};
   const fail = (status: number, error: string): RevertPlan => ({ ok: false, status, error });
@@ -2008,11 +2012,12 @@ async function planRevert(
 
   // 人工编辑守卫：提取写入之后被管理面编辑过 → 默认拒绝，force 显式丢弃人工编辑。
   if (later.length > 0 && !opts.force) {
-    return fail(409, `Record ${recordId} was manually edited after extraction (event ${later.map((e) => e.event_id).join(", ")}) — revert the manual edit first (event_id), or pass force:true to discard it`);
+    return fail(409, `Record ${recordId} has newer writes after the target (event ${later.map((e) => e.event_id).join(", ")}) — revert those first (event_id), or pass force:true to discard them`);
   }
 
   // 链守卫：沿 superseded_by 向下走，任一后代仍有存活行 → 驳回本记录会让
-  // 祖先与存活者共存 → 409。上限 5 跳防环。
+  // 祖先与存活者共存 → 409。上限 5 跳防环；到顶还没走完说明链比上限深，
+  // 无法确认最深后代是否存活——与其它守卫一样 fail closed，不放行。
   const frontier = [...new Set(events.filter((e) => e.op === "superseded" && e.superseded_by).map((e) => e.superseded_by!))];
   const visited = new Set<string>([recordId]);
   for (let hop = 0; hop < 5 && frontier.length > 0; hop++) {
@@ -2028,6 +2033,9 @@ async function planRevert(
         if (e.op === "superseded" && e.superseded_by && !visited.has(e.superseded_by)) frontier.push(e.superseded_by);
       }
     }
+  }
+  if (frontier.length > 0) {
+    return fail(503, `Supersession chain of ${recordId} is deeper than 5 hops — cannot verify the deepest descendant is gone; revert refused`);
   }
 
   // 分叉守卫：待恢复的旧记录若还被其它存活记录替代（并发 session 各自
@@ -2144,9 +2152,10 @@ async function revertOneL1RecordInner(
     const failRolledBack = async (ids: string[], cause: string): Promise<RevertOutcome> => {
       const survivors = await rollbackRestores(store, ids.filter((id) => !preExisting.has(id)), deleteFilter, deps.logger);
       const stillLive = survivors === undefined ? undefined : [...survivors, ...ids.filter((id) => preExisting.has(id))];
+      const partial = { restored: stillLive ?? ids, verified: survivors !== undefined, ...(missingIds.length > 0 ? { missing: missingIds } : {}) };
       return stillLive?.length === 0
         ? fail(500, `Revert of ${recordId} ${cause}; rolled back — nothing was changed, retry is allowed`)
-        : fail(500, `Revert of ${recordId} ${cause}; rollback incomplete — retry to finish the revert`, { restored: stillLive ?? ids, verified: survivors !== undefined });
+        : fail(500, `Revert of ${recordId} ${cause}; rollback incomplete — retry to finish the revert`, partial);
     };
     for (const { targetId, snap } of restores) {
       if (!snap?.snapshot_json) {
@@ -2177,7 +2186,7 @@ async function revertOneL1RecordInner(
       // 此时按成功继续记账；读不到行状态则不回滚，如实报告。
       const newLive = await liveRecordIds(store, [recordId], deleteFilter ?? {}).then((ids) => ids.length > 0, () => undefined);
       if (newLive === undefined) {
-        return fail(500, `Revert of ${recordId} failed to delete it (${deleteError}) and its state could not be verified — retry to finish the revert`, { restored: restoredIds, verified: false });
+        return fail(500, `Revert of ${recordId} failed to delete it (${deleteError}) and its state could not be verified — retry to finish the revert`, { restored: restoredIds, verified: false, ...(missingIds.length > 0 ? { missing: missingIds } : {}) });
       }
       if (newLive) return failRolledBack(restoredIds, `failed to delete ${recordId} (${deleteError})`);
     }
@@ -2268,7 +2277,7 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
   }
 
   const results = [] as Array<
-    | { record_id: string; reverted: true; restored: string[]; missing?: string[]; ledger_pending?: boolean; tombstone_pending?: boolean }
+    | { record_id: string; reverted: true; restored: string[]; missing?: string[]; target_event_id?: string; ledger_pending?: boolean; tombstone_pending?: boolean }
     | { record_id: string; reverted: false; status: number; error: string; partial?: RevertPartial }
   >;
   for (const id of recordIds) {
@@ -2278,6 +2287,7 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
         ? {
           record_id: id, reverted: true, restored: outcome.restored,
           ...(outcome.missing ? { missing: outcome.missing } : {}),
+          ...(outcome.target_event_id ? { target_event_id: outcome.target_event_id } : {}),
           ...(outcome.ledger_pending ? { ledger_pending: true } : {}),
           ...(outcome.tombstone_pending ? { tombstone_pending: true } : {}),
         }

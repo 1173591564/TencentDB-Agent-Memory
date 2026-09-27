@@ -3816,7 +3816,7 @@ export class VectorStore implements IMemoryStore {
       ORDER BY event_ts ${filter.order === "desc" ? "DESC" : "ASC"}, seq ${filter.order === "desc" ? "DESC" : "ASC"}
       LIMIT ? OFFSET ?
     `;
-    const stmt = this.db.prepare(sql);
+    const stmt = this.ledgerStmt(sql);
     const rows = stmt.all(...args, limit, offset) as Array<{
       event_ts: string;
       session_key: string;

@@ -1850,9 +1850,10 @@ async function liveRecordIds(
 }
 
 /**
- * 撤销失败时回滚本次恢复的旧记录——它们不能与仍存活的新记录共存（链/分叉
- * 守卫保证撤销前它们都不存在，删掉即回到原状）。返回回滚后仍存活的 id，
- * 读不到行状态时返回 undefined。只兜后端报错，兜不住进程在中途崩溃。
+ * 撤销失败时删除指定的恢复行。调用方只传本次尝试写入的行——先前部分撤销
+ * 已恢复（本次开始前就存活）的行不在其列，否则重试会删掉自己没写的数据。
+ * 返回回滚后仍存活的 id，读不到行状态时返回 undefined。
+ * 只兜后端报错，兜不住进程在中途崩溃。
  */
 async function rollbackRestores(
   store: RevertStore,
@@ -2095,12 +2096,24 @@ async function revertOneL1RecordInner(
     // filter 只用 team/user/agent/task 做租户隔离——revert 按 record_id 定位，
     // 目标可能属于别的 session（跨 session supersede 是正常场景）。
     const deleteFilter = iso ? { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId } : undefined;
-    // 回滚后按实际行状态作答：确认干净才能说"什么都没改"。
+    // 回滚只删"本次尝试从 absent→live"的行：上次部分撤销留下的已存活恢复行
+    // 不是本次写入的，删了会让重试比不改更糟。在任何变更前快照存活集；读不到
+    // 就中止——之后的回滚都依赖这个前提。
+    const preExisting = await liveRecordIds(store, restores.map((r) => r.targetId), deleteFilter ?? {}).then(
+      (ids) => new Set(ids),
+      () => undefined,
+    );
+    if (preExisting === undefined) {
+      return fail(503, `Revert of ${recordId} aborted: restore-target row state unreadable — nothing was changed, retry later`);
+    }
+    // 回滚后按实际行状态作答：本次新增的行都不在了才能说"什么都没改"；
+    // 尝试前已存活的恢复行保持原状，只计入仍存活清单。
     const failRolledBack = async (ids: string[], cause: string): Promise<RevertOutcome> => {
-      const live = await rollbackRestores(store, ids, deleteFilter, deps.logger);
-      return live?.length === 0
+      const survivors = await rollbackRestores(store, ids.filter((id) => !preExisting.has(id)), deleteFilter, deps.logger);
+      const stillLive = survivors === undefined ? undefined : [...survivors, ...ids.filter((id) => preExisting.has(id))];
+      return stillLive?.length === 0
         ? fail(500, `Revert of ${recordId} ${cause}; rolled back — nothing was changed, retry is allowed`)
-        : fail(500, `Revert of ${recordId} ${cause}; rollback incomplete — retry to finish the revert`, { restored: live ?? ids, verified: live !== undefined });
+        : fail(500, `Revert of ${recordId} ${cause}; rollback incomplete — retry to finish the revert`, { restored: stillLive ?? ids, verified: survivors !== undefined });
     };
     for (const { targetId, snap } of restores) {
       if (!snap?.snapshot_json) {

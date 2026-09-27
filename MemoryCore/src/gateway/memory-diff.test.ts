@@ -570,6 +570,39 @@ describe("POST /memory/diff/revert", () => {
     expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
   });
 
+  it("a retry after a partial revert never deletes restore rows that were already live", async () => {
+    await mergeTwo();
+    // Attempt 1: m_c's restore fails and rollback can't remove m_b → partial
+    // state m_b+m_m left live (same injection as the previous test).
+    const { real: real1, restore: restore1 } = withStore({
+      upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_c" ? false : real1.upsertL1(...a)),
+      deleteL1: (...a: Parameters<VectorStore["deleteL1"]>) => {
+        if (a[0] === "m_b") throw new Error("vdb down");
+        return real1.deleteL1(...a);
+      },
+    });
+    const r1 = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    restore1();
+    expect(r1.status).toBe(500);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_m"]);
+
+    // Attempt 2: m_b is already live from attempt 1. Its upsert now fails — a
+    // rollback that treated it as this attempt's write would delete a row that
+    // predates the attempt, then report "nothing was changed".
+    const { real: real2, restore: restore2 } = withStore({
+      upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_b" ? false : real2.upsertL1(...a)),
+    });
+    const r2 = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    restore2();
+    expect(r2.status).toBe(500);
+    expect(r2.data).toMatchObject({ partial: { restored: ["m_b"], verified: true } });
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_m"]);
+
+    const retry = await call("/v3/memory/diff/revert", { record_id: "m_m" });
+    expect(retry.status).toBe(200);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
+  });
+
   it("a failed delete of the new record rolls back the restores it would have left alive beside it", async () => {
     await mergeTwo();
     const { real, restore } = withStore({

@@ -9,8 +9,9 @@
  * - Time fields stored as uint64 epoch ms (ISO ↔ epoch conversion internal)
  *
  * All methods are fault-tolerant: return empty/false on error, never throw —
- * except appendMemoryEvent, which rethrows after logging so the ledger writer
- * can count the failure and leave the event for outbox backfill.
+ * except init and the ledger verbs (appendMemoryEvent, queryMemoryEvents,
+ * redactMemoryEvents) plus strict queryL1Records, which rethrow so ledger
+ * review/revert callers fail closed instead of reading a failure as "no rows".
  */
 
 import type { MemoryRecord } from "../../record/l1-writer.js";

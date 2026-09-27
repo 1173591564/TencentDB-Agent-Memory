@@ -270,8 +270,9 @@ curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \
 - 回放只使用扫描范围内（`since` 之后分片里）的标记；早于 `since` 的标记不参与回放，其覆盖的事件在原 store 中已擦除，
   但若用于重建新 store，需让 `since` 覆盖相应标记所在分片。
 - 封存分片与原分片短暂并存时（崩溃于 rename 与删除之间）可能留下含明文的原分片；它仍属本 writer，下次 backfill 会改写。
-- 擦除改写只扫日期 ≤ `until` 的分片：极端情况下一条迟到的带旧 `event_ts` 的事件若落进更晚日期的
-  分片，那行明文不会被本次改写扫到（标记仍保证其不会进 store）。
+- 擦除改写只扫日期 ≤ `until` 的分片（分片按 `event_ts` 日期命名）：一条带旧 `event_ts` 的事件若在
+  该日期分片已被改写之后才追加进来，会落进该日期**新重建的 live 分片**，本次改写已经扫过它——那行
+  明文残留到下次 backfill/改写为止（标记仍保证其不会进 store）。
 - `resetLedgerHealth` / `status {"reset":true}` 只清失败计数，不清 pending 擦除——后者是未完成的
   工作，丢弃它会让失败的 store 擦除永远不重试而账本却报健康。
 - 已知标记集是进程内状态：按 scope 去重、按 1 小时视界过期清理（见上）；另一进程的 in-flight 明文追加收敛于该进程的下次 backfill，

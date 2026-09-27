@@ -900,13 +900,14 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_audit_record    ON memory_audit(record_id, updated_at_ms)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_audit_isolation ON memory_audit(team_id, agent_id, user_id, task_id)");
 
-    // ── Memory Events（session 变更集）──
-    //   - 只由 writeMemory 的 dedup 落地路径追加（created/updated/merged/superseded）
+    // ── Memory Events（统一变更账）──
+    //   - 追加面：extraction dedup 落地（created/updated/merged/superseded）、
+    //     管理面镜像（api_mutation）、review revert、TTL/clear（deleted）、
+    //     outbox 回放补写
     //   - superseded 事件的 content 是旧记录快照；session_id 记执行淘汰的 session，
     //     origin_session_id 保留旧记录原归属
-    //   - 不取代 memory_audit：audit 管显式 mutation API，本表管自动提取写入
-    //   - 统一变更账扩展：op 增加 deleted（管理面显式删除），新增 layer/source/
-    //     request_id 列区分变更来源与所属层（api_mutation 双写，见 v2-router）
+    //   - 不取代 memory_audit：audit 是显式 mutation API 的审计日志，本表是变更事实账
+    //   - layer/source/request_id 列区分变更来源与所属层（api_mutation 双写，见 v2-router）
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS memory_events (
         seq                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3727,7 +3728,7 @@ export class VectorStore implements IMemoryStore {
   }
 
   // ─────────────────────────────────────────────────────────
-  // Memory Events (session 变更集)
+  // Memory Events (统一变更账)
   // ─────────────────────────────────────────────────────────
 
   appendMemoryEvent(event: MemoryEvent): void {

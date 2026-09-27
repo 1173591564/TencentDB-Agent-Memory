@@ -485,6 +485,8 @@ export function getLedgerHealth(
  * Unrecoverable gaps gate only their own record — one bad append must not
  * freeze every revert of the tenant — unless the per-record tracking
  * overflowed, in which case the whole tenant is gated (fail-closed).
+ * Process-local: sees only failures this process recorded, and only until
+ * restart — see docs/change-ledger.md “进程内状态与已知限制”.
  */
 export function hasPendingLedgerEvent(store: LedgerStore | undefined, recordId: string, scope?: LedgerScope): boolean {
   for (const h of matchingTenants(store, healScope(scope))) {

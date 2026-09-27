@@ -476,7 +476,7 @@ describe("POST /memory/diff/revert", () => {
     expect(status).toBe(400);
   });
 
-  it("failed restore is retryable — delete of an already-deleted record must not deadlock", async () => {
+  it("a failed restore changes nothing and the retry completes the revert", async () => {
     // 第一次 revert：restore 阶段 upsertL1 全部失败 → 500 且不落 reverted 标记。
     const real = store;
     store = new Proxy(real, {
@@ -489,8 +489,8 @@ describe("POST /memory/diff/revert", () => {
     const first = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     store = real;
     expect(first.status).toBe(500);
-    // 重试：m_b 行已不在（上次已删）→ 跳过 delete 直接恢复 → 200。
-    // 若 deleteL1 的 false 被当成故障，这里会永久 500。
+    // 恢复在删除之前失败：m_b 仍在、回滚无可删 → 干净的 500；重试走同一条
+    // 幂等路径完成撤销（恢复 m_a、删 m_b、落标记）。
     const retry = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     expect(retry.status).toBe(200);
     expect(retry.data).toMatchObject({ record_id: "m_b", reverted: true, restored: ["m_a"] });
@@ -568,6 +568,22 @@ describe("POST /memory/diff/revert", () => {
     const retry = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     expect(retry.status).toBe(200);
     expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
+  });
+
+  it("a legacy reverted marker without target_event_id still blocks a second revert", async () => {
+    // 旧格式标记按 record_id 归属整条记录、不指向某次写入：diff 按 record_id
+    // 命中显示已撤销，幂等守卫也必须同样挡住重复撤销——两侧语义一致。
+    store.appendMemoryEvent({
+      event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-y",
+      team_id: "t1", user_id: "u1", agent_id: "a1",
+      op: "reverted", record_id: "m_b", content: "", reviewer_id: "u1", source: "review",
+    });
+    const res = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(res.status).toBe(409);
+    // diff 侧同样按 record_id 命中显示已撤销（原有兜底不变）。
+    const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
+    const card = (diff.data?.changes as Array<Record<string, unknown>>).find((c) => c.record_id === "m_b");
+    expect(card).toMatchObject({ reverted: true });
   });
 
   it("a retry after a partial revert never deletes restore rows that were already live", async () => {

@@ -1668,7 +1668,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     layer?: "l2" | "l3";
     origin_session_id?: string;
     origin_session_key?: string;
-    /** 该 change 已被 revert 撤销（reverted 事件 record_id 命中）。 */
+    /** 该 change 已被 revert 撤销（reverted 事件按 target_event_id 命中；旧标记按 record_id）。 */
     reverted?: boolean;
     /** 驳回者身份（reverted 事件的 reviewer_id）。 */
     reverted_by?: string;
@@ -1736,19 +1736,21 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
  * 定位方式：按 record_id 查该记录的写入事件（created/updated/merged），
  * 再找到它 supersede 掉的旧记录快照。
  *   - created        → deleteL1 删新记录
- *   - updated/merged → deleteL1 删新记录 + 逐条按 snapshot_json 重建旧记录
+ *   - updated/merged → 逐条按 snapshot_json 重建旧记录，再 deleteL1 删新记录
  *                      （embedding 尽力而为，缺省时只恢复 metadata+FTS）
+ *   - 人工编辑层     → 按 snapshot_json 回写同一条记录（无独立恢复行，也无可删行）
  * 幂等：同一 record_id 已存在 reverted 事件 → 409。
  * 撤销动作本身追加一条 reverted 事件（record_id=被撤销的新 record，
  * supersedes=本次恢复的旧 record_id 列表），保持事件流 append-only。
  * 恢复或删除失败时返回 500 且**不追加** reverted 事件（否则 409 会永久挡住
- * 重试），并回滚本次已恢复的旧记录：确认回滚干净 = 什么都没改；否则
- * data.partial 列出仍存活的恢复行（verified=false 表示读不到行状态）。
+ * 重试），并回滚本次写入的恢复行（只删本次 absent→live 的，先前部分撤销
+ * 留下的存活行保持原状）：确认回滚干净 = 什么都没改；否则 data.partial
+ * 列出仍存活的恢复行（verified=false 表示读不到行状态）。
  * delete/upsert 均幂等，重试即续完撤销。
  *
  * 批量：body 可传 record_ids[]（≤50）。逐条独立处理互不影响——单条失败
  * 不阻塞其他记录；批量响应恒为 200 + results[]，每项携带各自的
- * status/error（或 restored/missing）。单条 record_id 调用保持原响应形态。
+ * status/error（或 restored/missing/partial）。单条 record_id 调用保持原响应形态。
  */
 
 interface RevertStore {
@@ -1780,7 +1782,7 @@ interface RevertOptions {
   reviewerId?: string;
 }
 
-/** 撤销失败且回滚未确认干净：本次恢复、仍（或可能仍）存活的旧记录；verified=false 表示读不到行状态。 */
+/** 撤销失败且回滚未确认干净：仍存活（或可能仍存活）的恢复行，含尝试前已存活的；verified=false 表示读不到行状态。 */
 type RevertPartial = { restored: string[]; verified: boolean };
 
 type RevertOutcome =
@@ -1901,8 +1903,13 @@ async function planRevert(
   const writes = events.filter((e) => WRITE_OPS.has(e.op));
   const reverts = events.filter((e) => e.op === "reverted");
   const revertedEventIds = new Set(reverts.map((e) => e.target_event_id).filter((id): id is string => !!id));
+  // 旧格式标记没有 target_event_id，撤销粒度是整条记录：把标记时刻之前的
+  // 写入都视为已撤销（与 diff 按 record_id 命中同一语义），否则旧标记会
+  // 让"已撤销 → 409"幂等守卫失效、又把未撤销的后续写入误算成冲突。
+  const legacyCutoff = reverts.filter((e) => !e.target_event_id).map((e) => e.event_ts).sort().pop();
   const isExtraction = (e: MemoryEvent) => e.source !== "api_mutation";
-  const isReverted = (e: MemoryEvent) => e.event_id !== undefined && revertedEventIds.has(e.event_id);
+  const isReverted = (e: MemoryEvent) =>
+    (e.event_id !== undefined && revertedEventIds.has(e.event_id)) || (legacyCutoff !== undefined && e.event_ts <= legacyCutoff);
 
   const target = opts.eventId
     ? writes.find((e) => e.event_id === opts.eventId)
@@ -2307,7 +2314,8 @@ async function handleMemoryHistory(body: unknown, _auth: V2AuthContext, requestI
  *
  * 实现说明：事件量在正常时间窗内有限（默认 limit 500），聚合在内存中完成；
  * limit 仅约束扫描的原始事件数，不保证每个 session 的完整计数——到达上限时
- * 响应里带 truncated:true 提示收窄时间窗。
+ * 响应里带 truncated:true 提示收窄时间窗；has_reverted 同样只反映扫描窗口
+ * 内的事件，更早窗口的驳回标记需收窄时间窗才能看到。
  */
 async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = memoryReviewInboxRequestSchema.safeParse(body);

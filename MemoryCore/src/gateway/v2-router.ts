@@ -2422,10 +2422,11 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
     // retention 事件无租户身份，写入时被归一到 "default"——只按隔离 id 过滤
     // 挡不住它进 default 租户的 inbox，按来源显式排除。
     if (e.source === "retention" || e.scope === "retention") continue;
-    if (e.event_id !== undefined) {
-      if (seen.has(e.event_id)) continue;
-      seen.add(e.event_id);
-    }
+    // 无 event_id 的历史行同样会双命中（主查按 user_id="default" 也能捞到
+    // 管理面行）——退化为与 diff 相同的合成键去重。
+    const dedupKey = e.event_id ?? `${e.op}\u0000${e.record_id}\u0000${e.superseded_by ?? ""}\u0000${e.event_ts}`;
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
     const sid = e.session_id || "(unknown)";
     let entry = bySession.get(sid);
     if (!entry) {

@@ -74,7 +74,7 @@ export interface MemoryRecord {
   createdAt: string;
   /** Last update timestamp (ISO) */
   updatedAt: string;
-  /** Monotonic version. New memories start at 1; update/merge increments by 1. */
+  /** Monotonic version. New memories start at 0; update/merge = max(target versions)+1. */
   version?: number;
   /** Source session key (conversation channel identifier) */
   sessionKey: string;

@@ -998,16 +998,25 @@ export class VectorStore implements IMemoryStore {
             until_ts           TEXT NOT NULL DEFAULT ''
           )
         `);
+        // Columns added after the CHECK rebuild (event_id/reason/target_event_id/
+        // scope/until_ts) may already exist on the old table when upgrading from
+        // an intermediate schema — copy them verbatim or their values are lost
+        // (event_id='' rows escape the partial unique index → replay duplicates).
+        const oldCols = new Set(
+          (this.db.prepare("PRAGMA table_info(memory_events)").all() as Array<{ name: string }>).map((c) => c.name),
+        );
+        const carriedCols = ["event_id", "reason", "target_event_id", "scope", "until_ts"].filter((c) => oldCols.has(c));
+        const carriedSql = carriedCols.length > 0 ? `, ${carriedCols.join(", ")}` : "";
         this.db.exec(`
           INSERT INTO memory_events_new
             (event_ts, session_key, session_id, origin_session_id, origin_session_key,
              team_id, user_id, agent_id, task_id,
              op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-             layer, source, request_id)
+             layer, source, request_id${carriedSql})
           SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
                  team_id, user_id, agent_id, task_id,
                  op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-                 'l1', CASE WHEN op = 'reverted' THEN 'review' ELSE 'extraction' END, ''
+                 'l1', CASE WHEN op = 'reverted' THEN 'review' ELSE 'extraction' END, ''${carriedSql}
           FROM memory_events ORDER BY seq
         `);
         this.db.exec("DROP TABLE memory_events");

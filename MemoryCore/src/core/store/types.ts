@@ -613,7 +613,8 @@ export interface AuditQueryFilter {
  *   - deleted    : 记录被显式删除（管理面 mutation API：atomic/delete、
  *                  chat-memory/clear 等）。content 为空（删除无新内容）。
  *
- * source 语义（变更来源；未填时按 op 推断：reverted → review，其余 → extraction）：
+ * source 语义（变更来源；写入方显式标记；无该列时代的旧行在迁移回填时
+ * 按 op 推断：reverted → review，其余 → extraction）：
  *   - extraction  : writeMemory 自动提取路径（dedup 决策）
  *   - api_mutation: 显式管理 API（atomic/*、scenario/*、core/write、chat-memory/clear）
  *   - review      : 审阅驳回（revert）
@@ -898,7 +899,7 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   appendAudit?(entry: AuditEntry): MaybePromise<void>;
   queryAudit?(filter: AuditQueryFilter): MaybePromise<AuditEntry[]>;
 
-  // ── Memory Events（session 变更集；optional，同上）─────────────
+  // ── Memory Events（统一变更账；optional，同上）─────────────
   appendMemoryEvent?(event: MemoryEvent): MaybePromise<void>;
   queryMemoryEvents?(filter: MemoryEventFilter): MaybePromise<MemoryEvent[]>;
   /**

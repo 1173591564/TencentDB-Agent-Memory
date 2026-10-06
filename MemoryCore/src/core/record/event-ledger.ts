@@ -962,7 +962,7 @@ async function retryPendingOutbox(
 }
 
 const MEMORY_EVENT_OPS: ReadonlySet<string> = new Set<MemoryEvent["op"]>(
-  ["created", "updated", "merged", "superseded", "reverted", "deleted"],
+  ["created", "updated", "merged", "superseded", "reverted", "deleted", "retracted", "restored"],
 );
 
 function isReplayableEvent(e: Partial<Record<keyof MemoryEvent, unknown>>): e is MemoryEvent {

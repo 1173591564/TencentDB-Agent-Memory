@@ -16,6 +16,7 @@
  */
 
 import type { MemoryRecord } from "../record/l1-writer.js";
+import type { ReviewStatus, VisibilityAware } from "./visibility.js";
 import type { EmbeddingProviderInfo } from "./embedding.js";
 import type { Logger } from "../types.js";
 import type { IsolationFilter } from "./isolation.js";
@@ -97,7 +98,7 @@ export interface L1FtsResult {
 }
 
 /** Filter options for querying L1 records. */
-export interface L1QueryFilter {
+export interface L1QueryFilter extends VisibilityAware {
   /** Query by document primary keys (maps to VDB `documentIds`, max 20). */
   recordIds?: string[];
   sessionKey?: string;
@@ -113,6 +114,8 @@ export interface L1QueryFilter {
 
 /** Row shape returned by L1 query methods. */
 export interface L1RecordRow {
+  /** 审核状态；后端映射须覆盖。历史行可缺省，所以类型本身不能防止漏映射，需契约测试。 */
+  review_status?: ReviewStatus;
   record_id: string;
   content: string;
   type: string;
@@ -367,7 +370,7 @@ export interface L0PaginatedResult {
 }
 
 /** Filter for v2 L1 paginated query (`/atomic/query`). */
-export interface L1CountFilter {
+export interface L1CountFilter extends VisibilityAware {
   /** Filter by memory type (episodic/persona/instruction). */
   type?: string;
   /** Filter by session. */
@@ -645,7 +648,7 @@ export interface MemoryEvent {
   agent_id?: string;
   task_id?: string;
   /** 变更类型。 */
-  op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted";
+  op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted" | "retracted" | "restored";
   /** 本事件对应的 record id（superseded 时为旧 record id）。 */
   record_id: string;
   /** 审阅者（reverted 事件 = 驳回操作的执行人，来自 v3 isolation 三元组）。 */
@@ -747,6 +750,18 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   deleteL1(recordId: string, filter?: IsolationFilter): MaybePromise<boolean>;
   deleteL1Batch(recordIds: string[], filter?: IsolationFilter): MaybePromise<boolean>;
   deleteL1Expired(cutoffIso: string): MaybePromise<number>;
+  /**
+   * 事后审核：设置一条 L1 的可见性状态（DP-01 retract/restore）。
+   *
+   * 可选能力 —— 未实现的后端由网关返回 501，沿用 appendMemoryEvent 的惯例。
+   * 返回 undefined = 记录不存在或不属于该租户；`changed:false` = 幂等空操作（DP-18）。
+   * 本方法只改状态列；账本由调用方另写，持久一致性门禁见 docs/change-ledger.md。
+   */
+  setL1ReviewStatus?(
+    recordId: string,
+    status: ReviewStatus,
+    filter?: IsolationFilter,
+  ): MaybePromise<{ changed: boolean; previous: ReviewStatus } | undefined>;
 
   // ── L1 Read ──────────────────────────────────────────────
 

@@ -10,7 +10,7 @@ import { VectorStore } from "../store/sqlite/memory-store.js";
 import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
-import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../store/types.js";
+import type { IMemoryStore, MemoryEvent } from "../store/types.js";
 import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, hasPendingLedgerEvent, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, registerLedgerState, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId, startLedgerOutboxRetention } from "./event-ledger.js";
 import { resolveLedgerOutboxRetentionDays } from "../../utils/env-config.js";
 import { LocalMemoryCleaner } from "../../utils/memory-cleaner.js";

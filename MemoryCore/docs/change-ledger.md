@@ -114,8 +114,9 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 - 该记录（或本次要恢复的记录）有事件仍在 pending（未进 store）时返回 503，补齐后再判断。
   **该判断基于进程内 pending 集合**，只在记下失败的那个进程、重启前有效，见“进程内状态与已知限制”。
 
-管理面 update 事件带修改前的 `snapshot_json`，可按 `event_id` 逐层回退。`reviewer_id` 只取
-`x-tdai-reviewer-id` 请求头（MemoryPanel 以 `panelMeta.userId` 填入），忽略 body。
+管理面 update 事件带修改前的 `snapshot_json`，可按 `event_id` 逐层回退。revert 的 `reviewer_id`
+优先取 `x-tdai-reviewer-id` 请求头（MemoryPanel 以 `panelMeta.userId` 填入），缺头仍回落记忆
+所有者 isolation userId，忽略 body；该回落不能证明操作者身份，见下方审核契约。
 
 `/memory/diff` 每张卡带 `event_id`（历史事件缺省）。同一 record 可有多次写入，单条撤销应回传它：
 Core 只撤该事件或显式拒绝，不会改撤同记录的其它写入；不传时缺省为该记录最后一次提取写入。
@@ -131,6 +132,61 @@ Core 只撤该事件或显式拒绝，不会改撤同记录的其它写入；不
 每项一致）：`ledger_pending: true` —— `reverted` 事件只进了 outbox 未落 store，待
 backfill 补齐；`tombstone_pending: true` —— JSONL 墓碑未写成，回放可能复活该记录，
 需要重试撤销或人工补写墓碑。
+
+## 事后审核：撤回 / 恢复 / 清单（retract / restore / list）
+
+**待验收，默认关闭；以下上线阻塞未解除。** revert 退一次写入，retract 改一条
+L1 的可见性，delete 删除行；隐藏不等于合规擦除。不要把三者合并成一个操作。
+
+`TDAI_MEMORY_REVIEW_ENABLED` 开启后，消费读默认只看 active；关闭后消费读恢复
+不过滤、审核写接口返回 403。显式审计口径始终有效，关闭开关也能查 quarantined。
+关闭开关会重新暴露已撤回内容，不是保留抑制状态的安全回滚。
+
+```text
+POST /v3/memory/review/retract
+{ "record_id": "m_x", "reason": "抽取错误" }
+POST /v3/memory/review/restore
+{ "record_id": "m_x" }
+POST /v3/memory/review/list
+{ "visibility": "quarantined", "limit": 50, "offset": 0 }
+```
+
+- v2/v3 三个审核接口均在默认值填充前强制显式 team/user/agent；不依赖全局严格隔离开关。
+  session 不收窄审核操作，task 传入时收窄读写；记录与事件的归属取记录自身。
+- retract 必须 reason，restore 理由可选；record_id/record_ids 可并用，去重后合计最多 50。
+- 写响应区分 `changed` / `no_op` / `not_found`；跨租户与不存在不区分。
+  后端错误返回 503；批量中途失败的 `data.partial` 保留已结算结果、另报 `failed_record_id`。
+  这不是跨记录事务，也不是未变更保证；网络超时后的提交状态仍需恢复协议处理。
+- list 默认 quarantined，支持 active/all，返回 total、has_more、next_offset、每条 review_status。
+  普通消费接口不接受 visibility 透传。导出游标刻意全量，不代表目标后端迁移已保留审核状态。
+- retract/restore 的 reviewer_id 只取 `x-tdai-reviewer-id`，缺头留空；响应 attribution 为
+  asserted/unattributed。asserted 是调用方声明，不是认证身份或独立审核员授权。
+  既有 revert 仍回落 isolation userId，这是待统一的审计缺口，不应称作可信操作者。
+- SQLite CHECK 迁移与新库共用一份 DDL、一次重建；保留 seq、分配高水位、原有字段、索引和触发器。
+  缺 source 时由 op 推导；未知列、索引重建错误或同名重建残骸导致事务回滚，不静默丢列或删残骸。
+  迁移失败当前仅告警，必须人工处置，不能把服务启动成功等同审核能力可用。
+
+### 上线阻塞（实现缺口）
+
+- **账本与状态不是可恢复的一致性协议**：当前先更新状态，随后读取记录、双写事件。
+  读取/写账前崩溃可能永久漏账，重试进 no_op 也不补账。backfill 只补事件，不投影状态；
+  不得宣称账本已经是状态唯一真相源。需先确定事务/CAS、操作身份、提交顺序和重启恢复契约。
+- **跨进程并发未闭合**：单次守卫读不能阻止随后发生的撤回、合并、restore、revert、clear。
+  写入守卫读失败现在会停止 update/merge，revert 存活判断显式看 all；但二者都不是分布式隔离。
+  快照恢复、直接 upsert、批量写与后端迁移仍需逐条证明不会重置隔离状态。
+- **Mongo 搜索缺索引**：普通查询已过滤，但 dynamic:false 的搜索索引没有 review_status。
+  新建与已存在索引都需升级；异步索引窗口不能仅靠 mustNot 作为抑制正确性的依据。
+- **TCVDB 读面未收口**：按 ID 查询与搜索后过滤已接入；全量查询、分页、getAllL1Texts 未过滤，
+  count 不过滤，分页也未传 visibility。quarantined 服务端条件缺 filter 索引；topK 后过滤无补偿。
+  审核更新只取部分字段且不取 vector，随后整文档 upsert；已有 client.update 能力需行级复核后采用。
+- **披露不是级联**：撤回不会改写 L2 场景块/L3 画像。downstream 只尝试列出当前文件，
+  不是血缘影响面；空值或扫描失败不是没有残留。反向索引、排除输入的重生成明确延后（A 类）。
+- **内容擦除与异常状态**：reason 可能含记忆正文，现有 clear/TTL 不擦 reason；当前未知
+  review_status 被归一为 active 是 fail-open 兼容策略。两者都需明确内容/异常数据契约并补验证。
+
+功能代码、schema 和测试保留在本 PR；Panel 操作闭环在配套 PR #1539，不在这里吞入整套 UI。
+抽取事件保留 best-effort 写入，不代表人类审核动作可沿用同一成功语义；以上阻塞不得用日志或
+进程内 pending 冒充持久解决方案，也不得因单测全绿而宣布可上线。
 
 ## clear / TTL 擦除
 

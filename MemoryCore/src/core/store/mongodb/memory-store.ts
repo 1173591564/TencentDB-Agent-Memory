@@ -18,6 +18,13 @@
  */
 
 import type { Collection, Db, Document } from "mongodb";
+import {
+  DEFAULT_REVIEW_STATUS,
+  normalizeReviewStatus,
+  resolveVisibilityScope,
+  visibilityMongoCondition,
+  type ReviewStatus,
+} from "../visibility.js";
 import type { MongoConfig } from "../../instance-config-provider.js";
 import type { MongoClientPool } from "./client-pool.js";
 import type { EmbeddingProviderInfo } from "../embedding.js";
@@ -332,9 +339,14 @@ export class MongoMemoryStore implements IMemoryStore {
     // upsert stays legal if the collection is ever sharded — on a sharded
     // collection an upsert without the full shard key fails with
     // ShardKeyNotFound. Harmless on non-sharded collections (extra equality).
-    await coll.replaceOne(
-      { _id: doc._id, team_id: doc.team_id, agent_id: doc.agent_id } as never,
-      doc as never,
+    // DP-14 后门（mongo 特有）：原本是 replaceOne —— 整文档替换会把 review_status
+    // 一起抹掉，于是任何一次合并更新都让被撤回的记忆复活。sqlite 靠 ON CONFLICT
+    // 的显式列清单天然躲过，mongo 必须显式处理：业务字段走 $set，
+    // 审核态只在**插入时**赋默认值。
+    const { _id: docId, ...rest } = doc as unknown as Record<string, unknown> & { _id: unknown };
+    await coll.updateOne(
+      { _id: docId, team_id: doc.team_id, agent_id: doc.agent_id } as never,
+      { $set: rest, $setOnInsert: { review_status: DEFAULT_REVIEW_STATUS } } as never,
       { upsert: true },
     );
     return true;
@@ -385,6 +397,8 @@ export class MongoMemoryStore implements IMemoryStore {
 
   private l1CountQuery(filter?: L1CountFilter): Record<string, unknown> {
     const q: Record<string, unknown> = {};
+    // 可见性先于 early-return：filter 为 undefined 时也必须抑制（fail-safe）。
+    Object.assign(q, visibilityMongoCondition(resolveVisibilityScope(filter)) ?? {});
     if (!filter) return q;
     if (filter.type !== undefined) q.type = filter.type;
     if (filter.sessionId !== undefined) q.session_id = filter.sessionId;
@@ -402,6 +416,7 @@ export class MongoMemoryStore implements IMemoryStore {
   async queryL1Records(filter?: L1QueryFilter): Promise<L1RecordRow[]> {
     const coll = await this.coll(COLLECTIONS.L1);
     const q: Record<string, unknown> = {};
+    Object.assign(q, visibilityMongoCondition(resolveVisibilityScope(filter)) ?? {});
     if (filter?.recordIds && filter.recordIds.length > 0) q._id = { $in: filter.recordIds };
     if (filter?.sessionKey !== undefined) q.session_key = filter.sessionKey;
     if (filter?.sessionId !== undefined) q.session_id = filter.sessionId;
@@ -416,7 +431,9 @@ export class MongoMemoryStore implements IMemoryStore {
 
   async getAllL1Texts(): Promise<Array<{ record_id: string; content: string; updated_time: string }>> {
     const coll = await this.coll(COLLECTIONS.L1);
-    const docs = await coll.find({}, { projection: { content: 1, updated_time: 1 } }).toArray();
+    // 返回形状没有状态字段 ⇒ 只能给 active（与 sqlite 同口径，DP-27）。
+    const q = visibilityMongoCondition(resolveVisibilityScope(undefined)) ?? {};
+    const docs = await coll.find(q as never, { projection: { content: 1, updated_time: 1 } }).toArray();
     return docs.map((d) => ({
       record_id: String((d as { _id: unknown })._id),
       content: String((d as { content?: string }).content ?? ""),
@@ -435,6 +452,29 @@ export class MongoMemoryStore implements IMemoryStore {
       .limit(filter.limit)
       .toArray();
     return { rows: docs.map((d) => docToL1RecordRow(d as unknown as L1Doc)), total };
+  }
+
+  /** 事后审核：改一条 L1 的可见性状态（DP-01）。幂等语义与 sqlite 一致。 */
+  async setL1ReviewStatus(
+    recordId: string,
+    status: ReviewStatus,
+    filter?: IsolationFilter,
+  ): Promise<{ changed: boolean; previous: ReviewStatus } | undefined> {
+    const coll = await this.coll(COLLECTIONS.L1);
+    const q: Record<string, unknown> = { _id: recordId };
+    // DP-09：审核是跨记录操作，租户必须显式核对。
+    if (filter?.teamId !== undefined) q.team_id = filter.teamId;
+    if (filter?.userId !== undefined) q.user_id = filter.userId;
+    if (filter?.agentId !== undefined) q.agent_id = filter.agentId;
+    if (filter?.sessionId !== undefined) q.session_id = filter.sessionId;
+    if (filter?.taskId !== undefined) q.task_id = filter.taskId;
+
+    const existing = await coll.findOne(q as never, { projection: { review_status: 1 } });
+    if (!existing) return undefined;
+    const previous = normalizeReviewStatus((existing as { review_status?: unknown }).review_status);
+    if (previous === status) return { changed: false, previous };
+    await coll.updateOne(q as never, { $set: { review_status: status } } as never);
+    return { changed: true, previous };
   }
 
   // ════════════════════════════════════════════════════════
@@ -664,6 +704,17 @@ export class MongoMemoryStore implements IMemoryStore {
       must: [{ text: { query: searchText, path: "tokens" } }],
     };
     if (filters.length > 0) compound.filter = filters;
+    // 可见性：$search 的 compound 不支持 $ne，用 mustNot 表达"不是 quarantined"。
+    // 缺字段的老文档自然落在 mustNot 之外，仍然可见（DP-12）。
+    const visScope = resolveVisibilityScope(filter);
+    if (visScope === "active") {
+      compound.mustNot = [{ text: { query: "quarantined", path: "review_status" } }];
+    } else if (visScope === "quarantined") {
+      compound.must = [
+        ...(compound.must as unknown[]),
+        { text: { query: "quarantined", path: "review_status" } },
+      ];
+    }
     const pipeline: Record<string, unknown>[] = [
       { $search: { index: MEMORY_SEARCH_INDEX, compound } },
       { $limit: Math.max(1, limit) },

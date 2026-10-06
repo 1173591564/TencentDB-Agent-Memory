@@ -1,3 +1,4 @@
+import type { VisibilityAware } from "./visibility.js";
 /**
  * Isolation Context — three-dimensional tenancy for L0/L1/Profile data.
  *
@@ -37,7 +38,7 @@ export interface IsolationContext {
  * narrow on this dimension". This matches the SQL convention of `WHERE x = ?`
  * being skipped when the parameter is absent.
  */
-export interface IsolationFilter {
+export interface IsolationFilter extends VisibilityAware {
   teamId?: string;
   userId?: string;
   agentId?: string;

@@ -31,10 +31,6 @@ import type {
   IMemoryStore,
   StoreCapabilities,
   L0Record,
-  L1SearchResult,
-  L1FtsResult,
-  L0SearchResult,
-  L0FtsResult,
   L0QueryRow,
   L1RecordRow,
   L1QueryFilter,
@@ -62,6 +58,16 @@ import type {
   MemoryEventRedactFilter,
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
+import type { ReviewStatus, VisibilityScope } from "../visibility.js";
+import {
+  normalizeReviewStatus,
+  resolveVisibilityScope,
+  visibilityNeedsFilter,
+  rowMatchesVisibility,
+  withVisibilityOverFetch,
+  recallTruncated,
+  recallTruncationWarning,
+} from "../visibility.js";
 import { SKILLS_DDL, SKILL_FTS_DDL } from "../../skill/skill-store-ddl.js";
 import { decodeMemoryEvent, parseSupersedesJson } from "../event-codec.js";
 import { canonEventBound, canonIsoTs, canonRecordInstants, healIsoId, isValidRedactFilter, newMemoryEventId } from "../memory-event-id.js";
@@ -178,6 +184,37 @@ function pushIsoCond(conds: string[], args: SQLInputValue[], col: string, v: str
   else { conds.push(`${col} = ?`); args.push(healed); }
 }
 
+/** memory_events 新表 DDL 主体（CHECK 重建迁移与建表共用同一份定义）。 */
+const MEMORY_EVENTS_DDL_BODY = `
+        seq                INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_ts           TEXT NOT NULL,
+        session_key        TEXT NOT NULL DEFAULT '',
+        session_id         TEXT NOT NULL DEFAULT '',
+        origin_session_id  TEXT NOT NULL DEFAULT '',
+        origin_session_key TEXT NOT NULL DEFAULT '',
+        team_id            TEXT NOT NULL DEFAULT '',
+        user_id            TEXT NOT NULL DEFAULT '',
+        agent_id           TEXT NOT NULL DEFAULT '',
+        task_id            TEXT NOT NULL DEFAULT '',
+        op                 TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted','deleted','retracted','restored')),
+        record_id          TEXT NOT NULL,
+        content            TEXT NOT NULL,
+        memory_type        TEXT NOT NULL DEFAULT '',
+        version            INTEGER NOT NULL DEFAULT 0,
+        supersedes         TEXT NOT NULL DEFAULT '[]',
+        superseded_by      TEXT NOT NULL DEFAULT '',
+        snapshot_json      TEXT NOT NULL DEFAULT '',
+        reviewer_id        TEXT NOT NULL DEFAULT '',
+        layer              TEXT NOT NULL DEFAULT 'l1',
+        source             TEXT NOT NULL DEFAULT '',
+        request_id         TEXT NOT NULL DEFAULT '',
+        event_id           TEXT NOT NULL DEFAULT '',
+        reason             TEXT NOT NULL DEFAULT '',
+        target_event_id    TEXT NOT NULL DEFAULT '',
+        scope              TEXT NOT NULL DEFAULT '',
+        until_ts           TEXT NOT NULL DEFAULT ''
+`;
+
 /**
  * Column list shared by all `l1_records` SELECT statements — the fixed
  * prepared-statement matrix and the dynamic record_id-IN path must project
@@ -186,7 +223,7 @@ function pushIsoCond(conds: string[], args: SQLInputValue[], col: string, v: str
 const L1_QUERY_COLS = `record_id, content, type, priority, scene_name, session_key, session_id,
   team_id, task_id, user_id, agent_id, version,
   timestamp_str, timestamp_start, timestamp_end,
-  created_time, updated_time, metadata_json`;
+  created_time, updated_time, metadata_json, review_status`;
 
 // ============================
 // FTS5 / keyword helpers
@@ -543,7 +580,10 @@ export class VectorStore implements IMemoryStore {
         timestamp_end TEXT DEFAULT '',
         created_time TEXT DEFAULT '',
         updated_time TEXT DEFAULT '',
-        metadata_json TEXT DEFAULT '{}'
+        metadata_json TEXT DEFAULT '{}',
+        -- 事后审核可见性（DP-02 物化列，账本 retracted/restored 为真相源）。
+        -- 默认 active：升级不得让历史记忆集体消失（DP-12）。
+        review_status TEXT NOT NULL DEFAULT 'active'
       )
     `);
 
@@ -554,6 +594,9 @@ export class VectorStore implements IMemoryStore {
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'default'"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN task_id TEXT DEFAULT ''"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN version INTEGER NOT NULL DEFAULT 0"); } catch { /* exists */ }
+    try { this.db.exec("ALTER TABLE l1_records ADD COLUMN review_status TEXT NOT NULL DEFAULT 'active'"); } catch { /* exists */ }
+    try { this.db.exec("UPDATE l1_records SET review_status = 'active' WHERE review_status IS NULL OR review_status = ''"); } catch { /* very old schema */ }
+    try { this.db.exec("CREATE INDEX IF NOT EXISTS idx_l1_review_status ON l1_records(review_status)"); } catch { /* best effort */ }
     this.db.prepare("UPDATE l1_records SET team_id = ? WHERE team_id = '' OR team_id IS NULL").run(DEFAULT_ISOLATION_ID);
     this.db.prepare("UPDATE l1_records SET user_id = ? WHERE user_id = '' OR user_id IS NULL").run(DEFAULT_ISOLATION_ID);
     this.db.prepare("UPDATE l1_records SET agent_id = ? WHERE agent_id = '' OR agent_id IS NULL").run(DEFAULT_ISOLATION_ID);
@@ -627,7 +670,7 @@ export class VectorStore implements IMemoryStore {
 
     this.stmtGetMeta = this.db.prepare(`
       SELECT content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id,
-             version, timestamp_str, timestamp_start, timestamp_end, metadata_json
+             version, timestamp_str, timestamp_start, timestamp_end, metadata_json, review_status
       FROM l1_records WHERE record_id = ?
     `);
 
@@ -908,37 +951,7 @@ export class VectorStore implements IMemoryStore {
     //     origin_session_id 保留旧记录原归属
     //   - 不取代 memory_audit：audit 是显式 mutation API 的审计日志，本表是变更事实账
     //   - layer/source/request_id 列区分变更来源与所属层（api_mutation 双写，见 v2-router）
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS memory_events (
-        seq                INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_ts           TEXT NOT NULL,
-        session_key        TEXT NOT NULL DEFAULT '',
-        session_id         TEXT NOT NULL DEFAULT '',
-        origin_session_id  TEXT NOT NULL DEFAULT '',
-        origin_session_key TEXT NOT NULL DEFAULT '',
-        team_id            TEXT NOT NULL DEFAULT '',
-        user_id            TEXT NOT NULL DEFAULT '',
-        agent_id           TEXT NOT NULL DEFAULT '',
-        task_id            TEXT NOT NULL DEFAULT '',
-        op                 TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted','deleted')),
-        record_id          TEXT NOT NULL,
-        content            TEXT NOT NULL,
-        memory_type        TEXT NOT NULL DEFAULT '',
-        version            INTEGER NOT NULL DEFAULT 0,
-        supersedes         TEXT NOT NULL DEFAULT '[]',
-        superseded_by      TEXT NOT NULL DEFAULT '',
-        snapshot_json      TEXT NOT NULL DEFAULT '',
-        reviewer_id        TEXT NOT NULL DEFAULT '',
-        layer              TEXT NOT NULL DEFAULT 'l1',
-        source             TEXT NOT NULL DEFAULT '',
-        request_id         TEXT NOT NULL DEFAULT '',
-        event_id           TEXT NOT NULL DEFAULT '',
-        reason             TEXT NOT NULL DEFAULT '',
-        target_event_id    TEXT NOT NULL DEFAULT '',
-        scope              TEXT NOT NULL DEFAULT '',
-        until_ts           TEXT NOT NULL DEFAULT ''
-      )
-    `);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS memory_events (${MEMORY_EVENTS_DDL_BODY})`);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_sessionkey ON memory_events(session_key, seq)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
@@ -950,92 +963,6 @@ export class VectorStore implements IMemoryStore {
     // pre-existing table was created with.
     try { this.db.exec("ALTER TABLE memory_events ADD COLUMN reviewer_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
     try { this.db.exec("ALTER TABLE memory_events ADD COLUMN snapshot_json TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
-    // Unified change ledger migration: pre-existing tables carry an op CHECK
-    // without 'deleted', and SQLite cannot ALTER a CHECK constraint — rebuild
-    // via create-copy-drop-rename. Detection reads sqlite_master.sql; legacy
-    // rows get layer='l1' and source inferred from op (reverted → review).
-    // The rebuild runs in a transaction: a crash between DROP and RENAME would
-    // otherwise orphan all events in memory_events_new while the next init's
-    // CREATE IF NOT EXISTS produces a fresh empty table that already contains
-    // 'deleted' — skipping detection and silently losing the data.
-    try {
-      const evTable = this.db.prepare(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_events'",
-      ).get() as { sql?: string } | undefined;
-      if (evTable?.sql && !evTable.sql.includes("'deleted'")) {
-        this.db.exec("BEGIN");
-        try {
-          // Debris from a previously failed migration must not block retry.
-          this.db.exec("DROP TABLE IF EXISTS memory_events_new");
-          this.db.exec(`
-          CREATE TABLE memory_events_new (
-            seq                INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_ts           TEXT NOT NULL,
-            session_key        TEXT NOT NULL DEFAULT '',
-            session_id         TEXT NOT NULL DEFAULT '',
-            origin_session_id  TEXT NOT NULL DEFAULT '',
-            origin_session_key TEXT NOT NULL DEFAULT '',
-            team_id            TEXT NOT NULL DEFAULT '',
-            user_id            TEXT NOT NULL DEFAULT '',
-            agent_id           TEXT NOT NULL DEFAULT '',
-            task_id            TEXT NOT NULL DEFAULT '',
-            op                 TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted','deleted')),
-            record_id          TEXT NOT NULL,
-            content            TEXT NOT NULL,
-            memory_type        TEXT NOT NULL DEFAULT '',
-            version            INTEGER NOT NULL DEFAULT 0,
-            supersedes         TEXT NOT NULL DEFAULT '[]',
-            superseded_by      TEXT NOT NULL DEFAULT '',
-            snapshot_json      TEXT NOT NULL DEFAULT '',
-            reviewer_id        TEXT NOT NULL DEFAULT '',
-            layer              TEXT NOT NULL DEFAULT 'l1',
-            source             TEXT NOT NULL DEFAULT '',
-            request_id         TEXT NOT NULL DEFAULT '',
-            event_id           TEXT NOT NULL DEFAULT '',
-            reason             TEXT NOT NULL DEFAULT '',
-            target_event_id    TEXT NOT NULL DEFAULT '',
-            scope              TEXT NOT NULL DEFAULT '',
-            until_ts           TEXT NOT NULL DEFAULT ''
-          )
-        `);
-        // Columns added after the CHECK rebuild (event_id/reason/target_event_id/
-        // scope/until_ts) may already exist on the old table when upgrading from
-        // an intermediate schema — copy them verbatim or their values are lost
-        // (event_id='' rows escape the partial unique index → replay duplicates).
-        const oldCols = new Set(
-          (this.db.prepare("PRAGMA table_info(memory_events)").all() as Array<{ name: string }>).map((c) => c.name),
-        );
-        const carriedCols = ["event_id", "reason", "target_event_id", "scope", "until_ts"].filter((c) => oldCols.has(c));
-        const carriedSql = carriedCols.length > 0 ? `, ${carriedCols.join(", ")}` : "";
-        this.db.exec(`
-          INSERT INTO memory_events_new
-            (event_ts, session_key, session_id, origin_session_id, origin_session_key,
-             team_id, user_id, agent_id, task_id,
-             op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-             layer, source, request_id${carriedSql})
-          SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
-                 team_id, user_id, agent_id, task_id,
-                 op, record_id, content, memory_type, version, supersedes, superseded_by, snapshot_json, reviewer_id,
-                 'l1', CASE WHEN op = 'reverted' THEN 'review' ELSE 'extraction' END, ''${carriedSql}
-          FROM memory_events ORDER BY seq
-        `);
-        this.db.exec("DROP TABLE memory_events");
-        this.db.exec("ALTER TABLE memory_events_new RENAME TO memory_events");
-        // Old indexes died with the DROP; recreate them on the rebuilt table.
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_session ON memory_events(session_id, seq)");
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_sessionkey ON memory_events(session_key, seq)");
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_session_id)");
-        this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
-          this.db.exec("COMMIT");
-        } catch (migErr) {
-          try { this.db.exec("ROLLBACK"); } catch { /* already rolled back */ }
-          throw migErr;
-        }
-      }
-    } catch (err) {
-      this.logger?.warn?.(`[memory-tdai][sqlite] memory_events CHECK migration failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
     // event_id: stable per-event identity; the partial unique index makes
     // re-appending the same event (outbox replay) a no-op while legacy rows
     // (event_id='') stay unconstrained.
@@ -1045,6 +972,41 @@ export class VectorStore implements IMemoryStore {
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_ts ON memory_events(event_ts, seq)");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_event_id ON memory_events(event_id) WHERE event_id != ''");
+
+    try {
+      const evT = this.db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_events'",
+      ).get() as { sql?: string } | undefined;
+      if (evT?.sql && (!evT.sql.includes("'deleted'") || !evT.sql.includes("'retracted'") || !evT.sql.includes("'restored'"))) {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          const oldCols = (this.db.prepare("PRAGMA table_info(memory_events)").all() as Array<{ name: string }>).map((c) => c.name);
+          const schemaSql = (this.db.prepare(
+            "SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger') AND tbl_name='memory_events' AND sql IS NOT NULL",
+          ).all() as Array<{ sql: string }>).map((r) => r.sql);
+          const sequence = (this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'memory_events'").get() as { seq: number } | undefined)?.seq ?? 0;
+          this.db.exec(`CREATE TABLE memory_events_oprebuild (${MEMORY_EVENTS_DDL_BODY})`);
+          const newCols = (this.db.prepare("PRAGMA table_info(memory_events_oprebuild)").all() as Array<{ name: string }>).map((c) => c.name);
+          if (oldCols.some((name) => !newCols.includes(name))) throw new Error("memory_events has unknown columns; migration requires explicit schema reconciliation");
+          const copiedCols = newCols.filter((name) => oldCols.includes(name) || name === "source");
+          const quotedCols = copiedCols.map((name) => `"${name}"`).join(", ");
+          const selectCols = copiedCols.map((name) => oldCols.includes(name) ? `"${name}"` : "CASE WHEN op = 'reverted' THEN 'review' ELSE 'extraction' END").join(", ");
+          this.db.exec(`INSERT INTO memory_events_oprebuild (${quotedCols}) SELECT ${selectCols} FROM memory_events ORDER BY seq`);
+          this.db.exec("DROP TABLE memory_events");
+          this.db.exec("ALTER TABLE memory_events_oprebuild RENAME TO memory_events");
+          const sequenceUpdate = this.db.prepare("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'memory_events'").run(sequence);
+          if (sequenceUpdate.changes === 0) this.db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('memory_events', ?)").run(sequence);
+          for (const sql of schemaSql) this.db.exec(sql);
+          this.db.exec("COMMIT");
+          this.logger?.info?.(`[memory-tdai][sqlite] memory_events op CHECK 已重建（+deleted/retracted/restored），拷贝列: ${copiedCols.length}`);
+        } catch (migErr) {
+          this.db.exec("ROLLBACK");
+          throw migErr;
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(`[memory-tdai][sqlite] memory_events op CHECK (retracted) migration failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     // One-shot legacy normalization (below): each pass is a full scan of
     // memory_events / l1_records / l0_conversations, so it must not run on
@@ -1629,7 +1591,10 @@ export class VectorStore implements IMemoryStore {
       // NOTE: "AND distance IS NOT NULL" is NOT usable because vec0 does not
       // support that constraint — it causes an empty result set.
       const ZERO_VEC_BUFFER = 10;
-      const retrieveCount = filter ? Math.max(topK * 5, topK + ZERO_VEC_BUFFER) : topK + ZERO_VEC_BUFFER;
+      const baseRetrieveCount = filter ? Math.max(topK * 5, topK + ZERO_VEC_BUFFER) : topK + ZERO_VEC_BUFFER;
+      // DP-04：被撤回的记忆占用超取窗口名额，不补偿就会静默降低召回。
+      const visScope = resolveVisibilityScope(filter);
+      const retrieveCount = withVisibilityOverFetch(baseRetrieveCount, visScope);
 
       this.logger?.debug?.(
         `${TAG} [L1-search] START topK=${topK}, retrieveCount=${retrieveCount}, ` +
@@ -1675,6 +1640,7 @@ export class VectorStore implements IMemoryStore {
               timestamp_start: string;
               timestamp_end: string;
               metadata_json: string;
+              review_status?: string;
             }
           | undefined;
 
@@ -1683,6 +1649,10 @@ export class VectorStore implements IMemoryStore {
           continue;
         }
         if (!rowMatchesIsolation(meta, filter)) {
+          continue;
+        }
+        // DP-03：抑制下沉到 store，7 个读侧调用方自动继承。
+        if (!rowMatchesVisibility(meta, visScope)) {
           continue;
         }
 
@@ -1715,6 +1685,10 @@ export class VectorStore implements IMemoryStore {
 
       // Trim back to the caller's requested topK (we over-fetched above).
       const trimmed = results.slice(0, topK);
+      // DP-04：被撤回记忆占满超取窗口 ⇒ 召回静默变少。运维唯一能发现退化的信号。
+      if (recallTruncated({ requested: topK, retrieved: rows.length, retrieveLimit: retrieveCount, kept: results.length, scope: visScope })) {
+        this.logger?.warn(recallTruncationWarning("searchL1Vector", { requested: topK, kept: results.length, retrieveLimit: retrieveCount }));
+      }
       this.logger?.info(
         `${TAG} [L1-search] DONE returning ${trimmed.length} result(s) (from ${results.length} valid, ${rows.length} raw)`,
       );
@@ -1724,6 +1698,35 @@ export class VectorStore implements IMemoryStore {
         `${TAG} [L1-search] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,
       );
       return [];
+    }
+  }
+
+  /**
+   * 事后审核：改一条 L1 的可见性状态（DP-01）。
+   * 幂等：已处于目标状态时返回 changed:false，调用方据此不写第二条账本事件（DP-18）。
+   */
+  setL1ReviewStatus(
+    recordId: string,
+    status: ReviewStatus,
+    filter?: IsolationFilter,
+  ): { changed: boolean; previous: ReviewStatus } | undefined {
+    if (this.degraded) throw new Error("L1 review rejected: sqlite store is degraded");
+    try {
+      const row = this.db
+        .prepare("SELECT review_status, team_id, user_id, agent_id, session_id, session_key, task_id FROM l1_records WHERE record_id = ?")
+        .get(recordId) as
+        | { review_status?: string; team_id?: string; user_id?: string; agent_id?: string; session_id?: string; session_key?: string; task_id?: string }
+        | undefined;
+      if (!row) return undefined;
+      // 审核是跨记录操作：租户归属必须显式核对，不得沿用"未设置=不收窄"（DP-09）。
+      if (!rowMatchesIsolation(row, filter)) return undefined;
+      const previous = normalizeReviewStatus(row.review_status);
+      if (previous === status) return { changed: false, previous };
+      this.db.prepare("UPDATE l1_records SET review_status = ? WHERE record_id = ?").run(status, recordId);
+      return { changed: true, previous };
+    } catch (err) {
+      this.logger?.warn(`${TAG} [review] setL1ReviewStatus failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -1875,6 +1878,16 @@ export class VectorStore implements IMemoryStore {
       const conditions: string[] = [];
       const params: SQLInputValue[] = [];
 
+      // 可见性（DP-25）。countL1 必须与它伴随的列表口径一致，否则面板显示
+      // “共 100 条”而实际只能召回 60 条。
+      // 例外：l1-dedup 的 hasVectorData 判定与 memory-cleaner 的容量统计
+      // 必须显式传 visibility:"all"，见各自调用点。
+      const countScope = resolveVisibilityScope(filter);
+      if (visibilityNeedsFilter(countScope)) {
+        conditions.push("review_status = ?");
+        params.push(countScope);
+      }
+
       if (filter?.type) {
         conditions.push("type = ?");
         params.push(filter.type);
@@ -2002,6 +2015,11 @@ export class VectorStore implements IMemoryStore {
       if (filter?.userId !== undefined) rows = rows.filter((r) => r.user_id === filter.userId);
       if (filter?.agentId !== undefined) rows = rows.filter((r) => r.agent_id === filter.agentId);
       if (taskId !== undefined) rows = rows.filter((r) => r.task_id === taskId);
+      // DP-03：可见性与隔离在同一后过滤点生效。缺省 scope = active（fail-safe）。
+      const visScope = resolveVisibilityScope(filter);
+      if (visibilityNeedsFilter(visScope)) {
+        rows = rows.filter((r) => rowMatchesVisibility(r, visScope));
+      }
 
       this.logger?.info(
         `${TAG} [L1-query] filter={sessionKey=${sessionKey ?? "(all)"}, sessionId=${sessionId ?? "(all)"}, teamId=${filter?.teamId ?? "(all)"}, userId=${filter?.userId ?? "(all)"}, agentId=${filter?.agentId ?? "(all)"}, taskId=${taskId ?? "(all)"}, updatedAfter=${updatedAfter ?? "(none)"}, recordIds=${recordIds?.length ?? "(none)"}}, ` +
@@ -2447,9 +2465,13 @@ export class VectorStore implements IMemoryStore {
   getAllL1Texts(): Array<{ record_id: string; content: string; updated_time: string }> {
     if (this.degraded) return [];
     try {
-      return this.db
-        .prepare("SELECT record_id, content, updated_time FROM l1_records")
-        .all() as Array<{ record_id: string; content: string; updated_time: string }>;
+      // 返回形状里没有 review_status，调用方无从判断 ⇒ 只能给 active（fail-safe）。
+      // 需要全量（导出/迁移）的调用方请用 queryL1RecordsCursor，它的行带状态。
+      const scope = resolveVisibilityScope(undefined);
+      const sql = visibilityNeedsFilter(scope)
+        ? "SELECT record_id, content, updated_time FROM l1_records WHERE review_status = 'active'"
+        : "SELECT record_id, content, updated_time FROM l1_records";
+      return this.db.prepare(sql).all() as Array<{ record_id: string; content: string; updated_time: string }>;
     } catch (err) {
       this.logger?.warn(
         `${TAG} getAllL1Texts failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
@@ -2696,6 +2718,13 @@ export class VectorStore implements IMemoryStore {
    * Returns rows with `record_id > afterId`, ordered by PK, limited to `pageSize`.
    * Pass `""` as `afterId` for the first page.
    */
+  /**
+   * 批量游标读（导出 / 迁移 / 重嵌入）。
+   *
+   * **刻意不做可见性过滤**（DP-27）：导出与后端迁移不得静默丢数据 ——
+   * 丢了等于把被撤回的记忆"洗白"成不存在，审计链在迁移处断掉。
+   * 返回的 L1RecordRow 带 review_status，调用方须自行决定如何处理隔离行。
+   */
   queryL1RecordsCursor(afterId: string, pageSize: number): L1RecordRow[] {
     if (this.degraded) return [];
     try {
@@ -2807,6 +2836,13 @@ export class VectorStore implements IMemoryStore {
       const conditions: string[] = [];
       const params: SQLInputValue[] = [];
 
+      // DP-26：/atomic/query 是面向消费者的数据面读，结果会进 prompt ⇒ 必须过滤。
+      const pageScope = resolveVisibilityScope(filter);
+      if (visibilityNeedsFilter(pageScope)) {
+        conditions.push("review_status = ?");
+        params.push(pageScope);
+      }
+
       if (filter.type) {
         conditions.push("type = ?");
         params.push(filter.type);
@@ -2850,7 +2886,10 @@ export class VectorStore implements IMemoryStore {
 
       // Fetch page — must include user_id / agent_id so callers can enforce
       // isolation in downstream filters / Coordinator candidate pool.
-      const dataSql = `SELECT record_id, content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id, version, timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json FROM l1_records ${where} ORDER BY updated_time DESC LIMIT ? OFFSET ?`;
+      // review_status 必须进 SELECT：审核清单用 visibility:"all" 拉全量时，
+      // 没有这一列每条都会被归一成 "active" —— 一个把已撤回记忆报成生效中的
+      // 审计台比没有审计台更危险（自信地给错答案）。
+      const dataSql = `SELECT record_id, content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id, version, timestamp_str, timestamp_start, timestamp_end, created_time, updated_time, metadata_json, review_status FROM l1_records ${where} ORDER BY updated_time DESC LIMIT ? OFFSET ?`;
       const rows = this.db.prepare(dataSql).all(...params, filter.limit, filter.offset) as unknown as L1RecordRow[];
 
       return { rows, total };
@@ -3331,10 +3370,37 @@ export class VectorStore implements IMemoryStore {
    *
    * **Fault-tolerant**: returns an empty array on any error.
    */
+  /**
+   * 给定候选 record_id，返回「应当被可见性过滤丢弃」的集合。
+   * FTS 虚拟表不含 review_status，只能回 l1_records 批量查一次（DP-03/DP-05）。
+   * l1_records 里查不到的孤儿：scope=active 时放行（沿用既有 orphan 容忍行为），
+   * scope=quarantined 时丢弃（查无此行 ⇒ 它不是被撤回的）。
+   */
+  private visibilityDropSet(ids: string[], scope: VisibilityScope): Set<string> {
+    const drop = new Set<string>();
+    if (!visibilityNeedsFilter(scope) || ids.length === 0) return drop;
+    const CHUNK = 400; // 避开 SQLITE_MAX_VARIABLE_NUMBER
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const batch = ids.slice(i, i + CHUNK);
+      const rows = this.db
+        .prepare(`SELECT record_id, review_status FROM l1_records WHERE record_id IN (${batch.map(() => "?").join(",")})`)
+        .all(...batch) as Array<{ record_id: string; review_status?: string }>;
+      const seen = new Set<string>();
+      for (const r of rows) {
+        seen.add(r.record_id);
+        if (!rowMatchesVisibility(r, scope)) drop.add(r.record_id);
+      }
+      if (scope === "quarantined") for (const id of batch) if (!seen.has(id)) drop.add(id);
+    }
+    return drop;
+  }
+
   searchL1Fts(ftsQuery: string, limit = 20, filter?: IsolationFilter): FtsSearchResult[] {
     if (this.degraded || !this.ftsAvailable) return [];
     try {
-      const retrieveLimit = filter ? Math.max(limit * 5, limit) : limit;
+      const visScope = resolveVisibilityScope(filter);
+      const baseRetrieveLimit = filter ? Math.max(limit * 5, limit) : limit;
+      const retrieveLimit = withVisibilityOverFetch(baseRetrieveLimit, visScope);
       const rows = this.stmtL1FtsSearch.all(ftsQuery, retrieveLimit) as Array<{
         record_id: string;
         content: string;
@@ -3355,8 +3421,14 @@ export class VectorStore implements IMemoryStore {
         rank: number;
       }>;
 
-      return rows
+      const drop = this.visibilityDropSet(rows.map((r) => r.record_id), visScope);
+      const kept = rows
         .filter((r) => rowMatchesIsolation(r, filter))
+        .filter((r) => !drop.has(r.record_id));
+      if (recallTruncated({ requested: limit, retrieved: rows.length, retrieveLimit, kept: kept.length, scope: visScope })) {
+        this.logger?.warn(recallTruncationWarning("searchL1Fts", { requested: limit, kept: kept.length, retrieveLimit }));
+      }
+      return kept
         .slice(0, limit)
         .map((r) => ({
           record_id: r.record_id,

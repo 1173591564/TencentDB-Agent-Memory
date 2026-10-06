@@ -142,7 +142,8 @@ export class LocalMemoryCleaner {
       let totalL0 = 0;
       let totalL1 = 0;
       try { totalL0 = await vectorStore.countL0(); } catch { /* non-fatal */ }
-      try { totalL1 = await vectorStore.countL1(); } catch { /* non-fatal */ }
+      // 容量/清理是**存储压力**口径：被撤回的记忆同样占磁盘与索引，必须计入。
+      try { totalL1 = await vectorStore.countL1({ visibility: "all" }); } catch { /* non-fatal */ }
 
       this.opts.logger?.info(
         `${TAG} [Pre-delete] cutoffIso=${cutoffIso}, retentionDays=${retentionDays}, totalL0=${totalL0}, totalL1=${totalL1}`,

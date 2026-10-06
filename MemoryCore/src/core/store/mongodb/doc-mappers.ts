@@ -170,6 +170,8 @@ export function docToL1RecordRow(doc: L1Doc): L1RecordRow {
     created_time: doc.created_time ?? "",
     updated_time: doc.updated_time ?? "",
     metadata_json: doc.metadata_json ?? "{}",
+    // 守卫与审核清单都依赖它；丢了就是静默失效。
+    review_status: (doc as { review_status?: string }).review_status as L1RecordRow["review_status"],
   };
 }
 

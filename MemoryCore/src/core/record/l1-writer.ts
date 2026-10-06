@@ -17,6 +17,7 @@
  */
 
 import crypto from "node:crypto";
+import { isMemoryReviewEnabled } from "../store/visibility.js";
 import { DEFAULT_ISOLATION_ID, type IMemoryStore } from "../store/types.js";
 import type { EmbeddingService } from "../store/embedding.js";
 import type { StorageAdapter } from "../storage/adapter.js";
@@ -280,12 +281,38 @@ export async function writeMemory(params: {
         ...(teamId || userId || agentId || taskId
           ? { teamId, userId, agentId, taskId }
           : sessionId ? { sessionId } : {}),
-      });
+        // DP-14：必须看得见被撤回的目标。
+        // 若这里走默认 active 口径，被撤回的目标查不到 ⇒ 代码当作"目标不存在"
+        // 继续往下写 ⇒ 同一事实以新 record_id 落库 ⇒ 被撤回的内容复活。
+        visibility: "all",
+      }, isMemoryReviewEnabled() ? { strict: true } : undefined);
       targetsQueried = true;
+
+      // 被撤回的记忆**不得通过合并复活**（DP-14）。
+      // 这是后端无关的源头拦截：三个后端的 upsert 语义各不相同
+      //（sqlite/mongo 已保留状态，tcvdb 的整文档 upsert 仍可能抹掉状态），
+      // 与其只依赖后端更新细节，
+      // 不如在这里直接不让这次写入发生。
+      const quarantinedTargets = !isMemoryReviewEnabled() ? [] : supersededTargets.filter(
+        (r) => r.review_status === "quarantined",
+      );
+      if (quarantinedTargets.length > 0) {
+        // 不打 content。这条日志描述的正是一条**刚被撤回**的记忆——
+        // 撤回的常见理由就是内容错误或敏感，再把它抄进应用日志等于把撤回漏回去：
+        // 日志聚合的访问面和留存期通常都比记忆库更宽。
+        // 定位用 record_id 足够（要正文就去 /memory/history，那是受控的审计面）。
+        logger?.warn?.(
+          `${TAG} [memory-review] 丢弃一次写入：去重目标 ` +
+          `[${quarantinedTargets.map((r) => r.record_id).join(", ")}] 已被撤回，` +
+          `不得通过合并复活。新内容长度=${memory.content.length}`,
+        );
+        return null;
+      }
       const maxVersion = supersededTargets.reduce((max, row) => Math.max(max, row.version ?? 0), 0);
       nextVersion = maxVersion + 1;
     } catch (err) {
-      logger?.warn?.(`${TAG} Failed to read existing memory version, defaulting to v0: ${err instanceof Error ? err.message : String(err)}`);
+      logger?.warn?.(`${TAG} Failed to read existing memory version: ${err instanceof Error ? err.message : String(err)}`);
+      if (isMemoryReviewEnabled()) return null;
     }
   }
 

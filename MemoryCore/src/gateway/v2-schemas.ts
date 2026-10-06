@@ -497,6 +497,37 @@ export const memoryHistoryRequestSchema = z.object({
 });
 export type MemoryHistoryRequest = z.infer<typeof memoryHistoryRequestSchema>;
 
+// POST /v2|v3/memory/review/retract|restore — 事后审核撤回/恢复。
+//
+// 与 /memory/diff/revert 的分工（见 docs/change-ledger.md）：
+//  - revert  作用于**一次写入事件**，语义是"这次抽取不该发生"，回到写入前那一版；
+//  - retract 作用于**一条记忆的可见性**，语义是"这条内容不可信，别再喂给模型"，
+//            行与血缘都保留，可 restore。事后审核的主操作是 retract。
+//
+// 注意：请求体里**没有** visibility/scope 之类的可见性开关 —— 它只能由服务端
+// 指定（DP-14），否则等于给调用方一个绕过审核的后门。
+export const memoryReviewRetractRequestSchema = z.object({
+  /** 要撤回的 record id。 */
+  record_id: z.string().min(1).optional(),
+  /** 批量撤回（上限 50/次）。 */
+  record_ids: z.array(z.string().min(1)).min(1).max(50).optional(),
+  /** 撤回理由，记入 retracted 事件的 reason。审核操作要求必须说明理由。 */
+  reason: z.string().min(1).max(2000),
+}).refine((d) => d.record_id || (d.record_ids?.length ?? 0) > 0, {
+  message: "record_id or non-empty record_ids is required",
+});
+export type MemoryReviewRetractRequest = z.infer<typeof memoryReviewRetractRequestSchema>;
+
+export const memoryReviewRestoreRequestSchema = z.object({
+  record_id: z.string().min(1).optional(),
+  record_ids: z.array(z.string().min(1)).min(1).max(50).optional(),
+  /** 恢复理由可选 —— 恢复是把系统还原到默认状态，举证责任低于撤回。 */
+  reason: z.string().max(2000).optional(),
+}).refine((d) => d.record_id || (d.record_ids?.length ?? 0) > 0, {
+  message: "record_id or non-empty record_ids is required",
+});
+export type MemoryReviewRestoreRequest = z.infer<typeof memoryReviewRestoreRequestSchema>;
+
 // POST /v2|v3/memory/review/inbox — 审阅收件箱：tenant 维度（team/agent/user）
 // 最近有 L1 变更的 session 列表。解决"审阅者不知道该审哪个 session"的问题。
 // 聚合在 handler 完成：拉时间窗内事件按 session_id 分组。
@@ -509,6 +540,26 @@ export const memoryReviewInboxRequestSchema = z.object({
   limit: z.number().int().min(1).max(1000).default(500),
 });
 export type MemoryReviewInboxRequest = z.infer<typeof memoryReviewInboxRequestSchema>;
+
+/**
+ * POST /memory/review/list — 按可见性口径列出记忆（DP-30）。
+ *
+ * 没有这个接口，撤回就是单向的：审阅者一旦丢了 record_id，既无法 restore，
+ * 也无法回答"当前有哪些记忆处于被压制状态"这个合规问题。
+ * /atomic/query 做不到 —— 它默认只返 active，且其 schema 是 OpenAPI 生成物，
+ * 不应为内部审核能力改动。
+ */
+export const memoryReviewListRequestSchema = z.object({
+  /** 口径：active=仍在生效 / quarantined=已撤回 / all=审计全量。默认 quarantined ——
+   *  审核台最常问的是"我撤了哪些"，默认值要对准主场景。 */
+  visibility: z.enum(["active", "quarantined", "all"]).default("quarantined"),
+  type: z.string().min(1).max(64).optional(),
+  time_start: z.string().min(1).optional(),
+  time_end: z.string().min(1).optional(),
+  limit: z.number().int().min(1).max(200).default(50),
+  offset: z.number().int().min(0).default(0),
+}).strict();
+export type MemoryReviewListRequest = z.infer<typeof memoryReviewListRequestSchema>;
 
 // POST /v2|v3/memory/ledger/status — 变更账健康度（本进程见到的 store/outbox 追加失败）。
 // reset:true 清失败计数；pending 擦除是未落地的工作项，不在 reset 范围内——

@@ -94,7 +94,10 @@ export async function batchDedup(params: {
     }));
 
   // Determine what recall capabilities are available
-  const hasVectorData = !!vectorStore && (await vectorStore.countL1()) > 0;
+  // DP-14 的第二道门：这里若只数 active，当一个租户的记忆全部被撤回时
+  // countL1() 返回 0 ⇒ 判定"没有可比对的数据" ⇒ **整个去重被跳过** ⇒
+  // 同一事实以新 record_id 原样写入，被撤回的内容复活。必须数全量。
+  const hasVectorData = !!vectorStore && (await vectorStore.countL1({ visibility: "all" })) > 0;
   const hasFts = vectorStore?.isFtsAvailable() ?? false;
   const nativeHybrid = !!(
     vectorStore &&
@@ -242,6 +245,12 @@ async function findCandidates(
   hasVectorData: boolean,
 ): Promise<CandidateMatch[]> {
   const newRecordIds = new Set(memories.map((m) => m.record_id));
+  // DP-14：去重**必须**能看见被撤回的记忆。
+  // 否则同一事实下次抽取时判不出重，会以一个新 record_id 重新写入，
+  // 审核员上次的撤回对新 id 无效 —— 被撤回的内容原样复活。
+  // 判重命中一条 quarantined 记录时，写入走 ON CONFLICT 更新该行，
+  // review_status 不在更新列清单里，因此它保持隔离（见 l1_records upsert）。
+  const dedupFilter: IsolationFilter = { ...(filter ?? {}), visibility: "all" };
   const nativeHybrid = !!(
     typeof vectorStore.getCapabilities === "function" &&
     vectorStore.getCapabilities().nativeHybridSearch &&
@@ -279,7 +288,7 @@ async function findCandidates(
       vectorStore,
       embeddingService: vectorSvc,
       logger,
-      filter,
+      filter: dedupFilter,
       queryEmbedding: queryEmbeddings?.[i],
       embeddingTimeoutMs,
       logTag: TAG,

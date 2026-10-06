@@ -15,6 +15,16 @@
  */
 
 import type { MemoryRecord } from "../../record/l1-writer.js";
+import {
+  DEFAULT_REVIEW_STATUS,
+  normalizeReviewStatus,
+  resolveVisibilityScope,
+  rowMatchesVisibility,
+  visibilityNeedsFilter,
+  visibilityTcvdbCondition,
+  type ReviewStatus,
+  type VisibilityScope,
+} from "../visibility.js";
 import type { EmbeddingProviderInfo } from "../embedding.js";
 import type {
   IMemoryStore,
@@ -144,6 +154,8 @@ const L1_OUTPUT_FIELDS = [
   "id", "text", "type", "priority", "scene_name",
   "team_id", "user_id", "agent_id", "session_key", "session_id", "task_id", "version", "timestamp_str", "timestamp_start",
   "timestamp_end", "metadata_json", "created_time_ms", "updated_time_ms",
+  // 事后审核可见性：客户端后过滤需要它（见 buildIsolationConditions 说明）
+  "review_status",
 ];
 
 /** All L0 output fields returned by query/search. */
@@ -227,7 +239,27 @@ function buildIsolationConditions(filter?: IsolationFilter): string[] {
   if (filter.sessionId !== undefined) conditions.push(eqFilter("session_id", filter.sessionId));
   if (filter.taskId !== undefined) conditions.push(eqFilter("task_id", filter.taskId));
   if (filter.sessionKey !== undefined) conditions.push(eqFilter("session_key", filter.sessionKey));
+  // 可见性（DP-05）：**只有 quarantined 下推服务端**。
+  // active 不能写成 review_status="active" —— 升级前写入的文档没有这个标量字段，
+  // 服务端等值过滤会把它们全部排除，一次升级让所有历史记忆凭空消失。
+  // 因此 active 口径改走客户端后过滤（applyVisibilityPostFilter）。
+  const visCond = visibilityTcvdbCondition(resolveVisibilityScope(filter));
+  if (visCond) conditions.push(visCond);
   return conditions;
+}
+
+/**
+ * 客户端可见性后过滤（DP-05）。TCVDB 的标量过滤表达式无法安全表达
+ * "字段不存在即视为 active"，因此 active 口径在客户端滤。
+ * 缺字段 / 空值一律按 active（DP-12）。
+ */
+function applyVisibilityPostFilter<T extends Record<string, unknown>>(
+  docs: T[],
+  scope: VisibilityScope,
+): T[] {
+  if (!visibilityNeedsFilter(scope)) return docs;
+  if (scope === "quarantined") return docs; // 已由服务端表达式收窄
+  return docs.filter((d) => rowMatchesVisibility({ review_status: d.review_status as string | undefined }, scope));
 }
 
 function joinFilter(conditions: string[]): string | undefined {
@@ -776,6 +808,11 @@ export class TcvdbMemoryStore implements IMemoryStore {
       updated_time_ms: isoToEpochMs(record.updatedAt),
       metadata_json: JSON.stringify(record.metadata),
       memory_type: DEFAULT_MEMORY_TYPE,
+      // 新写入一定带审核态；老文档缺字段由客户端后过滤按 active 处理。
+      // 注意：tcvdb 的 upsert 是整文档替换，会抹掉已有的 review_status ——
+      // 该复活路径已在写入层源头拦截（l1-writer.ts 的 quarantinedTargets 守卫），
+      // 不得仅依赖本处。
+      review_status: DEFAULT_REVIEW_STATUS,
     };
     if (!this.embeddingEnabled) doc.vector = [1];
 
@@ -932,6 +969,43 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
+  /**
+   * 事后审核：改一条 L1 的可见性状态（DP-01）。幂等语义与 sqlite/mongo 一致。
+   *
+   * TCVDB 没有"部分字段更新"的通用保证，这里走 query → 改字段 → upsert 整文档。
+   * 因此必须先把原文档完整取回（outputFields 全量），否则会丢字段。
+   */
+  async setL1ReviewStatus(
+    recordId: string,
+    status: ReviewStatus,
+    filter?: IsolationFilter,
+  ): Promise<{ changed: boolean; previous: ReviewStatus } | undefined> {
+    try {
+      await this._ensureInit();
+      if (this.degraded) throw new Error("L1 review rejected: tcvdb store is degraded");
+      // 取回时必须用 visibility:"all"，否则已被撤回的记录自己都查不到，restore 永远失败。
+      const conditions = buildIsolationConditions({ ...(filter ?? {}), visibility: "all" });
+      const filterExpr = joinFilter(conditions);
+      const queryParams: Record<string, unknown> = {
+        retrieveVector: false,
+        documentIds: [recordId],
+        outputFields: L1_OUTPUT_FIELDS,
+      };
+      if (filterExpr) queryParams.filter = filterExpr;
+      const resp = await this.client.query(this.l1Collection, queryParams);
+      const doc = (resp.documents ?? [])[0] as Record<string, unknown> | undefined;
+      if (!doc) return undefined;
+
+      const previous = normalizeReviewStatus(doc.review_status);
+      if (previous === status) return { changed: false, previous };
+      await this.client.upsert(this.l1Collection, [{ ...doc, review_status: status }]);
+      return { changed: true, previous };
+    } catch (err) {
+      this.logger?.warn(`${TAG} [review] setL1ReviewStatus failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
+  }
+
   // ── L1 Read Operations ───────────────────────────────────
 
   async countL1(filter?: L1CountFilter): Promise<number> {
@@ -994,7 +1068,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
           const resp = await this.client.query(this.l1Collection, queryParams);
           docs.push(...(resp.documents ?? []));
         }
-        return docs.map((doc: Record<string, unknown>) => ({
+        // DP-05：active 口径靠客户端后过滤（服务端等值会排除缺字段的老文档）。
+        return applyVisibilityPostFilter(docs, resolveVisibilityScope(filter)).map((doc: Record<string, unknown>) => ({
           record_id: String(doc.id ?? ""),
           content: String(doc.text ?? ""),
           type: String(doc.type ?? ""),
@@ -1013,6 +1088,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
           created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)),
           updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
           metadata_json: String(doc.metadata_json ?? "{}"),
+          review_status: doc.review_status as L1RecordRow["review_status"],
         }));
       }
 
@@ -1045,6 +1121,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)),
         updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
         metadata_json: String(doc.metadata_json ?? "{}"),
+        review_status: doc.review_status as L1RecordRow["review_status"],
       }));
     } catch (err) {
       this.logger?.warn(`${TAG} [L1-query] FAILED${opts?.strict ? " (strict, rethrowing)" : ""}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1146,7 +1223,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         }];
         searchParams.rerank = { method: "rrf", k: 60 };
         const resp = await this.client.hybridSearch(this.l1Collection, searchParams);
-        return this._parseL1SearchResults(resp.documents);
+        return this._parseL1SearchResults(resp.documents, resolveVisibilityScope(filter));
       }
 
       // ann: use embedding field name "text" for server-side embedding
@@ -1168,7 +1245,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         searchParams.rerank = { method: "rrf", k: 60 };
 
         const resp = await this.client.hybridSearch(this.l1Collection, searchParams);
-        return this._parseL1SearchResults(resp.documents);
+        return this._parseL1SearchResults(resp.documents, resolveVisibilityScope(filter));
       }
 
       // Dense-only fallback (BM25 unavailable) — use /document/search with embeddingItems
@@ -1180,7 +1257,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       };
       if (filterExpr) denseSearch.filter = filterExpr;
       const resp = await this.client.search(this.l1Collection, denseSearch);
-      return this._parseL1SearchResults(resp.documents);
+      return this._parseL1SearchResults(resp.documents, resolveVisibilityScope(filter));
     } catch (err) {
       this.logger?.warn(`${TAG} [L1-hybridSearch] FAILED: ${err instanceof Error ? err.message : String(err)}`);
       return [];
@@ -2084,6 +2161,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         created_time: d.created_time_ms ? new Date(d.created_time_ms).toISOString() : "",
         updated_time: d.updated_time_ms ? new Date(d.updated_time_ms).toISOString() : "",
         metadata_json: d.metadata_json ?? "{}",
+        review_status: d.review_status as L1RecordRow["review_status"],
       }));
 
       return { rows, total };
@@ -2169,7 +2247,16 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   // ── Internal: parse search results ───────────────────────
 
-  private _parseL1SearchResults(docArrays: Array<Array<Record<string, unknown>>>): L1SearchResult[] {
+  /**
+   * 所有 L1 搜索路径（fts / vector / hybrid）的共同出口。
+   * DP-05：active 口径的可见性过滤在这里统一做 —— 服务端等值表达式会把
+   * 缺少 review_status 标量字段的老文档全部排除，不能下推。
+   */
+  private _parseL1SearchResults(
+    docArrays: Array<Array<Record<string, unknown>>>,
+    scope: VisibilityScope = "active",
+  ): L1SearchResult[] {
+    docArrays = (docArrays ?? []).map((arr) => applyVisibilityPostFilter(arr ?? [], scope));
     const results: L1SearchResult[] = [];
     // hybridSearch/search returns [[doc, doc, ...]] (one array per query)
     const docs = docArrays?.[0] ?? [];
@@ -2192,6 +2279,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
         agent_id: String(doc.agent_id ?? ""),
         version: Number(doc.version ?? 0),
         metadata_json: String(doc.metadata_json ?? "{}"),
+        // 刻意不在 L1SearchResult 上带 review_status：搜索路径已按口径过滤，
+        // 而三后端的搜索映射若只有一个填这个字段，就又是一个"看着有、其实常为空"的陷阱。
       });
     }
     return results;

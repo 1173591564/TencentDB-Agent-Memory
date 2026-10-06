@@ -263,11 +263,3 @@ export async function readAllMemoryRecords(
     return [];
   }
 }
-
-// ============================
-// Helpers
-// ============================
-
-function sanitizeFilename(name: string): string {
-  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
-}

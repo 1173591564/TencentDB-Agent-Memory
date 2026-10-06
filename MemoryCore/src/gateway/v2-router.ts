@@ -19,7 +19,7 @@ import type http from "node:http";
 import { classifyError } from "./error-handler.js";
 import type { IMemoryStore, L0Record, L1RecordRow, MemoryEvent, MemoryEventFilter, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
-import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
+import { scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
 import type { IStateBackend } from "../core/state/types.js";
@@ -28,6 +28,8 @@ import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import { appendRevertTombstone, type MemoryRecord } from "../core/record/l1-writer.js";
 import { appendLedgerEvent, getLedgerHealth, hasPendingLedgerEvent, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
+import type { ReviewStatus } from "../core/store/visibility.js";
+import { normalizeReviewStatus, isMemoryReviewEnabled } from "../core/store/visibility.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
 // ── Zod schemas (validated types + defaults) ──
@@ -53,6 +55,9 @@ import {
   memoryDiffRevertRequestSchema,
   memoryHistoryRequestSchema,
   memoryReviewInboxRequestSchema,
+  memoryReviewListRequestSchema,
+  memoryReviewRetractRequestSchema,
+  memoryReviewRestoreRequestSchema,
   memoryLedgerStatusRequestSchema,
   memoryLedgerBackfillRequestSchema,
   teamCreateRequestSchema,
@@ -182,6 +187,9 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/memory/diff/revert",
   "/memory/history",
   "/memory/review/inbox",
+  "/memory/review/list",
+  "/memory/review/retract",
+  "/memory/review/restore",
   "/memory/ledger/status",
   "/memory/ledger/backfill",
 ]);
@@ -524,6 +532,9 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/memory/diff/revert": withLedgerQueryGuard(handleMemoryDiffRevert),
   "/memory/history": withLedgerQueryGuard(handleMemoryHistory),
   "/memory/review/inbox": withLedgerQueryGuard(handleMemoryReviewInbox),
+  "/memory/review/list": withLedgerQueryGuard(handleMemoryReviewList),
+  "/memory/review/retract": withLedgerQueryGuard(handleMemoryReviewRetract),
+  "/memory/review/restore": withLedgerQueryGuard(handleMemoryReviewRestore),
   "/memory/ledger/status": withLedgerQueryGuard(handleMemoryLedgerStatus),
   "/memory/ledger/backfill": withLedgerQueryGuard(handleMemoryLedgerBackfill),
 };
@@ -698,6 +709,15 @@ export async function handleV2Route(
     // and must not be blocked by per-agent memory isolation.
     // Runtime default comes from server.ts/env and is OFF;
     // undefined keeps strict in direct router tests for backward compatibility.
+    const reviewScopeRequired = ["/memory/review/list", "/memory/review/retract", "/memory/review/restore"]
+      .some((subpath) => pathname === `${V2_PREFIX}${subpath}` || pathname === `${V3_PREFIX}${subpath}`);
+    if (reviewScopeRequired) {
+      const missing = collectV3Missing(pathname, body as Record<string, unknown> | undefined, headers);
+      if (missing.length > 0) {
+        sendJson(res, 400, errorEnvelope(400, `Review requires explicit isolation: missing ${missing.join(", ")}`, requestId));
+        return true;
+      }
+    }
     const v3StrictEnabled = deps.v3StrictIsolation ?? true;
     if (isV3 && !isV3Extra && v3StrictEnabled) {
       const v3Subpath = pathname.slice(V3_PREFIX.length);
@@ -1642,6 +1662,12 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   }
 
   const eventShape = (e: (typeof events)[number]) => ({
+    // 操作身份：一个 record 有多次写入后，record_id 不再唯一标识"这次变更"。
+    // 不暴露它，客户端只能按 record_id 撤销，Core 退化为"撤最后一次抽取写入"
+    // （planRevert 的 `writes.filter(isExtraction).pop()`）——审阅者点的是旧卡
+    // 片、撤掉的却是新写入。reverted 事件早已用 target_event_id 精确记账，
+    // 读侧契约必须对齐。老数据 event_id 为空 → 字段缺省，响应形状不变。
+    ...(e.event_id ? { event_id: e.event_id } : {}),
     record_id: e.record_id,
     content: e.content,
     memory_type: e.memory_type,
@@ -1677,6 +1703,9 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     /** 本卡不是完整变更组：声明的伙伴不在本响应里（被 op 过滤、超出补查窗口，或账本缺行）。 */
     incomplete_group?: boolean;
     replaced: Array<{
+      /** superseded 事件自身的身份（用于与 /memory/history 对账）。
+       *  注意：它不是写入事件，不能作为 revert 的 event_id —— 传入会 404。 */
+      event_id?: string;
       record_id: string; content: string; memory_type?: string;
       version: number; event_ts: string; origin_session_id?: string; origin_session_key?: string;
     }>;
@@ -1692,7 +1721,6 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
       changes.push({
         op: "superseded",
         ...eventShape(e),
-        ...(e.event_id ? { event_id: e.event_id } : {}),
         ...(e.superseded_by ? { superseded_by: e.superseded_by } : {}),
         incomplete_group: true,
         replaced: [],
@@ -1708,7 +1736,6 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     changes.push({
       op: e.op,
       ...eventShape(e),
-      ...(e.event_id ? { event_id: e.event_id } : {}),
       replaced,
       ...(incomplete ? { incomplete_group: true } : {}),
       // reverted 事件自身是驳回动作的账，不是"被撤销的变更"——不给它打标，
@@ -1845,7 +1872,7 @@ async function liveRecordIds(
 ): Promise<string[]> {
   const out: string[] = [];
   for (let i = 0; i < ids.length; i += 20) { // TCVDB documentIds 单查上限 20
-    const rows = await store.queryL1Records({ recordIds: ids.slice(i, i + 20), ...rowFilter }, { strict: true });
+    const rows = await store.queryL1Records({ recordIds: ids.slice(i, i + 20), ...rowFilter, visibility: "all" }, { strict: true });
     out.push(...rows.map((r) => r.record_id));
   }
   return out;
@@ -2353,6 +2380,259 @@ async function handleMemoryHistory(body: unknown, _auth: V2AuthContext, requestI
  * 响应里带 truncated:true 提示收窄时间窗；has_reverted 同样只反映扫描窗口
  * 内的事件，更早窗口的驳回标记需收窄时间窗才能看到。
  */
+/**
+ * POST /memory/review/{retract,restore} — 事后审核的主操作（DP-01）。
+ *
+ * retract = 切断「进入 prompt」这一条通路，**不删行、不断血缘、可逆**。
+ * 它与 revert 是两个轴：revert 退的是一次写入事件，retract 改的是一条记忆的可见性。
+ *
+ * 实现要点：
+ *  - 状态与账本分开写；持久一致性及状态投影尚未实现，见 docs/change-ledger.md。
+ *  - 幂等：已处于目标状态 ⇒ 不写第二条账本事件，计入 no_op（DP-18）。
+ *  - 租户：作用域取请求 isolation，store 侧再核一次；跨租户返回 not_found 而非 403，
+ *    避免用错误码探测他人 record 是否存在。
+ *  - reviewer_id 只取服务端 isolation，不接受请求体传入（DP-19）。
+ */
+async function handleMemoryReviewStatusChange(
+  body: unknown,
+  requestId: string,
+  deps: V2RouterDeps,
+  mode: "retract" | "restore",
+): Promise<ApiResponseEnvelope> {
+  const schema = mode === "retract" ? memoryReviewRetractRequestSchema : memoryReviewRestoreRequestSchema;
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+
+  if (!isMemoryReviewEnabled()) {
+    // DP-23：开关关着就不该接受写操作 —— 否则会积累一批读路径不生效的"已撤回"记录，
+    // 运维以为撤掉了，实际还在喂给模型。
+    return errorEnvelope(403, "Memory review is disabled on this gateway (set TDAI_MEMORY_REVIEW_ENABLED to enable)", requestId);
+  }
+
+  const store = deps.getStore();
+  if (!store || store.isDegraded()) return errorEnvelope(503, "Store not available", requestId);
+  if (!store.setL1ReviewStatus) {
+    return errorEnvelope(501, "Memory review is not supported by this store backend", requestId);
+  }
+
+  const iso = deps.requestIsolation;
+  // DP-09：审核是跨记录操作，不得沿用 IsolationFilter"未设置=不收窄"的默认，
+  // 否则一个空作用域就是"撤回全租户"。
+  if (!iso?.userId || !iso?.agentId) {
+    return errorEnvelope(400, "Review operations require an explicit isolation scope (user_id + agent_id)", requestId);
+  }
+  const filter = { teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId };
+
+  const d = parsed.data;
+  const recordIds = [...new Set([...(d.record_id ? [d.record_id] : []), ...(d.record_ids ?? [])])];
+  if (recordIds.length > 50) {
+    return errorEnvelope(400, "At most 50 records per review request (record_id + record_ids combined)", requestId);
+  }
+
+  const targetStatus: ReviewStatus = mode === "retract" ? "quarantined" : "active";
+  const op = mode === "retract" ? "retracted" : "restored";
+  const changed: string[] = [];
+  const noOp: string[] = [];
+  const notFound: string[] = [];
+  let ledgerPending = false;
+
+  for (const recordId of recordIds) {
+    let res: { changed: boolean; previous: ReviewStatus } | undefined;
+    try {
+      res = await store.setL1ReviewStatus(recordId, targetStatus, filter);
+    } catch (err) {
+      deps.logger.warn(`${TAG} review ${mode} failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
+      return errorEnvelope(503, `Failed to ${mode} record ${recordId} — retry is allowed`, requestId, {
+        partial: { changed, no_op: noOp, not_found: notFound }, failed_record_id: recordId,
+        ...(ledgerPending ? { ledger_pending: true } : {}),
+      });
+    }
+    if (!res) { notFound.push(recordId); continue; }
+    if (!res.changed) { noOp.push(recordId); continue; }
+
+    // 取记录自身的租户/session 归属写账本（与既有账本行口径一致：
+    // 请求方身份只进 reviewer_id）。
+    const row = (await store.queryL1Records({ recordIds: [recordId], ...filter, visibility: "all" }))[0];
+    const { store: ledgerOk } = await appendLedgerEvent({
+      store, storage: deps.getStorage(), logger: deps.logger,
+      event: {
+        event_ts: new Date().toISOString(),
+        session_key: row?.session_key ?? "",
+        session_id: row?.session_id ?? "",
+        team_id: row?.team_id ?? iso.teamId ?? "",
+        user_id: row?.user_id ?? iso.userId,
+        agent_id: row?.agent_id ?? iso.agentId,
+        task_id: row?.task_id ?? iso.taskId ?? "",
+        op,
+        record_id: recordId,
+        content: row?.content ?? "",
+        ...(d.reason ? { reason: d.reason } : {}),
+        version: row?.version,
+        // DP-35：reviewer_id 要么是**真的操作者**，要么留空 —— 绝不回落成 iso.userId。
+        //
+        // 本接口的 isolation 作用域就是用来定位这条记录的过滤器，即**记忆所有者**，
+        // 不是操作者。回落等于把数据主体写成审核人：既伪造了一条"本人自查"的
+        // 审计记录，又与真正的本人自查无法区分 —— 审计链在最关键的一格上失真。
+        // 空值是诚实的（"操作者未声明"），假值不是。
+        //
+        // 上游 PR #1539 的评审（LeonSGP43）正是在 Panel 侧点出这条：User Key
+        // 会话下代理不传 reviewerId，Core 回落后"跨用户撤销可能误记操作者"。
+        // Panel 侧要修，但根因在 Core 的回落上 —— 调用方忘了传，不该由 Core
+        // 编一个出来。基线 revert 有同样的回落（event-ledger 侧），已登记为发现项，
+        // 但不在本轮改动范围（会改变既有行为）。
+        ...(deps.requestReviewerId ? { reviewer_id: deps.requestReviewerId } : {}),
+        source: "review",
+      },
+    });
+    if (!ledgerOk) {
+      ledgerPending = true;
+      deps.logger.warn(`${TAG} ${op} event not in store yet for ${recordId} (pending backfill)`);
+    }
+    changed.push(recordId);
+  }
+
+  // DP-31：撤回 L1 不会改写 L2 场景块 / L3 画像 —— 它们是派生出来的独立文件，
+  // 仍被 auto-recall 注入每一次 prompt。不在响应里说这件事，调用方会以为
+  // "撤回完成了"，而错误内容继续生效 —— 整个机制形同虚设。
+  const downstream = mode === "retract" && changed.length > 0
+    ? await collectDownstreamArtifacts(deps)
+    : undefined;
+
+  // 调用方必须能分辨这批审计记录有没有操作者署名 —— 否则事后无从追责。
+  if (!deps.requestReviewerId && changed.length > 0) {
+    deps.logger.warn(
+      `${TAG} ${op}: no x-tdai-reviewer-id header — ${changed.length} ledger event(s) written without an operator identity`,
+    );
+  }
+
+  return successEnvelope({
+    ok: true,
+    mode,
+    changed,
+    // 幂等空操作与"查无此记录"必须分开报，否则调用方分不清
+    // "已经撤过了" 和 "我撤错了 id"。
+    no_op: noOp,
+    not_found: notFound,
+    ...(ledgerPending ? { ledger_pending: true } : {}),
+    ...(downstream ? { downstream } : {}),
+    // "署名了" 与 "没署名" 是两种不同的成功，不能折叠成同一个 ok:true
+    //（与 ledger_pending 同理 —— 参见 #1539 评审 kvnloo 对 tombstone_pending 的意见）。
+    reviewer_attribution: deps.requestReviewerId ? "asserted" : "unattributed",
+  }, requestId);
+}
+
+/**
+ * 列出撤回后仍然存在的 L2/L3 派生物（DP-31）。
+ *
+ * **刻意不做内容比对。** 用子串/分词去猜"这个画像里是不是含有被撤回的事实"，
+ * 在中文上本来就不可靠；而一个"未检出"会被读成"安全"——假阴性比不检测更危险。
+ * 这里只做确定性的事：报出该租户当前存在哪些派生文件，由人去处置。
+ */
+async function collectDownstreamArtifacts(deps: V2RouterDeps): Promise<{
+  auto_cleaned: false;
+  note: string;
+  artifacts: Array<{ layer: "L2" | "L3"; path: string }>;
+  truncated?: true;
+} | undefined> {
+  const base = deps.getStorage();
+  if (!base) return undefined;
+  const artifacts: Array<{ layer: "L2" | "L3"; path: string }> = [];
+  let truncated: true | undefined;
+  try {
+    const storage = scopedProfileStorage(base, deps.requestIsolation);
+    try {
+      const persona = await storage.readFile(StoragePaths.persona);
+      if (persona && persona.trim()) artifacts.push({ layer: "L3", path: StoragePaths.persona });
+    } catch { /* 没有画像文件是新租户的正常状态 */ }
+    try {
+      const listed = await storage.getBackend().listObjects(StoragePaths.sceneBlocksDir, { recursive: true });
+      const blocks = listed.entries.filter((e) => e.key.endsWith(".md"));
+      for (const e of blocks.slice(0, 50)) artifacts.push({ layer: "L2", path: e.key });
+      if (blocks.length > 50) truncated = true;
+    } catch { /* 场景块目录不存在同理 */ }
+  } catch (err) {
+    // 披露是尽力而为的附加信息，绝不能让它把一次成功的撤回变成 500。
+    deps.logger.warn(`${TAG} downstream artifact scan failed: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+  if (artifacts.length === 0) return undefined;
+  return {
+    auto_cleaned: false,
+    note: "L1 记忆已撤回，但 L2 场景块与 L3 画像是独立的派生文件，不会被本操作改写，"
+      + "且仍会注入后续每一次 prompt。若被撤回的内容已沉淀进下列文件，需要重新生成或人工编辑。"
+      + "（未做内容比对：中文子串匹配的假阴性会被误读为安全）",
+    artifacts,
+    ...(truncated ? { truncated } : {}),
+  };
+}
+
+/**
+ * POST /memory/review/list — 按可见性口径列出记忆（DP-30）。
+ *
+ * 开关关闭时**依然放行**（DP-32）：这是只读审计面，而紧急回滚
+ *（把开关关掉）之后恰恰是最需要回答"现在有哪些记忆处于撤回状态"的时刻。
+ * 写操作 403、读操作放行，两者不矛盾。
+ */
+async function handleMemoryReviewList(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = memoryReviewListRequestSchema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+
+  const store = deps.getStore();
+  if (!store) return errorEnvelope(503, "Store not available", requestId);
+  if (!store.queryL1Paginated) {
+    return errorEnvelope(501, "Paginated L1 query is not supported by this store backend", requestId);
+  }
+  const iso = deps.requestIsolation;
+  if (!iso?.userId || !iso?.agentId) {
+    return errorEnvelope(400, "Review operations require an explicit isolation scope (user_id + agent_id)", requestId);
+  }
+
+  const d = parsed.data;
+  const result = await store.queryL1Paginated({
+    type: d.type,
+    timeStart: d.time_start,
+    timeEnd: d.time_end,
+    limit: d.limit,
+    offset: d.offset,
+    teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId,
+    // 显式口径：绝不沿用默认 active，否则 quarantined 永远查不出来。
+    visibility: d.visibility,
+  });
+
+  // 显式 has_more：审阅面不能把"截断的一页"默默呈现成"全部"。
+  // （#1539 评审 kvnloo 对 history 的同类意见：provenance completeness
+  //  应当显式声明，而不是靠调用方自己拿 total 去减。）
+  const hasMore = d.offset + result.rows.length < result.total;
+
+  return successEnvelope({
+    visibility: d.visibility,
+    total: result.total,
+    limit: d.limit,
+    offset: d.offset,
+    has_more: hasMore,
+    ...(hasMore ? { next_offset: d.offset + result.rows.length } : {}),
+    items: result.rows.map((r) => ({
+      record_id: r.record_id,
+      type: r.type,
+      content: r.content,
+      // 列表必须带状态：visibility=all 时没有它就分不清哪条被撤回了。
+      review_status: normalizeReviewStatus(r.review_status),
+      session_id: r.session_id,
+      version: r.version ?? 0,
+      created_at: r.created_time,
+      updated_at: r.updated_time,
+    })),
+  }, requestId);
+}
+
+async function handleMemoryReviewRetract(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  return handleMemoryReviewStatusChange(body, requestId, deps, "retract");
+}
+
+async function handleMemoryReviewRestore(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  return handleMemoryReviewStatusChange(body, requestId, deps, "restore");
+}
+
 async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
   const parsed = memoryReviewInboxRequestSchema.safeParse(body);
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);

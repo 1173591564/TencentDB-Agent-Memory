@@ -103,6 +103,23 @@ describe("POST /memory/diff", () => {
     expect(created[0].replaced).toEqual([]);
   });
 
+  it("names every change by its event_id (and matches /memory/history)", async () => {
+    const { data } = await call("/v3/memory/diff", { session_id: "ses-y" });
+    const change = data!.changes[0];
+    // 契约：撤销的定位键必须出现在读侧，否则客户端只能按 record_id 撤销。
+    expect(typeof change.event_id).toBe("string");
+    expect(change.event_id as string).toMatch(/^evt-[0-9a-f]{32}$/);
+    // superseded 行也带自己的身份，便于与 history 对账（但它不是写入事件）。
+    const replaced = change.replaced as Array<Record<string, unknown>>;
+    expect(typeof replaced[0].event_id).toBe("string");
+    expect(replaced[0].event_id).not.toBe(change.event_id);
+
+    // 同一 id 在 /memory/history 里能被找到 —— 两个端点说的是同一件事。
+    const hist = await call("/v3/memory/history", { record_id: "m_b" });
+    const histIds = ((hist.data as unknown as { events: Array<{ event_id?: string }> }).events).map((e) => e.event_id);
+    expect(histIds).toContain(change.event_id);
+  });
+
   it("surfaces orphan superseded rows as standalone changes", async () => {
     store.appendMemoryEvent({
       event_ts: "2026-01-02T00:00:00Z", session_key: "sk-x", session_id: "ses-x",
@@ -356,6 +373,53 @@ describe("POST /memory/diff/revert", () => {
     await call("/v3/memory/diff/revert", { record_id: "m_b" });
     const second = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     expect(second.status).toBe(409);
+  });
+
+  it("a record with two extraction writes: event_id picks the reviewed one, never substitutes the newer", async () => {
+    // E1 = m_b supersedes m_a (beforeEach). Add E2 = m_b supersedes m_c, so one
+    // record_id now carries two extraction write events — record_id alone is no
+    // longer an operation identity.
+    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 7000"), decision: decision("m_c", "store") });
+    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 8000"), decision: decision("m_b", "update", ["m_c"], "salary 8000") });
+
+    const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
+    const cards = ((diff.data?.changes ?? []) as Array<Record<string, unknown>>)
+      .filter((c) => c.record_id === "m_b" && c.op === "updated");
+    expect(cards).toHaveLength(2); // the reviewer sees both; they must be distinguishable
+    const [e1, e2] = cards.map((c) => c.event_id as string);
+    expect(e1).toBeTruthy();
+    expect(e2).toBeTruthy();
+    expect(e1).not.toBe(e2);
+
+    // Reviewer clicks the OLDER card.
+    const res = await call("/v3/memory/diff/revert", { record_id: "m_b", event_id: e1 });
+
+    // Hard invariant: E2 must never be reverted behind the reviewer's back.
+    const revertEvents = store.queryMemoryEvents({ record_id: "m_b", op: "reverted" });
+    expect(revertEvents.map((r) => r.target_event_id)).not.toContain(e2);
+
+    if (res.status === 200) {
+      expect(res.data).toMatchObject({ target_event_id: e1 });
+    } else {
+      // Explicit refusal is acceptable; silent substitution is not.
+      expect(res.status).toBe(409);
+      expect(revertEvents).toHaveLength(0);
+      expect((await store.queryL1Records({ recordIds: ["m_b"] })).map((r) => r.record_id)).toEqual(["m_b"]);
+    }
+  });
+
+  it("without event_id the revert still falls back to the newest extraction write (pinned)", async () => {
+    // Pins the documented fallback so any future change to it is a conscious
+    // decision rather than an accident. See the event_id card contract above.
+    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 7000"), decision: decision("m_c", "store") });
+    await writeMemory({ ...writeIso, sessionId: "ses-y", baseDir: dir, vectorStore: store, memory: memory("salary 8000"), decision: decision("m_b", "update", ["m_c"], "salary 8000") });
+    const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
+    const newest = ((diff.data?.changes ?? []) as Array<Record<string, unknown>>)
+      .filter((c) => c.record_id === "m_b" && c.op === "updated").pop()!.event_id as string;
+
+    const res = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    expect(res.status).toBe(200);
+    expect(res.data).toMatchObject({ target_event_id: newest });
   });
 
   it("unknown record → 404", async () => {

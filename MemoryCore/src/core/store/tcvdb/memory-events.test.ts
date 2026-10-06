@@ -128,6 +128,7 @@ describe("tcvdb memory_events record_ids filter", () => {
     });
     (store as unknown as { client: unknown }).client = {
       query: async (_c: string, p: { filter?: string }) => { calls.push(p); return { documents: [] }; },
+      count: async () => 0,
     };
     return { store, calls };
   }

@@ -162,9 +162,9 @@ export function rowMatchesIsolation(
   filter: IsolationFilter | undefined,
 ): boolean {
   if (!filter) return true;
-  if (filter.teamId !== undefined && row.team_id !== filter.teamId) return false;
-  if (filter.userId !== undefined && row.user_id !== filter.userId) return false;
-  if (filter.agentId !== undefined && row.agent_id !== filter.agentId) return false;
+  if (filter.teamId !== undefined && (row.team_id || DEFAULT_ISOLATION_ID) !== (filter.teamId || DEFAULT_ISOLATION_ID)) return false;
+  if (filter.userId !== undefined && (row.user_id || DEFAULT_ISOLATION_ID) !== (filter.userId || DEFAULT_ISOLATION_ID)) return false;
+  if (filter.agentId !== undefined && (row.agent_id || DEFAULT_ISOLATION_ID) !== (filter.agentId || DEFAULT_ISOLATION_ID)) return false;
   if (filter.sessionId !== undefined && row.session_id !== filter.sessionId) return false;
   if (filter.taskId !== undefined && row.task_id !== filter.taskId) return false;
   if (filter.sessionKey !== undefined && row.session_key !== filter.sessionKey) return false;

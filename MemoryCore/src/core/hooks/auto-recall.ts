@@ -20,7 +20,8 @@ import { buildFtsQuery } from "../store/tokenize.js";
 import { hasClientEmbedding, type EmbeddingService, type EmbeddingCallOptions } from "../store/embedding.js";
 import { sanitizeText } from "../../utils/sanitize.js";
 import path from "node:path";
-import { scopeProfileStorageView, type StorageAdapter } from "../storage/adapter.js";
+import { scopeProfileStorageView, StorageAdapter } from "../storage/adapter.js";
+import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
 import {
   DEFAULT_PROFILE_SCOPE,
@@ -159,6 +160,7 @@ async function performAutoRecallCore(params: {
 }): Promise<RecallResult | undefined> {
   const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService, storage } = params;
   const tRecallStart = performance.now();
+  if (!vectorStore || vectorStore.isDegraded() || !vectorStore.queryMemoryEvents) throw RecallErrors.dependencyUnavailable("review ledger");
 
   // L2/L3 writers scope profile files by team+agent. Recall resolves the same
   // scope and never falls back to the unscoped data root, preventing cross-scope
@@ -170,9 +172,11 @@ async function performAutoRecallCore(params: {
     ? path.join(pluginDataDir, "profiles", encodeURIComponent(profileScope))
     : pluginDataDir;
   // rowfs 后端在 scopeProfileStorageView 内改走隔离重绑定（D12 ③），不套键前缀。
-  const profileStorage = storage && isScopedProfile
+  let profileStorage = storage && isScopedProfile
     ? scopeProfileStorageView(storage, `profiles/${encodeURIComponent(profileScope)}/`, profileIsolation)
     : storage;
+  profileStorage ??= new StorageAdapter(createLocalStorageBackend(profileDataDir));
+  profileStorage = profileStorage.withReviewStore(() => vectorStore).withBackend(profileStorage.getBackend(), profileIsolation, true);
 
   // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
   const tSearchStart = performance.now();
@@ -207,20 +211,14 @@ async function performAutoRecallCore(params: {
   const tPersonaStart = performance.now();
   let personaContent: string | undefined;
   try {
-    let raw: string | null = null;
-    if (profileStorage) {
-      raw = await profileStorage.readFile(StoragePaths.persona);
-    } else {
-      const fs = await import("node:fs/promises");
-      raw = await fs.default.readFile(path.join(profileDataDir, "persona.md"), "utf-8");
-    }
+    const raw = await profileStorage.readFile(StoragePaths.persona);
     if (raw) {
       personaContent = stripSceneNavigation(raw).trim();
       if (!personaContent) personaContent = undefined;
     }
     logger?.debug?.(`${TAG} Persona loaded: ${personaContent ? `${personaContent.length} chars` : "empty"}`);
-  } catch {
-    logger?.debug?.(`${TAG} No persona file found (expected for new users)`);
+  } catch (err) {
+    throw RecallErrors.storageError("profile review", err);
   }
   const tPersonaEnd = performance.now();
 

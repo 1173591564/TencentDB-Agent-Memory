@@ -1,4 +1,5 @@
 import type { MemoryEvent } from "./types.js";
+import { decodeReview } from "./review.js";
 
 /**
  * Shared field-dictionary → MemoryEvent normalization for every store
@@ -11,18 +12,20 @@ export type MemoryEventFields = Readonly<Record<string, unknown>>;
 const str = (v: unknown): string => String(v ?? "");
 const opt = (v: unknown): string | undefined => str(v) || undefined;
 
-/** Decode a JSON-encoded `supersedes` column; malformed → none. */
+/** Decode legacy empty lineage; malformed nonempty lineage must fail closed. */
 export function parseSupersedesJson(json: string): string[] {
-  try {
-    return JSON.parse(json) as string[];
-  } catch {
-    return [];
-  }
+  if (!json) return [];
+  let value: unknown;
+  try { value = JSON.parse(json) as unknown; }
+  catch { throw new Error("Invalid supersession lineage"); }
+  if (!Array.isArray(value) || !value.every((id) => typeof id === "string" && id.length > 0 && id.length <= 1024)) throw new Error("Invalid supersession lineage");
+  return value;
 }
 
 export function decodeMemoryEvent(f: MemoryEventFields, supersedes: string[]): MemoryEvent {
   return {
     event_id: opt(f.event_id),
+    ...(f.review !== undefined || f.review_json ? { review: decodeReview(f.review ?? f.review_json) } : {}),
     event_ts: str(f.event_ts),
     session_key: str(f.session_key),
     session_id: str(f.session_id),

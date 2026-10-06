@@ -343,6 +343,7 @@ describe("tcvdb memory_events document id uniqueness", () => {
     const docs = new Map<string, Record<string, unknown>>();
     const upsertCalls: Array<Array<Record<string, unknown>>> = [];
     const stubClient = {
+      count: async () => docs.size,
       upsert: async (_collection: string, batch: Array<Record<string, unknown>>) => {
         upsertCalls.push(batch);
         for (const d of batch) docs.set(String(d.id), d);

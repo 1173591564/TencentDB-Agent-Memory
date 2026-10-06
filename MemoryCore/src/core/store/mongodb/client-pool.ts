@@ -148,18 +148,16 @@ function endpointKey(cfg: MongoConfig): string {
 /**
  * Client options for every pooled data-plane client.
  *
- * Write concern `w:1` (D15): memory data is derived and rebuildable, so
- * primary-ack is enough. The server-side implicit default since MongoDB 5.0
- * is `w:majority` — it buys rollback durability we don't need at real
- * replication-latency cost. Ordering and read-your-writes on the primary are
- * unaffected (w:1 is still acknowledged, just not replication-confirmed).
+ * Review decisions are authoritative, not rebuildable extraction output:
+ * journaled majority writes and primary majority reads must not acknowledge
+ * a retraction that a failover can lose or a lagging secondary cannot see.
  *
  * Scope note: the metadata store (`src/metadata/store/factory.ts`) builds its
  * own clients and is NOT covered — its multi-document transactions keep the
  * server default.
  */
 export function buildMongoClientOptions(cfg: MongoConfig): MongoClientOptions {
-  const options: MongoClientOptions = { writeConcern: { w: 1 } };
+  const options: MongoClientOptions = { writeConcern: { w: "majority", j: true }, readPreference: "primary", readConcern: { level: "majority" } };
   if (cfg.user) options.auth = { username: cfg.user, password: cfg.password };
   return options;
 }

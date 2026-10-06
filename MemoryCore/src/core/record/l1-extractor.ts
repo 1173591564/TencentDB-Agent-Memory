@@ -366,14 +366,15 @@ export async function extractL1Memories(params: {
         vectorStore: options.vectorStore,
         embeddingService: options.embeddingService,
         storage,
+        startedAt: new Date(l1StartMs).toISOString(),
       });
 
     } catch (err) {
-      logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
-      storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage);
+      logger?.warn?.(`${TAG} Batch dedup could not be verified; refusing blind new writes: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   } else {
-    storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage);
+    storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage, new Date(l1StartMs).toISOString());
   }
 
   const logStorage = storage ?? new StorageAdapter(new LocalStorageBackend(baseDir));
@@ -713,6 +714,7 @@ async function applyDecisions(params: {
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
   storage?: StorageAdapter;
+  startedAt?: string;
 }): Promise<MemoryRecord[]> {
   const { memoriesWithIds, decisions, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, vectorStore, embeddingService, storage } = params;
   const storedRecords: MemoryRecord[] = [];
@@ -734,6 +736,7 @@ async function applyDecisions(params: {
       const record = await writeMemory({
         memory: memoryWithId,
         decision,
+        startedAt: params.startedAt,
         baseDir,
         sessionKey,
         sessionId,
@@ -776,6 +779,7 @@ async function storeAllDirectly(
   vectorStore?: IMemoryStore,
   embeddingService?: EmbeddingService,
   storage?: StorageAdapter,
+  startedAt?: string,
 ): Promise<MemoryRecord[]> {
   const storedRecords: MemoryRecord[] = [];
 
@@ -783,6 +787,7 @@ async function storeAllDirectly(
     try {
       const record = await writeMemory({
         memory: memoryWithId,
+        startedAt,
         decision: {
           record_id: memoryWithId.record_id,
           action: "store",

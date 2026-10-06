@@ -6,7 +6,7 @@ import { listLocalProfiles } from "../../src/core/profile/profile-sync.js";
 import { createBM25Encoder } from "../../src/core/store/bm25-local.js";
 import { VectorStore, type L0RecordRow } from "../../src/core/store/sqlite/memory-store.js";
 import { TcvdbMemoryStore } from "../../src/core/store/tcvdb/memory-store.js";
-import type { L0Record, L1RecordRow, ProfileRecord, ProfileSyncRecord, StoreInitResult } from "../../src/core/store/types.js";
+import type { L0Record, L1RecordRow, L1CountFilter, MemoryEvent, ProfileRecord, ProfileSyncRecord, StoreInitResult } from "../../src/core/store/types.js";
 import { readManifest } from "../../src/utils/manifest.js";
 import {
   rewriteMigrationManifest as rewriteMigrationManifestDefault,
@@ -73,6 +73,7 @@ export interface MigrationPreflightSummary {
   source: {
     l0Count: number;
     l1Count: number;
+    ledgerEventsPresent: boolean;
     profileCount: number;
     manifestExists: boolean;
     manifestStoreType: "sqlite" | "tcvdb" | "mongodb" | null;
@@ -98,6 +99,7 @@ export interface MigrationPreflightSummary {
   migration?: {
     l0Migrated: number;
     l1Migrated: number;
+    eventsMigrated: number;
     profileMigrated: number;
     targetL0Count: number;
     targetL1Count: number;
@@ -118,7 +120,8 @@ export interface MigrationTargetStore {
   upsertL0(record: L0Record, embedding?: Float32Array): Promise<boolean> | boolean;
   upsertL1Batch?(records: MemoryRecord[]): Promise<number>;
   upsertL0Batch?(records: L0Record[]): Promise<number>;
-  countL1(): Promise<number> | number;
+  countL1(filter?: L1CountFilter): Promise<number> | number;
+  appendMemoryEvent?(event: MemoryEvent): Promise<void> | void;
   countL0(): Promise<number> | number;
   pullProfiles?(): Promise<ProfileRecord[]>;
   syncProfiles?(records: ProfileSyncRecord[]): Promise<void>;
@@ -238,6 +241,7 @@ function buildEmptySummary(options: ResolvedMigrationCliOptions): MigrationPrefl
     source: {
       l0Count: 0,
       l1Count: 0,
+      ledgerEventsPresent: false,
       profileCount: 0,
       manifestExists: false,
       manifestStoreType: null,
@@ -310,6 +314,10 @@ function mapL1RowToMemoryRecord(row: L1RecordRow): MemoryRecord {
     updatedAt: row.updated_time || row.created_time || fallbackIso,
     sessionKey: row.session_key || "",
     sessionId: row.session_id || "",
+    teamId: row.team_id, userId: row.user_id, agentId: row.agent_id, taskId: row.task_id || undefined,
+    version: row.version, review_status: row.review_status,
+    review_sources: JSON.parse(row.review_sources_json || "[]") as string[],
+    review_guard_at: row.review_guard_at,
   };
 }
 
@@ -322,6 +330,7 @@ function mapL0RowToRecord(row: L0RecordRow): L0Record {
     messageText: row.message_text,
     recordedAt: row.recorded_at || "",
     timestamp: row.timestamp ?? 0,
+    teamId: row.team_id, userId: row.user_id, agentId: row.agent_id, taskId: row.task_id || undefined,
   };
 }
 
@@ -352,7 +361,7 @@ async function ensureTargetIsEmpty(
   if (!options.failIfTargetNonempty) return;
 
   const [existingL1, existingL0, existingProfiles] = await Promise.all([
-    Promise.resolve(targetStore.countL1()),
+    Promise.resolve(targetStore.countL1({ visibility: "all" })),
     Promise.resolve(targetStore.countL0()),
     targetStore.pullProfiles ? targetStore.pullProfiles().then((records) => records.length) : Promise.resolve(0),
   ]);
@@ -371,15 +380,15 @@ async function migrateL1Records(sourceStore: VectorStore, targetStore: Migration
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const rows = sourceStore.queryL1RecordsCursor(cursor, pageSize);
+    const rows = sourceStore.queryL1RecordsCursor(cursor, pageSize, { review: false });
     if (rows.length === 0) break;
 
     const records = rows.map(mapL1RowToMemoryRecord);
 
     if (useBatch) {
       const count = await targetStore.upsertL1Batch!(records);
-      if (count === 0) {
-        throw new Error(`Failed to batch migrate L1 records (cursor=${cursor}, page=${rows.length})`);
+      if (count !== records.length) {
+        throw new Error(`Partial batch migrate L1 records (cursor=${cursor}, written=${count}, page=${rows.length})`);
       }
     } else {
       for (const record of records) {
@@ -399,6 +408,20 @@ async function migrateL1Records(sourceStore: VectorStore, targetStore: Migration
   return migrated;
 }
 
+export async function migrateReviewLedger(sourceStore: VectorStore, targetStore: MigrationTargetStore): Promise<number> {
+  let migrated = 0;
+  for (let offset = 0; ; offset += 1000) {
+    if (offset >= 500_000) throw new Error("Migration ledger budget exceeded; source must be partitioned offline");
+    const events = sourceStore.queryMemoryEvents({ limit: 1000, offset });
+    if (events.length && !targetStore.appendMemoryEvent) throw new Error("Target cannot preserve the review ledger");
+    for (const event of events) {
+      await targetStore.appendMemoryEvent!(event);
+      migrated++;
+    }
+    if (events.length < 1000) return migrated;
+  }
+}
+
 async function migrateL0Records(sourceStore: VectorStore, targetStore: MigrationTargetStore, pageSize: number): Promise<number> {
   let migrated = 0;
   let cursor = "";
@@ -413,8 +436,8 @@ async function migrateL0Records(sourceStore: VectorStore, targetStore: Migration
 
     if (useBatch) {
       const count = await targetStore.upsertL0Batch!(records);
-      if (count === 0) {
-        throw new Error(`Failed to batch migrate L0 records (cursor=${cursor}, page=${rows.length})`);
+      if (count !== records.length) {
+        throw new Error(`Partial batch migrate L0 records (cursor=${cursor}, written=${count}, page=${rows.length})`);
       }
     } else {
       for (const record of records) {
@@ -464,7 +487,7 @@ async function verifyMigratedCounts(
   log("开始校验迁移数量...");
 
   const [l1Count, l0Count, profileCount] = await Promise.all([
-    Promise.resolve(targetStore.countL1()),
+    Promise.resolve(targetStore.countL1({ visibility: "all" })),
     Promise.resolve(targetStore.countL0()),
     targetStore.pullProfiles ? targetStore.pullProfiles().then((records) => records.length) : Promise.resolve(0),
   ]);
@@ -679,7 +702,8 @@ export async function collectMigrationPreflight(
       },
       source: {
         l0Count: store.countL0(),
-        l1Count: store.countL1(),
+        l1Count: store.countL1({ visibility: "all" }),
+        ledgerEventsPresent: store.queryMemoryEvents({ limit: 1 }).length > 0,
         profileCount: profiles.length,
         manifestExists: manifest !== null,
         manifestStoreType: manifest?.store.type ?? null,
@@ -718,7 +742,7 @@ export async function runMigrationCli(
   log(`预检完成: 源数据 L1=${summary.source.l1Count}, L0=${summary.source.l0Count}, Profiles=${summary.source.profileCount}`);
   log(`目标: ${summary.target.url} / ${summary.target.database}`);
 
-  const hasSourceData = summary.source.l0Count > 0 || summary.source.l1Count > 0 || summary.source.profileCount > 0;
+  const hasSourceData = summary.source.l0Count > 0 || summary.source.l1Count > 0 || summary.source.profileCount > 0 || summary.source.ledgerEventsPresent;
 
   if (!hasSourceData) {
     log("源数据为空，跳过数据迁移。");
@@ -737,6 +761,7 @@ export async function runMigrationCli(
 
   const migration = {
     l1Migrated: 0,
+    eventsMigrated: 0,
     l0Migrated: 0,
     profileMigrated: 0,
     targetL1Count: 0,
@@ -771,6 +796,7 @@ export async function runMigrationCli(
       log(`分页大小: ${pageSize} 条/批`);
 
       migration.l1Migrated = options.layers.includes("l1") ? await migrateL1Records(sourceStore, targetStore, pageSize) : 0;
+      migration.eventsMigrated = await migrateReviewLedger(sourceStore, targetStore);
       migration.l0Migrated = options.layers.includes("l0") ? await migrateL0Records(sourceStore, targetStore, pageSize) : 0;
       migration.profileMigrated = options.layers.includes("l2") || options.layers.includes("l3")
         ? await migrateProfiles(options.pluginDataDir, targetStore)
@@ -781,7 +807,7 @@ export async function runMigrationCli(
       const verifiedCounts = options.verifyCounts
         ? await verifyMigratedCounts(summary, targetStore, verifyDelayMs)
         : {
-            l1Count: await Promise.resolve(targetStore.countL1()),
+            l1Count: await Promise.resolve(targetStore.countL1({ visibility: "all" })),
             l0Count: await Promise.resolve(targetStore.countL0()),
             profileCount: targetStore.pullProfiles ? (await targetStore.pullProfiles()).length : 0,
           };
@@ -833,6 +859,7 @@ export async function runMigrationCli(
 
   summary.migration = {
     l1Migrated: migration.l1Migrated,
+    eventsMigrated: migration.eventsMigrated,
     l0Migrated: migration.l0Migrated,
     profileMigrated: migration.profileMigrated,
     targetL1Count: migration.targetL1Count,

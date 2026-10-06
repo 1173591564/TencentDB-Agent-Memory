@@ -19,6 +19,8 @@ import { VectorStore } from "../core/store/sqlite/memory-store.js";
 import { __setMemoryReviewEnabledForTests } from "../core/store/visibility.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { handleV2Route, type V2RouterDeps } from "./v2-router.js";
+import { StorageAdapter, scopeProfileStorageView } from "../core/storage/adapter.js";
+import { createLocalStorageBackend } from "../core/storage/factory.js";
 
 function rec(over: Partial<MemoryRecord> & { id: string; content: string }): MemoryRecord {
   return {
@@ -118,6 +120,26 @@ describe("POST /memory/review/retract|restore", () => {
     expect(retracted[0].reviewer_id ?? "").toBe("");
     expect(retracted[0].reviewer_id).not.toBe("attacker");
     expect(retracted[0].record_id).toBe("m_2");
+  });
+
+  it("rejects whitespace, oversized and control-character record identities before querying", async () => {
+    for (const record_id of ["   ", "x".repeat(1025), "unsafe\nid"]) {
+      const result = await call("/v3/memory/review/retract", { record_id, reason: "r" });
+      expect(result.status).toBe(400);
+    }
+    expect(store.queryMemoryEvents({})).toEqual([]);
+  });
+
+  it("an explicit empty task scope can replay its committed receipt without becoming not_found", async () => {
+    store.upsertL1(rec({ id: "task_empty", content: "fact" }), undefined);
+    const body = { record_id: "task_empty", task_id: "", reason: "r", operation_id: "empty-task-operation" };
+    const first = await call("/v3/memory/review/retract", body);
+    const retry = await call("/v3/memory/review/retract", body);
+    expect(first.status).toBe(200);
+    expect(retry.status).toBe(200);
+    expect(retry.data).toMatchObject({ changed: ["task_empty"], not_found: [] });
+    expect(retry.data?.event_ids).toEqual(first.data?.event_ids);
+    expect(store.queryMemoryEvents({ record_id: "task_empty", op: "retracted" })).toHaveLength(1);
   });
 
   it("DP-18 幂等：重复撤回进 no_op，且不写第二条账本事件", async () => {
@@ -343,6 +365,66 @@ describe("POST /memory/review/retract|restore", () => {
     const r = await call("/v3/memory/diff/revert", { record_id: "m_revert_hidden" });
     expect(r.status).toBe(200);
     expect(store.queryL1Records({ recordIds: ["m_revert_hidden"], visibility: "all" })).toEqual([]);
+  });
+
+  it("downstream scan failure is disclosed even on no-op and never changes committed review success", async () => {
+    store.upsertL1(rec({ id: "scan", content: "fact" }), undefined);
+    const result = await call("/v3/memory/review/retract", { record_id: "scan", reason: "r" });
+    expect(result.status).toBe(200);
+    expect(result.data?.downstream).toMatchObject({ scan: "failed", lineage_analyzed: false });
+    const repeat = await call("/v3/memory/review/retract", { record_id: "scan", reason: "r" }, ISO_HEADERS, { getStorage: () => undefined });
+    expect(repeat.data?.downstream).toMatchObject({ scan: "unavailable", artifacts: [] });
+    expect(repeat.data?.no_op).toEqual(["scan"]);
+  });
+
+  it("derived review verifies current bytes without restoring the wrong L1 fact", async () => {
+    const base = new StorageAdapter(createLocalStorageBackend(path.join(dir, "data")));
+    const scoped = scopeProfileStorageView(base, `profiles/${encodeURIComponent("team:t1|agent:a1")}/`, { teamId: "t1", agentId: "a1" });
+    await scoped.writeFile("persona.md", "reviewed derived text");
+    store.upsertL1(rec({ id: "m_derived", content: "wrong" }), undefined);
+    await call("/v3/memory/review/retract", { record_id: "m_derived", reason: "r" });
+    const overrides = { getStorage: () => base };
+    const read = await call("/v3/memory/review/derived", { path: "persona.md" }, ISO_HEADERS, overrides);
+    expect(read.status).toBe(200);
+    expect(read.data).toMatchObject({ content: "reviewed derived text", blocked: true });
+    const ack = await call("/v3/memory/review/derived", { path: "persona.md", acknowledge: true, expected_hash: read.data?.content_hash, expected_fence: read.data?.fence_hash, reason: "manually checked", operation_id: "ack" }, ISO_HEADERS, overrides);
+    expect(ack.status).toBe(200);
+    expect(ack.data).toMatchObject({ acknowledged: true, still_blocked: false });
+    expect(store.queryMemoryEvents({ source: "review", layer: "l3" })[0]?.user_id).toBe("default");
+    expect(store.queryL1Records({ recordIds: ["m_derived"], visibility: "all" })[0]?.review_status).toBe("quarantined");
+    store.upsertL1(rec({ id: "later_review", content: "second wrong fact" }), undefined);
+    await call("/v3/memory/review/retract", { record_id: "later_review", reason: "new review" });
+    const outdatedFence = await call("/v3/memory/review/derived", { path: "persona.md", acknowledge: true, expected_hash: read.data?.content_hash, expected_fence: read.data?.fence_hash, reason: "old confirmation" }, ISO_HEADERS, overrides);
+    expect(outdatedFence.status).toBe(409);
+    const reread = await call("/v3/memory/review/derived", { path: "persona.md" }, ISO_HEADERS, overrides);
+    expect(reread.data?.blocked).toBe(true);
+    await scoped.writeFile("persona.md", "changed text");
+    const stale = await call("/v3/memory/review/derived", { path: "persona.md", acknowledge: true, expected_hash: read.data?.content_hash, expected_fence: read.data?.fence_hash, reason: "r" }, ISO_HEADERS, overrides);
+    expect(stale.status).toBe(409);
+    const escaped = await call("/v3/memory/review/derived", { path: "../private" }, ISO_HEADERS, overrides);
+    expect(escaped.status).toBe(400);
+  });
+
+  it("operation identity is replayed, not re-executed after a later restore", async () => {
+    store.upsertL1(rec({ id: "m_key", content: "keyed" }), undefined);
+    const first = await call("/v3/memory/review/retract", { record_id: "m_key", reason: "r", operation_id: "first" });
+    await call("/v3/memory/review/restore", { record_id: "m_key" });
+    const retry = await call("/v3/memory/review/retract", { record_id: "m_key", reason: "r", operation_id: "first" });
+    expect(retry.data?.event_ids).toEqual(first.data?.event_ids);
+    expect(store.queryL1Records({ recordIds: ["m_key"] })).toHaveLength(1);
+    const changed = await call("/v3/memory/review/retract", { record_id: "m_key", reason: "different", operation_id: "first" });
+    expect(changed.status).toBe(409);
+  });
+
+  it("historical controls remain listable and restorable without recreating rows", async () => {
+    store.upsertL1(rec({ id: "m_history", content: "history" }), undefined);
+    await call("/v3/memory/review/retract", { record_id: "m_history", reason: "r" });
+    store.deleteL1("m_history");
+    const list = await call("/v3/memory/review/list", {});
+    expect(list.data?.items).toEqual(expect.arrayContaining([expect.objectContaining({ record_id: "m_history", exists: false, review_status: "quarantined" })]));
+    const restored = await call("/v3/memory/review/restore", { record_id: "m_history" });
+    expect(restored.status).toBe(200);
+    expect(store.queryL1Records({ recordIds: ["m_history"], visibility: "all" })).toEqual([]);
   });
 
   it("DP-01 撤回不断审计链：/memory/history 仍能查到这条记忆", async () => {

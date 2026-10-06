@@ -19,7 +19,7 @@ import type http from "node:http";
 import { classifyError } from "./error-handler.js";
 import type { IMemoryStore, L0Record, L1RecordRow, MemoryEvent, MemoryEventFilter, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
-import { scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
+import { scopeProfileStorageView, StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
 import type { IStateBackend } from "../core/state/types.js";
@@ -29,6 +29,8 @@ import { executeConversationSearch } from "../core/tools/conversation-search.js"
 import { appendRevertTombstone, type MemoryRecord } from "../core/record/l1-writer.js";
 import { appendLedgerEvent, getLedgerHealth, hasPendingLedgerEvent, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
 import type { ReviewStatus } from "../core/store/visibility.js";
+import { ReviewConflictError, derivedProfileAllowed, historicalReviewRows, profileReviewFence, resolveReviewRows } from "../core/store/review.js";
+import { newMemoryEventId } from "../core/store/memory-event-id.js";
 import { normalizeReviewStatus, isMemoryReviewEnabled } from "../core/store/visibility.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
@@ -58,6 +60,7 @@ import {
   memoryReviewListRequestSchema,
   memoryReviewRetractRequestSchema,
   memoryReviewRestoreRequestSchema,
+  memoryDerivedReviewRequestSchema,
   memoryLedgerStatusRequestSchema,
   memoryLedgerBackfillRequestSchema,
   teamCreateRequestSchema,
@@ -190,6 +193,7 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/memory/review/list",
   "/memory/review/retract",
   "/memory/review/restore",
+  "/memory/review/derived",
   "/memory/ledger/status",
   "/memory/ledger/backfill",
 ]);
@@ -535,6 +539,7 @@ const DATAPLANE_HANDLERS: Record<string, RouteHandler> = {
   "/memory/review/list": withLedgerQueryGuard(handleMemoryReviewList),
   "/memory/review/retract": withLedgerQueryGuard(handleMemoryReviewRetract),
   "/memory/review/restore": withLedgerQueryGuard(handleMemoryReviewRestore),
+  "/memory/review/derived": withLedgerQueryGuard(handleMemoryDerivedReview),
   "/memory/ledger/status": withLedgerQueryGuard(handleMemoryLedgerStatus),
   "/memory/ledger/backfill": withLedgerQueryGuard(handleMemoryLedgerBackfill),
 };
@@ -677,7 +682,7 @@ export async function handleV2Route(
       ...deps,
       getStore: () => resolved.store,
       getEmbedding: () => resolved.embedding,
-      getStorage: () => resolvedStorage,
+      getStorage: () => resolvedStorage instanceof StorageAdapter ? resolvedStorage.withReviewStore(() => resolved.store) : resolvedStorage,
     };
 
     const bodyStart = Date.now();
@@ -709,7 +714,7 @@ export async function handleV2Route(
     // and must not be blocked by per-agent memory isolation.
     // Runtime default comes from server.ts/env and is OFF;
     // undefined keeps strict in direct router tests for backward compatibility.
-    const reviewScopeRequired = ["/memory/review/list", "/memory/review/retract", "/memory/review/restore"]
+    const reviewScopeRequired = ["/memory/review/list", "/memory/review/retract", "/memory/review/restore", "/memory/review/derived"]
       .some((subpath) => pathname === `${V2_PREFIX}${subpath}` || pathname === `${V3_PREFIX}${subpath}`);
     if (reviewScopeRequired) {
       const missing = collectV3Missing(pathname, body as Record<string, unknown> | undefined, headers);
@@ -1274,7 +1279,7 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
 
   // Read existing record by primary key — strict: a failed query returning []
   // would misreport a degraded backend as "not found".
-  const existing = await store.queryL1Records({ recordIds: [id] }, { strict: true });
+  const existing = await store.queryL1Records({ recordIds: [id], visibility: "all" }, { strict: true });
   if (!existing || existing.length === 0) {
     return errorEnvelope(404, `Atomic note not found: ${id}`, requestId);
   }
@@ -1312,6 +1317,9 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
     createdAt: record.created_time,
     updatedAt: now,
     version: updatedVersion,
+    expected_existing: true,
+    review_sources: JSON.parse(record.review_sources_json ?? "[]") as string[],
+    review_guard_at: record.review_guard_at,
     sessionKey: record.session_key ?? "",
     sessionId: record.session_id ?? iso?.sessionId ?? "",
     taskId: record.task_id ?? iso?.taskId,
@@ -1842,6 +1850,8 @@ function rowToMemoryRecord(row: L1RecordRow): MemoryRecord {
     createdAt: row.created_time,
     updatedAt: new Date().toISOString(),
     version: row.version,
+    review_sources: JSON.parse(row.review_sources_json ?? "[]") as string[],
+    review_status: row.review_status,
     sessionKey: row.session_key,
     sessionId: row.session_id,
     taskId: row.task_id || undefined,
@@ -1851,8 +1861,8 @@ function rowToMemoryRecord(row: L1RecordRow): MemoryRecord {
   };
 }
 
-async function upsertSnapshot(store: RevertStore, snapshotJson: string, deps: V2RouterDeps): Promise<string> {
-  const restored = rowToMemoryRecord(JSON.parse(snapshotJson) as L1RecordRow);
+async function upsertSnapshot(store: RevertStore, snapshotJson: string, deps: V2RouterDeps, guardAt: string): Promise<string> {
+  const restored = { ...rowToMemoryRecord(JSON.parse(snapshotJson) as L1RecordRow), review_guard_at: guardAt };
   let emb: Float32Array | undefined;
   try {
     emb = await deps.getEmbedding()?.embed(restored.content);
@@ -2155,7 +2165,7 @@ async function revertOneL1RecordInner(
   const missingIds: string[] = [];
   if (isManualEdit) {
     try {
-      await upsertSnapshot(store, target.snapshot_json!, deps);
+      await upsertSnapshot(store, target.snapshot_json!, deps, target.event_ts);
     } catch (err) {
       deps.logger.warn(`${TAG} revert restore failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
       return fail(500, `Failed to restore pre-edit snapshot of ${recordId} — retry is allowed`);
@@ -2191,7 +2201,7 @@ async function revertOneL1RecordInner(
         continue;
       }
       try {
-        restoredIds.push(await upsertSnapshot(store, snap.snapshot_json, deps));
+        restoredIds.push(await upsertSnapshot(store, snap.snapshot_json, deps, target.event_ts));
       } catch (err) {
         deps.logger.warn(`${TAG} revert restore failed for ${targetId}: ${err instanceof Error ? err.message : String(err)}`);
         failedIds.push(targetId);
@@ -2238,7 +2248,7 @@ async function revertOneL1RecordInner(
     memory_type: target.memory_type,
     version: target.version,
     supersedes: restoredIds,
-    reviewer_id: opts.reviewerId ?? iso?.userId,
+    reviewer_id: opts.reviewerId,
     source: "review",
   } });
   // 标记未进 store 时该记录进入 pending 集合：再次 revert 会被 pending 守卫
@@ -2251,7 +2261,7 @@ async function revertOneL1RecordInner(
   if (!isManualEdit) {
     tombstoneOk = await appendRevertTombstone({
       recordId,
-      reviewerId: opts.reviewerId ?? iso?.userId,
+      reviewerId: opts.reviewerId,
       storage: deps.getStorage(),
       logger: deps.logger,
     });
@@ -2387,11 +2397,11 @@ async function handleMemoryHistory(body: unknown, _auth: V2AuthContext, requestI
  * 它与 revert 是两个轴：revert 退的是一次写入事件，retract 改的是一条记忆的可见性。
  *
  * 实现要点：
- *  - 状态与账本分开写；持久一致性及状态投影尚未实现，见 docs/change-ledger.md。
- *  - 幂等：已处于目标状态 ⇒ 不写第二条账本事件，计入 no_op（DP-18）。
+ *  - 先提交审核账本事实，消费读按 observed-token 协议推导；outbox 只镜像已提交事件。
+ *  - operation_id 重试返回原收据；无变化请求可留下 no-op 收据，不取消未来撤回。
  *  - 租户：作用域取请求 isolation，store 侧再核一次；跨租户返回 not_found 而非 403，
  *    避免用错误码探测他人 record 是否存在。
- *  - reviewer_id 只取服务端 isolation，不接受请求体传入（DP-19）。
+ *  - reviewer_id 只取显式请求头声明，不回落记忆所有者，也不等同认证身份。
  */
 async function handleMemoryReviewStatusChange(
   body: unknown,
@@ -2404,8 +2414,7 @@ async function handleMemoryReviewStatusChange(
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
 
   if (!isMemoryReviewEnabled()) {
-    // DP-23：开关关着就不该接受写操作 —— 否则会积累一批读路径不生效的"已撤回"记录，
-    // 运维以为撤掉了，实际还在喂给模型。
+    // 部署开关只控制新审核写入；关闭后既有消费抑制继续生效。
     return errorEnvelope(403, "Memory review is disabled on this gateway (set TDAI_MEMORY_REVIEW_ENABLED to enable)", requestId);
   }
 
@@ -2430,94 +2439,42 @@ async function handleMemoryReviewStatusChange(
   }
 
   const targetStatus: ReviewStatus = mode === "retract" ? "quarantined" : "active";
-  const op = mode === "retract" ? "retracted" : "restored";
+  const operationId = d.operation_id ?? randomUUID();
   const changed: string[] = [];
   const noOp: string[] = [];
   const notFound: string[] = [];
-  let ledgerPending = false;
+  const events: Record<string, string> = {};
+  let outboxPending = false;
 
   for (const recordId of recordIds) {
-    let res: { changed: boolean; previous: ReviewStatus } | undefined;
     try {
-      res = await store.setL1ReviewStatus(recordId, targetStatus, filter);
+      const identity = `rop-${createHash("sha256").update(JSON.stringify([iso.teamId, iso.userId, iso.agentId, iso.taskId ?? null, recordId, operationId])).digest("hex")}`;
+      const result = await store.setL1ReviewStatus(recordId, targetStatus, filter, {
+        operation_id: identity, request_id: requestId, reviewer_id: deps.requestReviewerId,
+        reason: d.reason, persist_no_op: d.operation_id !== undefined,
+      });
+      if (!result) { notFound.push(recordId); continue; }
+      if (result.event) {
+        events[recordId] = result.event.event_id!;
+        const mirrored = await appendLedgerEvent({ store, storage: deps.getStorage(), logger: deps.logger, event: result.event, storeAlreadyCommitted: true });
+        if (deps.getStorage() && !mirrored.jsonl) outboxPending = true;
+      }
+      (result.changed ? changed : noOp).push(recordId);
     } catch (err) {
       deps.logger.warn(`${TAG} review ${mode} failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
-      return errorEnvelope(503, `Failed to ${mode} record ${recordId} — retry is allowed`, requestId, {
-        partial: { changed, no_op: noOp, not_found: notFound }, failed_record_id: recordId,
-        ...(ledgerPending ? { ledger_pending: true } : {}),
+      return errorEnvelope(err instanceof ReviewConflictError ? 409 : 503, "Review operation could not be confirmed; retry with the same operation_id", requestId, {
+        operation_id: operationId, partial: { changed, no_op: noOp, not_found: notFound, event_ids: events },
+        failed_record_id: recordId, commit_unknown: !(err instanceof ReviewConflictError),
       });
     }
-    if (!res) { notFound.push(recordId); continue; }
-    if (!res.changed) { noOp.push(recordId); continue; }
-
-    // 取记录自身的租户/session 归属写账本（与既有账本行口径一致：
-    // 请求方身份只进 reviewer_id）。
-    const row = (await store.queryL1Records({ recordIds: [recordId], ...filter, visibility: "all" }))[0];
-    const { store: ledgerOk } = await appendLedgerEvent({
-      store, storage: deps.getStorage(), logger: deps.logger,
-      event: {
-        event_ts: new Date().toISOString(),
-        session_key: row?.session_key ?? "",
-        session_id: row?.session_id ?? "",
-        team_id: row?.team_id ?? iso.teamId ?? "",
-        user_id: row?.user_id ?? iso.userId,
-        agent_id: row?.agent_id ?? iso.agentId,
-        task_id: row?.task_id ?? iso.taskId ?? "",
-        op,
-        record_id: recordId,
-        content: row?.content ?? "",
-        ...(d.reason ? { reason: d.reason } : {}),
-        version: row?.version,
-        // DP-35：reviewer_id 要么是**真的操作者**，要么留空 —— 绝不回落成 iso.userId。
-        //
-        // 本接口的 isolation 作用域就是用来定位这条记录的过滤器，即**记忆所有者**，
-        // 不是操作者。回落等于把数据主体写成审核人：既伪造了一条"本人自查"的
-        // 审计记录，又与真正的本人自查无法区分 —— 审计链在最关键的一格上失真。
-        // 空值是诚实的（"操作者未声明"），假值不是。
-        //
-        // 上游 PR #1539 的评审（LeonSGP43）正是在 Panel 侧点出这条：User Key
-        // 会话下代理不传 reviewerId，Core 回落后"跨用户撤销可能误记操作者"。
-        // Panel 侧要修，但根因在 Core 的回落上 —— 调用方忘了传，不该由 Core
-        // 编一个出来。基线 revert 有同样的回落（event-ledger 侧），已登记为发现项，
-        // 但不在本轮改动范围（会改变既有行为）。
-        ...(deps.requestReviewerId ? { reviewer_id: deps.requestReviewerId } : {}),
-        source: "review",
-      },
-    });
-    if (!ledgerOk) {
-      ledgerPending = true;
-      deps.logger.warn(`${TAG} ${op} event not in store yet for ${recordId} (pending backfill)`);
-    }
-    changed.push(recordId);
   }
-
-  // DP-31：撤回 L1 不会改写 L2 场景块 / L3 画像 —— 它们是派生出来的独立文件，
-  // 仍被 auto-recall 注入每一次 prompt。不在响应里说这件事，调用方会以为
-  // "撤回完成了"，而错误内容继续生效 —— 整个机制形同虚设。
-  const downstream = mode === "retract" && changed.length > 0
-    ? await collectDownstreamArtifacts(deps)
-    : undefined;
-
-  // 调用方必须能分辨这批审计记录有没有操作者署名 —— 否则事后无从追责。
-  if (!deps.requestReviewerId && changed.length > 0) {
-    deps.logger.warn(
-      `${TAG} ${op}: no x-tdai-reviewer-id header — ${changed.length} ledger event(s) written without an operator identity`,
-    );
-  }
-
+  const downstream = mode === "retract" ? await collectDownstreamArtifacts(deps) : undefined;
   return successEnvelope({
-    ok: true,
-    mode,
-    changed,
-    // 幂等空操作与"查无此记录"必须分开报，否则调用方分不清
-    // "已经撤过了" 和 "我撤错了 id"。
-    no_op: noOp,
-    not_found: notFound,
-    ...(ledgerPending ? { ledger_pending: true } : {}),
-    ...(downstream ? { downstream } : {}),
-    // "署名了" 与 "没署名" 是两种不同的成功，不能折叠成同一个 ok:true
-    //（与 ledger_pending 同理 —— 参见 #1539 评审 kvnloo 对 tombstone_pending 的意见）。
+    ok: true, mode, changed, no_op: noOp, not_found: notFound, event_ids: events,
+    ...(changed.length || d.operation_id ? { operation_id: operationId } : {}),
+    ...(outboxPending ? { outbox_pending: true } : {}), ...(downstream ? { downstream } : {}),
     reviewer_attribution: deps.requestReviewerId ? "asserted" : "unattributed",
+    ...ledgerStatusField(store, iso),
   }, requestId);
 }
 
@@ -2530,39 +2487,34 @@ async function handleMemoryReviewStatusChange(
  */
 async function collectDownstreamArtifacts(deps: V2RouterDeps): Promise<{
   auto_cleaned: false;
+  scan: "complete" | "failed" | "unavailable";
+  scope_conservative: true;
+  lineage_analyzed: false;
   note: string;
   artifacts: Array<{ layer: "L2" | "L3"; path: string }>;
   truncated?: true;
-} | undefined> {
+}> {
   const base = deps.getStorage();
-  if (!base) return undefined;
   const artifacts: Array<{ layer: "L2" | "L3"; path: string }> = [];
+  let scan: "complete" | "failed" | "unavailable" = base ? "complete" : "unavailable";
   let truncated: true | undefined;
-  try {
-    const storage = scopedProfileStorage(base, deps.requestIsolation);
+  if (base) {
     try {
-      const persona = await storage.readFile(StoragePaths.persona);
-      if (persona && persona.trim()) artifacts.push({ layer: "L3", path: StoragePaths.persona });
-    } catch { /* 没有画像文件是新租户的正常状态 */ }
-    try {
-      const listed = await storage.getBackend().listObjects(StoragePaths.sceneBlocksDir, { recursive: true });
-      const blocks = listed.entries.filter((e) => e.key.endsWith(".md"));
-      for (const e of blocks.slice(0, 50)) artifacts.push({ layer: "L2", path: e.key });
-      if (blocks.length > 50) truncated = true;
-    } catch { /* 场景块目录不存在同理 */ }
-  } catch (err) {
-    // 披露是尽力而为的附加信息，绝不能让它把一次成功的撤回变成 500。
-    deps.logger.warn(`${TAG} downstream artifact scan failed: ${err instanceof Error ? err.message : String(err)}`);
-    return undefined;
+      const storage = scopedProfileStorage(base, deps.requestIsolation);
+      if (await storage.exists(StoragePaths.persona)) artifacts.push({ layer: "L3", path: StoragePaths.persona });
+      const listed = await storage.readdirPage(StoragePaths.sceneBlocksDir, { recursive: true, maxKeys: 51 });
+      for (const e of listed.entries.filter((e) => !e.isDirectory && e.key.endsWith(".md")).slice(0, 50)) artifacts.push({ layer: "L2", path: e.key });
+      if (listed.nextMarker || listed.entries.length > 50) truncated = true;
+    } catch {
+      deps.logger.warn(`${TAG} downstream artifact scan failed`);
+      scan = "failed";
+    }
   }
-  if (artifacts.length === 0) return undefined;
   return {
-    auto_cleaned: false,
-    note: "L1 记忆已撤回，但 L2 场景块与 L3 画像是独立的派生文件，不会被本操作改写，"
-      + "且仍会注入后续每一次 prompt。若被撤回的内容已沉淀进下列文件，需要重新生成或人工编辑。"
-      + "（未做内容比对：中文子串匹配的假阴性会被误读为安全）",
-    artifacts,
-    ...(truncated ? { truncated } : {}),
+    auto_cleaned: false, scan, scope_conservative: true, lineage_analyzed: false,
+    note: "L2/L3 文件不会自动改写。审核未解除的派生内容默认停止消费，需人工检查当前内容并确认。"
+      + "文件清单是 profile 作用域的保守披露，不是逐条记忆的血缘影响面；扫描失败不代表无残留。",
+    artifacts, ...(truncated ? { truncated } : {}),
   };
 }
 
@@ -2578,7 +2530,7 @@ async function handleMemoryReviewList(body: unknown, _auth: V2AuthContext, reque
   if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
 
   const store = deps.getStore();
-  if (!store) return errorEnvelope(503, "Store not available", requestId);
+  if (!store || store.isDegraded() || !store.queryMemoryEvents) return errorEnvelope(503, "Store not available", requestId);
   if (!store.queryL1Paginated) {
     return errorEnvelope(501, "Paginated L1 query is not supported by this store backend", requestId);
   }
@@ -2588,16 +2540,22 @@ async function handleMemoryReviewList(body: unknown, _auth: V2AuthContext, reque
   }
 
   const d = parsed.data;
-  const result = await store.queryL1Paginated({
-    type: d.type,
-    timeStart: d.time_start,
-    timeEnd: d.time_end,
-    limit: d.limit,
-    offset: d.offset,
-    teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId,
-    // 显式口径：绝不沿用默认 active，否则 quarantined 永远查不出来。
-    visibility: d.visibility,
-  });
+  const live = await store.queryL1Paginated({ limit: 50_000, offset: 0, teamId: iso.teamId, userId: iso.userId, agentId: iso.agentId, taskId: iso.taskId, visibility: "all" });
+  if (live.total !== live.rows.length) throw new Error("Review listing row budget exceeded; narrow scope");
+  const roots = new Map(live.rows.map((r) => [r.record_id, r]));
+  const audit: MemoryEvent[] = [];
+  for (let offset = 0; ; offset += 1000) {
+    if (offset >= 50_000) throw new Error("Review listing history budget exceeded; narrow scope");
+    const page = await store.queryMemoryEvents!({ layer: "l1", source: "review", team_id: iso.teamId, user_id: iso.userId, agent_id: iso.agentId, limit: 1000, offset, metadata_only: true });
+    audit.push(...page);
+    if (page.length < 1000) break;
+  }
+  const historical = historicalReviewRows(audit).filter((r) => !roots.has(r.record_id) && (iso.taskId === undefined || r.task_id === iso.taskId));
+  for (const r of await resolveReviewRows(store, historical)) roots.set(r.record_id, r);
+  const matches = [...roots.values()].filter((r) => (d.visibility === "all" || r.review_status === d.visibility) && (!d.type || r.type === d.type) && (!d.time_start || r.updated_time >= d.time_start) && (!d.time_end || r.updated_time <= d.time_end))
+    .sort((a, b) => b.updated_time.localeCompare(a.updated_time) || a.record_id.localeCompare(b.record_id));
+  const liveIds = new Set(live.rows.map((r) => r.record_id));
+  const result = { rows: matches.slice(d.offset, d.offset + d.limit), total: matches.length };
 
   // 显式 has_more：审阅面不能把"截断的一页"默默呈现成"全部"。
   // （#1539 评审 kvnloo 对 history 的同类意见：provenance completeness
@@ -2617,12 +2575,64 @@ async function handleMemoryReviewList(body: unknown, _auth: V2AuthContext, reque
       content: r.content,
       // 列表必须带状态：visibility=all 时没有它就分不清哪条被撤回了。
       review_status: normalizeReviewStatus(r.review_status),
+      exists: liveIds.has(r.record_id),
+      ...(r.review_invalid ? { invalid_legacy_status: true } : {}),
+      ...(r.review_incomplete ? { lineage_incomplete: true } : {}),
+      ...(r.review_tokens?.some((t) => t.startsWith("clear:")) ? { invalidated_by_clear: true } : {}),
       session_id: r.session_id,
       version: r.version ?? 0,
       created_at: r.created_time,
       updated_at: r.updated_time,
     })),
   }, requestId);
+}
+
+async function handleMemoryDerivedReview(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
+  const parsed = memoryDerivedReviewRequestSchema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodError(parsed.error), requestId);
+  const store = deps.getStore();
+  const base = deps.getStorage();
+  const iso = deps.requestIsolation;
+  if (!store || store.isDegraded() || !base || !store.queryMemoryEvents || !store.appendMemoryEvent) return errorEnvelope(503, "Review resources unavailable", requestId);
+  if (!iso?.teamId || !iso.agentId || !iso.userId) return errorEnvelope(400, "Explicit review scope required", requestId);
+  const d = parsed.data;
+  if (d.acknowledge && !isMemoryReviewEnabled()) return errorEnvelope(403, "Memory review is disabled", requestId);
+  const storage = scopedProfileStorage(base, iso);
+  const content = await storage.readFile(d.path, { review: false });
+  if (content === null) return errorEnvelope(404, "Derived artifact not found", requestId);
+  if (Buffer.byteLength(content, "utf-8") > 1_048_576) return errorEnvelope(413, "Derived artifact exceeds audit read budget", requestId);
+  const hash = createHash("sha256").update(content).digest("hex");
+  const fence = await profileReviewFence(store, iso);
+  const fenceHash = createHash("sha256").update(JSON.stringify([...fence].sort())).digest("hex");
+  if (!d.acknowledge) return successEnvelope({ path: d.path, content, content_hash: hash, fence_hash: fenceHash, blocked: !(await derivedProfileAllowed(store, d.path, content, fence, iso)), scope_conservative: true }, requestId);
+  if (d.expected_hash !== hash) return errorEnvelope(409, "Derived artifact changed; review the current content", requestId);
+  if (d.expected_fence !== fenceHash) return errorEnvelope(409, "Review fence changed; review the current artifact again", requestId);
+  const operationId = d.operation_id ?? randomUUID();
+  const identity = `rop-${createHash("sha256").update(JSON.stringify(["derived", iso.teamId, iso.agentId, d.path, operationId])).digest("hex")}`;
+  const requestHash = createHash("sha256").update(JSON.stringify([hash, d.expected_fence, d.reason, deps.requestReviewerId ?? ""])).digest("hex");
+  let prior: MemoryEvent | undefined;
+  for (let offset = 0; ; offset += 1000) {
+    if (offset >= 50_000) throw new Error("Derived review history budget exceeded");
+    const page = await store.queryMemoryEvents({ record_id: d.path, layer: d.path === StoragePaths.persona ? "l3" : "l2", source: "review", team_id: iso.teamId, agent_id: iso.agentId, limit: 1000, offset });
+    prior = page.find((e) => e.review?.operation_id === identity);
+    if (prior || page.length < 1000) break;
+  }
+  if (prior && prior.review?.request_hash !== requestHash) return errorEnvelope(409, "Derived review operation identity reused with different input", requestId);
+  const event: MemoryEvent = prior ?? {
+    event_id: newMemoryEventId(), event_ts: new Date().toISOString(), session_id: "", session_key: "",
+    team_id: iso.teamId, user_id: "default", agent_id: iso.agentId, record_id: d.path, layer: d.path === StoragePaths.persona ? "l3" : "l2",
+    op: "updated", source: "review", content: "", reason: d.reason, reviewer_id: deps.requestReviewerId, request_id: requestId,
+    review: { protocol: 1, operation_id: identity, request_hash: requestHash, content_hash: hash, fence_hash: fenceHash },
+  };
+  try {
+    if (!prior) await store.appendMemoryEvent(event);
+  } catch {
+    return errorEnvelope(503, "Derived review commit could not be confirmed; retry with the same operation_id", requestId, { operation_id: operationId, commit_unknown: true });
+  }
+  const mirrored = await appendLedgerEvent({ store, storage: base, event, logger: deps.logger, storeAlreadyCommitted: true });
+  return successEnvelope({ path: d.path, content_hash: hash, operation_id: operationId, event_id: event.event_id,
+    acknowledged: true, still_blocked: !(await derivedProfileAllowed(store, d.path, content, await profileReviewFence(store, iso), iso)),
+    ...(base && !mirrored.jsonl ? { outbox_pending: true } : {}), reviewer_attribution: deps.requestReviewerId ? "asserted" : "unattributed" }, requestId);
 }
 
 async function handleMemoryReviewRetract(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {

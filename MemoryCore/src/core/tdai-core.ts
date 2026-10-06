@@ -559,7 +559,7 @@ export class TdaiCore {
 
   /** Set the StorageAdapter (for service mode, injected by Gateway after config resolution). */
   setStorage(adapter: StorageAdapter): void {
-    this.storage = adapter;
+    this.storage = adapter.withReviewStore(() => this.vectorStore);
     this.logger.info(`${TAG} StorageAdapter set: type=${adapter.type}`);
     // Re-trigger skill wiring — the gateway path sets storage AFTER
     // initialize() finishes, so the eager promise chain in initialize()
@@ -610,6 +610,7 @@ export class TdaiCore {
   // ============================
 
   private async initStores(): Promise<void> {
+    if (this.storage) this.storage = this.storage.withReviewStore(() => this.vectorStore);
     try {
       const stores = await initStores(this.cfg, this.dataDir, this.logger);
       this.vectorStore = stores.vectorStore;

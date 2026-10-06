@@ -204,6 +204,22 @@ describe("memory_events op CHECK 重建迁移", () => {
     store.close();
   });
 
+  it("unknown columns abort migration and disable the store without dropping user data", () => {
+    const db = new DatabaseSync(dbPath);
+    db.exec("ALTER TABLE memory_events ADD COLUMN future_field TEXT DEFAULT 'preserved'");
+    db.close();
+    const store = new VectorStore(dbPath, 0);
+    store.init();
+    expect(store.isDegraded()).toBe(true);
+    expect(() => store.queryMemoryEvents({})).toThrow(/degraded/);
+    store.close();
+    const verify = new DatabaseSync(dbPath);
+    try {
+      expect(verify.prepare("SELECT future_field, seq FROM memory_events").get()).toMatchObject({ future_field: "preserved", seq: 1 });
+      expect(verify.prepare("SELECT name FROM sqlite_master WHERE name='memory_events_oprebuild'").get()).toBeUndefined();
+    } finally { verify.close(); }
+  });
+
   it("迁移是幂等的：再次打开不重复重建，数据行数不变", () => {
     const s1 = new VectorStore(dbPath, 0); s1.init();
     const c1 = (s1 as unknown as { db: DatabaseSync }).db

@@ -14,7 +14,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import { VectorStore } from "./sqlite/memory-store.js";
-import { __setMemoryReviewEnabledForTests, resolveVisibilityScope, rowMatchesVisibility, withVisibilityOverFetch, recallTruncated, visibilityMongoCondition, visibilityTcvdbCondition } from "./visibility.js";
+import { __setMemoryReviewEnabledForTests, resolveVisibilityScope, rowMatchesVisibility, withVisibilityOverFetch, recallTruncated } from "./visibility.js";
 
 function rec(over: Partial<MemoryRecord> & { id: string; content: string }): MemoryRecord {
   return {
@@ -64,18 +64,18 @@ describe("memory review visibility", () => {
     expect(rowMatchesVisibility({ review_status: "quarantined" }, "all")).toBe(true);
   });
 
-  it("DP-12 老数据：缺字段 / 空值 / 未知值一律按 active，不得凭空消失", () => {
+  it("legacy missing/empty status remains active, unknown nonempty status does not", () => {
     expect(rowMatchesVisibility({}, "active")).toBe(true);
     expect(rowMatchesVisibility({ review_status: null }, "active")).toBe(true);
     expect(rowMatchesVisibility({ review_status: "" }, "active")).toBe(true);
-    expect(rowMatchesVisibility({ review_status: "whatever-future-value" }, "active")).toBe(true);
-    // 反向：它们都不算 quarantined
+    expect(rowMatchesVisibility({ review_status: "whatever-future-value" }, "active")).toBe(false);
+    // 反向：缺字段不算 quarantined
     expect(rowMatchesVisibility({}, "quarantined")).toBe(false);
   });
 
   it("keeps explicit audit visibility when consumer suppression is disabled", () => {
     __setMemoryReviewEnabledForTests(false);
-    expect(resolveVisibilityScope(undefined)).toBe("all");
+    expect(resolveVisibilityScope(undefined)).toBe("active");
     expect(resolveVisibilityScope({ visibility: "active" })).toBe("active");
     expect(resolveVisibilityScope({ visibility: "quarantined" })).toBe("quarantined");
   });
@@ -95,7 +95,7 @@ describe("memory review visibility", () => {
     expect(before.map((r) => r.record_id).sort()).toEqual(["m_bad", "m_keep"]);
 
     const res = store.setL1ReviewStatus("m_bad", "quarantined", ISO);
-    expect(res).toEqual({ changed: true, previous: "active" });
+    expect(res).toMatchObject({ changed: true, previous: "active" });
 
     const after = store.queryL1Records({ ...ISO });
     expect(after.map((r) => r.record_id)).toEqual(["m_keep"]);
@@ -124,6 +124,13 @@ describe("memory review visibility", () => {
     expect(hit2.map((r) => r.record_id).sort()).toEqual(["m_fts1", "m_fts2"]);
   });
 
+  it("FTS uses authoritative current bytes rather than stale indexed content", () => {
+    store.upsertL1(rec({ id: "indexed", content: "kubernetes current verified fact" }), undefined);
+    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync }).db;
+    db.prepare("UPDATE l1_fts SET content_original = ? WHERE record_id = ?").run("stale sensitive fact", "indexed");
+    expect(store.searchL1Fts("kubernetes", 10, ISO)[0]?.content).toBe("kubernetes current verified fact");
+  });
+
   it("restore 之后记忆回到读路径，且可逆（向量/FTS 条目未被删，DP-21）", () => {
     store.upsertL1(rec({ id: "m_r", content: "restore roundtrip 测试内容" }), undefined);
     store.setL1ReviewStatus("m_r", "quarantined", ISO);
@@ -131,7 +138,7 @@ describe("memory review visibility", () => {
     expect(store.searchL1Fts("roundtrip", 10, ISO)).toHaveLength(0);
 
     const back = store.setL1ReviewStatus("m_r", "active", ISO);
-    expect(back).toEqual({ changed: true, previous: "quarantined" });
+    expect(back).toMatchObject({ changed: true, previous: "quarantined" });
     expect(store.queryL1Records({ ...ISO }).map((r) => r.record_id)).toEqual(["m_r"]);
     // FTS 仍能命中 ⇒ 索引条目确实没被删，restore 不需要重新 embedding
     expect(store.searchL1Fts("roundtrip", 10, ISO).map((r) => r.record_id)).toEqual(["m_r"]);
@@ -213,7 +220,7 @@ describe("memory review visibility", () => {
     store.setL1ReviewStatus("m_fts_failure", "quarantined", ISO);
     const db = (store as unknown as { db: import("node:sqlite").DatabaseSync }).db;
     vi.spyOn(db, "prepare").mockImplementationOnce(() => { throw new Error("database unavailable"); });
-    expect(store.searchL1Fts("suppression", 10, ISO)).toEqual([]);
+    expect(() => store.searchL1Fts("suppression", 10, ISO)).toThrow("database unavailable");
   });
 
   it("DP-04 截断信号：过滤后不足请求量且取回窗口被填满 ⇒ 必须报 truncated", () => {
@@ -289,7 +296,7 @@ describe("memory review visibility", () => {
 
   it("DP-18 幂等：重复撤回返回 changed:false，调用方据此不写第二条账本事件", () => {
     store.upsertL1(rec({ id: "m_i", content: "幂等测试" }), undefined);
-    expect(store.setL1ReviewStatus("m_i", "quarantined", ISO)).toEqual({ changed: true, previous: "active" });
+    expect(store.setL1ReviewStatus("m_i", "quarantined", ISO)).toMatchObject({ changed: true, previous: "active" });
     expect(store.setL1ReviewStatus("m_i", "quarantined", ISO)).toEqual({ changed: false, previous: "quarantined" });
   });
 
@@ -303,38 +310,15 @@ describe("memory review visibility", () => {
     expect(store.setL1ReviewStatus("m_nope", "quarantined", ISO)).toBeUndefined();
   });
 
-  // ───────────── 后端条件构造：三后端语义必须一致 ─────────────
-
-  it("DP-12 mongo 条件不能用等值 —— 老文档没有该字段，等值会让它们全部消失", () => {
-    const active = visibilityMongoCondition("active");
-    // 必须是 $ne，不能是 {review_status: "active"}
-    expect(active).toEqual({ review_status: { $ne: "quarantined" } });
-    expect(JSON.stringify(active)).not.toContain('"review_status":"active"');
-
-    expect(visibilityMongoCondition("quarantined")).toEqual({ review_status: "quarantined" });
-    expect(visibilityMongoCondition("all")).toBeUndefined();
-  });
-
-  it("DP-05 tcvdb 只对 quarantined 下推服务端，active 必须回落客户端后过滤", () => {
-    // 服务端等值表达式无法表达“字段不存在视为 active”，下推就会漏掉老文档
-    expect(visibilityTcvdbCondition("active")).toBeUndefined();
-    expect(visibilityTcvdbCondition("quarantined")).toBe('review_status="quarantined"');
-    expect(visibilityTcvdbCondition("all")).toBeUndefined();
-  });
-
-  it("三后端对“缺字段”的判定必须与 rowMatchesVisibility 一致", () => {
-    // sqlite/客户端侧
+  it("legacy absent status is active, but unknown nonempty status fails closed", () => {
     expect(rowMatchesVisibility({}, "active")).toBe(true);
-    // mongo 侧：$ne:"quarantined" 对缺字段文档为真（mongo 语义）
-    const mongoActive = visibilityMongoCondition("active") as { review_status: { $ne: string } };
-    expect(mongoActive.review_status.$ne).toBe("quarantined");
-    // tcvdb 侧：不下推 ⇒ 由 rowMatchesVisibility 判定 ⇒ 同一套语义
-    expect(visibilityTcvdbCondition("active")).toBeUndefined();
+    expect(rowMatchesVisibility({ review_status: "unexpected" }, "active")).toBe(false);
+    expect(rowMatchesVisibility({ review_status: "unexpected" }, "quarantined")).toBe(true);
   });
 
   // ───────────── DP-23 开关关闭 = 基线行为 ─────────────
 
-  it("DP-23 开关关闭时，被撤回的记忆照常返回 —— 行为等同基线，回滚只需改环境变量", () => {
+  it("关闭审核写入口不能复活已撤回的记忆", () => {
     // 注意用 ASCII 词元：sqlite FTS5 默认 unicode61 分词器不切中文，
     // 整串中文做 MATCH 查询匹配不上 —— 这是基线既有行为，与本机制无关。
     store.upsertL1(rec({ id: "m_flag", content: "featureflag switch content" }), undefined);
@@ -342,17 +326,17 @@ describe("memory review visibility", () => {
     expect(store.queryL1Records({ ...ISO })).toHaveLength(0);
 
     __setMemoryReviewEnabledForTests(false);
-    expect(store.queryL1Records({ ...ISO }).map((r) => r.record_id)).toEqual(["m_flag"]);
-    expect(store.searchL1Fts("featureflag", 10, ISO).map((r) => r.record_id)).toEqual(["m_flag"]);
+    expect(store.queryL1Records({ ...ISO })).toEqual([]);
+    expect(store.searchL1Fts("featureflag", 10, ISO)).toEqual([]);
     // 关闭时超取也回落到基线值，不产生额外查询开销
     expect(withVisibilityOverFetch(10, "all")).toBe(10);
   });
 
-  it("开关关闭时写入侧仍可改状态（便于灰度前预置），只是读路径不生效", () => {
+  it("内部审核事件不因关闭 HTTP 写入口而失去读保护", () => {
     __setMemoryReviewEnabledForTests(false);
     store.upsertL1(rec({ id: "m_pre", content: "灰度前预置" }), undefined);
-    expect(store.setL1ReviewStatus("m_pre", "quarantined", ISO)).toEqual({ changed: true, previous: "active" });
-    expect(store.queryL1Records({ ...ISO })).toHaveLength(1);
+    expect(store.setL1ReviewStatus("m_pre", "quarantined", ISO)).toMatchObject({ changed: true, previous: "active" });
+    expect(store.queryL1Records({ ...ISO })).toHaveLength(0);
     __setMemoryReviewEnabledForTests(true);
     expect(store.queryL1Records({ ...ISO })).toHaveLength(0);
   });

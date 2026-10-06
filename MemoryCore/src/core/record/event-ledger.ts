@@ -32,6 +32,7 @@ import type { IMemoryStore, MemoryEvent, MemoryEventRedactFilter } from "../stor
 import { createKeyedMutex } from "../../utils/keyed-mutex.js";
 import { canonEventBound, canonIsoTs, EVENT_ID_RE, healIsoId, isValidRedactFilter, newMemoryEventId, withMemoryEventId } from "../store/memory-event-id.js";
 import type { Logger } from "../types.js";
+import { validReview } from "../store/review.js";
 
 /** The store capabilities the ledger needs; health is tracked per store object and tenant. */
 export type LedgerStore = Pick<IMemoryStore, "appendMemoryEvent" | "redactMemoryEvents">;
@@ -666,10 +667,10 @@ function redactOutboxContent(content: string, filters: readonly MemoryEventRedac
     const e = value as MemoryEvent & Partial<RedactionMarker>;
     if (e.redact !== undefined || typeof e.event_ts !== "string") return line;
     const hasPlaintext = (e.content !== undefined && e.content !== null && e.content !== "") ||
-      (e.snapshot_json !== undefined && e.snapshot_json !== null && e.snapshot_json !== "");
+      (e.snapshot_json !== undefined && e.snapshot_json !== null && e.snapshot_json !== "") || Boolean(e.reason);
     if (!hasPlaintext || !filters.some((f) => markerCovers(f, e))) return line;
     lines += 1;
-    const { snapshot_json: _dropped, ...skeleton } = e;
+    const { snapshot_json: _dropped, reason: _reason, ...skeleton } = e;
     return JSON.stringify({ ...skeleton, content: "" });
   });
   return { content: out.join("\n"), lines };
@@ -737,6 +738,7 @@ export async function appendLedgerEvent(params: {
   store: LedgerStore | undefined;
   storage?: StorageAdapter;
   event: MemoryEvent;
+  storeAlreadyCommitted?: boolean;
   logger?: LedgerLogger;
 }): Promise<LedgerAppendResult> {
   const { store, storage, logger } = params;
@@ -784,7 +786,7 @@ export async function appendLedgerEvent(params: {
   // that shard) and not in the store (its wipe already ran). Events covered by
   // any known marker are appended as content-less skeletons instead.
   if (coveringRedactions(store, event).length > 0) {
-    event = { ...event, content: "", snapshot_json: undefined };
+    event = { ...event, content: "", snapshot_json: undefined, reason: undefined };
   }
   const result: LedgerAppendResult = { event_id: event.event_id, jsonl: false, store: false };
 
@@ -798,7 +800,7 @@ export async function appendLedgerEvent(params: {
       const key = StoragePaths.eventShard(shardDateOf(event.event_ts), ledgerWriterId);
       await withShardLock(key, async () => {
         if (coveringRedactions(store, event).length > 0) {
-          event = { ...event, content: "", snapshot_json: undefined };
+          event = { ...event, content: "", snapshot_json: undefined, reason: undefined };
         }
         await storage.appendFile(key, JSON.stringify(event) + "\n");
       });
@@ -816,7 +818,7 @@ export async function appendLedgerEvent(params: {
   if (store?.appendMemoryEvent) {
     let storeErr: unknown;
     try {
-      await store.appendMemoryEvent(event);
+      if (!params.storeAlreadyCommitted) await store.appendMemoryEvent(event);
       result.store = true;
     } catch (err) {
       storeErr = err;
@@ -829,7 +831,7 @@ export async function appendLedgerEvent(params: {
     // content) means the store leg missed it — re-apply the covering
     // markers' filter-update ourselves. Idempotent, and failures are tracked
     // as pending store redactions.
-    if (storeErr === undefined && (event.content !== "" || event.snapshot_json)) {
+    if (storeErr === undefined && (event.content !== "" || event.snapshot_json || event.reason)) {
       for (const m of coveringRedactions(store, event)) {
         try {
           await store.redactMemoryEvents?.(m);
@@ -971,6 +973,7 @@ function isReplayableEvent(e: Partial<Record<keyof MemoryEvent, unknown>>): e is
     typeof e.op === "string" && MEMORY_EVENT_OPS.has(e.op) &&
     typeof e.event_ts === "string" && canonIsoTs(e.event_ts) !== null &&
     typeof e.content === "string" &&
+    (e.review === undefined || validReview(e.review)) &&
     (e.version === undefined || typeof e.version === "number") &&
     (e.supersedes === undefined || (Array.isArray(e.supersedes) && e.supersedes.every((s) => typeof s === "string"))) &&
     OPTIONAL_STRING_FIELDS.every((k) => e[k] === undefined || typeof e[k] === "string");
@@ -1248,7 +1251,7 @@ export async function replayLedgerEvents(params: {
     }
     let event = raw;
     if (markers.some((m) => markerCovers(m, raw))) {
-      event = { ...raw, content: "", snapshot_json: undefined };
+      event = { ...raw, content: "", snapshot_json: undefined, reason: undefined };
       out.redacted += 1;
     }
     try {

@@ -389,24 +389,22 @@ export function resolveIsolation(
     if (Array.isArray(raw)) return raw[0];
     return typeof raw === "string" ? raw : undefined;
   };
-  const teamId = (body?.team_id as string | undefined) ?? headerStr("x-tdai-team-id") ?? "";
-  const userId = (body?.user_id as string | undefined) ?? headerStr("x-tdai-user-id") ?? "";
-  const agentId = (body?.agent_id as string | undefined) ?? headerStr("x-tdai-agent-id") ?? "";
-  const sessionId =
-    (body?.session_id as string | undefined)
-    ?? headerStr("x-tdai-session-id")
-    ?? "";
-  const taskId =
-    (body?.task_id as string | undefined)
-    ?? headerStr("x-tdai-task-id")
-    ?? undefined;
+  const field = (name: string): string | undefined => {
+    const value = body?.[name] ?? headerStr(`x-tdai-${name.replaceAll("_", "-")}`);
+    return typeof value === "string" ? value.trim() : undefined;
+  };
+  const teamId = field("team_id") ?? "";
+  const userId = field("user_id") ?? "";
+  const agentId = field("agent_id") ?? "";
+  const sessionId = field("session_id") ?? "";
+  const taskId = field("task_id");
   const missing: string[] = [];
   if (!userId) missing.push("user_id");
   if (!agentId) missing.push("agent_id");
   if (!sessionId) missing.push("session_id");
 
   const ph = opts.legacyCompatMode ? (opts.legacyPlaceholder ?? DEFAULT_ISOLATION_ID) : DEFAULT_ISOLATION_ID;
-  const ctx = { ...(teamId ? { teamId } : {}), userId: userId || ph, agentId: agentId || ph, sessionId: sessionId || ph, ...(taskId ? { taskId } : {}) };
+  const ctx = { ...(teamId ? { teamId } : {}), userId: userId || ph, agentId: agentId || ph, sessionId: sessionId || ph, ...(taskId !== undefined ? { taskId } : {}) };
   return { ok: true, ctx };
 }
 
@@ -506,23 +504,27 @@ export type MemoryHistoryRequest = z.infer<typeof memoryHistoryRequestSchema>;
 //
 // 注意：请求体里**没有** visibility/scope 之类的可见性开关 —— 它只能由服务端
 // 指定（DP-14），否则等于给调用方一个绕过审核的后门。
+const reviewRecordId = z.string().trim().min(1).max(1024).regex(/^[^\p{Cc}]+$/u);
+
 export const memoryReviewRetractRequestSchema = z.object({
   /** 要撤回的 record id。 */
-  record_id: z.string().min(1).optional(),
+  record_id: reviewRecordId.optional(),
   /** 批量撤回（上限 50/次）。 */
-  record_ids: z.array(z.string().min(1)).min(1).max(50).optional(),
+  record_ids: z.array(reviewRecordId).min(1).max(50).optional(),
   /** 撤回理由，记入 retracted 事件的 reason。审核操作要求必须说明理由。 */
-  reason: z.string().min(1).max(2000),
+  reason: z.string().trim().min(1).max(2000),
+  operation_id: z.string().trim().min(1).max(256).optional(),
 }).refine((d) => d.record_id || (d.record_ids?.length ?? 0) > 0, {
   message: "record_id or non-empty record_ids is required",
 });
 export type MemoryReviewRetractRequest = z.infer<typeof memoryReviewRetractRequestSchema>;
 
 export const memoryReviewRestoreRequestSchema = z.object({
-  record_id: z.string().min(1).optional(),
-  record_ids: z.array(z.string().min(1)).min(1).max(50).optional(),
+  record_id: reviewRecordId.optional(),
+  record_ids: z.array(reviewRecordId).min(1).max(50).optional(),
   /** 恢复理由可选 —— 恢复是把系统还原到默认状态，举证责任低于撤回。 */
-  reason: z.string().max(2000).optional(),
+  reason: z.string().trim().max(2000).optional(),
+  operation_id: z.string().trim().min(1).max(256).optional(),
 }).refine((d) => d.record_id || (d.record_ids?.length ?? 0) > 0, {
   message: "record_id or non-empty record_ids is required",
 });
@@ -554,12 +556,25 @@ export const memoryReviewListRequestSchema = z.object({
    *  审核台最常问的是"我撤了哪些"，默认值要对准主场景。 */
   visibility: z.enum(["active", "quarantined", "all"]).default("quarantined"),
   type: z.string().min(1).max(64).optional(),
-  time_start: z.string().min(1).optional(),
-  time_end: z.string().min(1).optional(),
+  time_start: isoDateString.optional(),
+  time_end: isoDateString.optional(),
   limit: z.number().int().min(1).max(200).default(50),
   offset: z.number().int().min(0).default(0),
-}).strict();
+  team_id: z.string().trim().min(1).optional(),
+  user_id: z.string().trim().min(1).optional(),
+  agent_id: z.string().trim().min(1).optional(),
+  task_id: z.string().trim().optional(),
+}).strict().refine((d) => !d.time_start || !d.time_end || d.time_start <= d.time_end, { message: "time_start must not be after time_end" });
 export type MemoryReviewListRequest = z.infer<typeof memoryReviewListRequestSchema>;
+
+export const memoryDerivedReviewRequestSchema = z.object({
+  path: safePath.refine((p) => p === "persona.md" || p === ".metadata/scene_index.json" || (p.startsWith("scene_blocks/") && p.endsWith(".md"))),
+  acknowledge: z.boolean().default(false),
+  expected_hash: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  expected_fence: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  reason: z.string().trim().min(1).max(2000).optional(),
+  operation_id: z.string().trim().min(1).max(256).optional(),
+}).refine((d) => !d.acknowledge || (d.expected_hash !== undefined && d.expected_fence !== undefined && d.reason !== undefined), { message: "Acknowledgement requires expected_hash, expected_fence and reason" });
 
 // POST /v2|v3/memory/ledger/status — 变更账健康度（本进程见到的 store/outbox 追加失败）。
 // reset:true 清失败计数；pending 擦除是未落地的工作项，不在 reset 范围内——

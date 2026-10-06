@@ -350,13 +350,14 @@ describe("POST /memory/diff/revert", () => {
     // reverted event carries the reviewer identity (isolation user).
     const reverted = store.queryMemoryEvents({ record_id: "m_b", op: "reverted" });
     expect(reverted).toHaveLength(1);
-    expect(reverted[0].reviewer_id).toBe("u1");
+    expect(reverted[0].reviewer_id).toBeUndefined();
     expect(reverted[0].session_id).toBe("ses-y"); // attributed to original session
 
     // diff view marks the change reverted and exposes the reviewer.
     const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
     const change = ((diff.data?.changes ?? []) as Array<Record<string, unknown>>).find((c) => c.record_id === "m_b");
-    expect(change).toMatchObject({ reverted: true, reverted_by: "u1" });
+    expect(change).toMatchObject({ reverted: true });
+    expect(change?.reverted_by).toBeUndefined();
   });
 
   it("appends a JSONL tombstone so replay cannot resurrect the record", async () => {
@@ -366,7 +367,8 @@ describe("POST /memory/diff/revert", () => {
       .filter((l) => l.includes('"tombstone":"l1"'));
     expect(tombstoneLines).toHaveLength(1);
     const tomb = JSON.parse(tombstoneLines[0]);
-    expect(tomb).toMatchObject({ record_id: "m_b", reviewer_id: "u1" });
+    expect(tomb).toMatchObject({ record_id: "m_b" });
+    expect(tomb.reviewer_id).toBeUndefined();
   });
 
   it("second revert is idempotent → 409", async () => {
@@ -792,7 +794,8 @@ describe("POST /memory/diff/revert", () => {
     });
     const { status } = await call("/v3/memory/diff/revert", { record_id: "m_b" });
     expect(status).toBe(409);
-    expect((await store.queryL1Records({ recordIds: ["m_b"] })).map((r) => r.record_id)).toEqual(["m_b"]);
+    expect((await store.queryL1Records({ recordIds: ["m_b"], visibility: "all" })).map((r) => r.record_id)).toEqual(["m_b"]);
+    expect(await store.queryL1Records({ recordIds: ["m_b"] })).toEqual([]);
   });
 
   it("a record removed by TTL (row gone) cannot be reverted", async () => {

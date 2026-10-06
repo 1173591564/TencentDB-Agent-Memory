@@ -27,12 +27,13 @@ import { ZodError, z } from "zod";
 
 import { errorEnvelope, successEnvelope } from "./v2-router.js";
 import type { ApiResponseEnvelope, V2AuthContext } from "./v2-schemas.js";
-import type { IMemoryStore, MemoryContentClearResult } from "../core/store/types.js";
+import type { IMemoryStore, MemoryContentClearResult, MemoryEvent } from "../core/store/types.js";
 import { StoragePaths } from "../core/storage/types.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
 import { buildProfileIsolationScope } from "../core/profile/profile-scope.js";
 import { MetadataError, type MetadataService } from "../metadata/service/metadata-service.js";
 import { buildChatMemoryAssetId } from "../metadata/utils/chat-memory-asset.js";
+import { newMemoryEventId } from "../core/store/memory-event-id.js";
 import { appendLedgerEvent, redactLedgerEvents } from "../core/record/event-ledger.js";
 import type { Logger } from "../core/types.js";
 
@@ -67,6 +68,9 @@ export interface ChatMemoryClearItem {
   memory_id: string;
   /** 清空是否成功。失败时 memory_id 内容可能残留，调用方可重试（幂等）。 */
   cleared: boolean;
+  fence_committed?: true;
+  fence_commit_unknown?: true;
+  counts_verified?: false;
   l0_deleted: number;
   l1_deleted: number;
   /** L2/L3 profile 记录数（VDB 行 + 存储文件）。 */
@@ -326,12 +330,8 @@ export async function clearChatMemoryContentResilient(args: {
   // record_id 统一用 asset_id 约定（chat_memory-{team}-{agent}）——与
   // /v3/chat-memory/clear 的审计行一致，按 asset_id 查账时两条路径对得上。
   const memoryId = buildChatMemoryAssetId(args.teamId, args.agentId);
-  const { result } = await clearChatMemoryContentWithRetry({
-    ...args,
-    memoryId,
-  });
   // archiveAgent 级联清空与 /v3/chat-memory/clear 行为对齐：同样留审计痕。
-  // 清理已成功，审计失败只 warn。
+  // 消费栅栏先持久提交；物理清理失败可重试，不允许无栅栏删除。
   await recordClearAudit(args.store, {
     memoryId,
     teamId: args.teamId,
@@ -340,6 +340,7 @@ export async function clearChatMemoryContentResilient(args: {
     logger: args.logger,
     storage: args.storage,
   });
+  const { result } = await clearChatMemoryContentWithRetry({ ...args, memoryId });
   return result;
 }
 
@@ -363,6 +364,14 @@ export async function recordClearAudit(
 ): Promise<void> {
   const now = Date.now();
   const until = new Date(now).toISOString();
+  if (!store.appendMemoryEvent) throw new Error("Clear requires a durable ledger fence");
+  const fence: MemoryEvent = {
+    event_id: newMemoryEventId(), event_ts: until, session_key: "", session_id: "",
+    team_id: args.teamId, agent_id: args.agentId, op: "deleted", record_id: args.memoryId,
+    content: "", version: 0, scope: "agent", until, layer: "l1", source: "api_mutation", request_id: args.requestId,
+  };
+  await store.appendMemoryEvent(fence);
+  await appendLedgerEvent({ store, storage: args.storage, logger: args.logger, event: fence, storeAlreadyCommitted: true });
   for (const layer of ["L1", "L2", "L3"] as const) {
     if (store.appendAudit) {
       try {
@@ -384,7 +393,7 @@ export async function recordClearAudit(
         );
       }
     }
-    if (store.appendMemoryEvent || args.storage) {
+    if (layer !== "L1") {
       try {
         await appendLedgerEvent({ store, storage: args.storage, logger: args.logger, event: {
           event_ts: until,
@@ -471,16 +480,8 @@ async function handleChatMemoryClear(
   //    所以带整体重试（清空幂等，重跑安全）。 ──
   const items: ChatMemoryClearItem[] = [];
   for (const target of targets) {
+    let fenceCommitted = false;
     try {
-      const { result, attempts } = await clearChatMemoryContentWithRetry({
-        store,
-        storage,
-        teamId: target.team_id,
-        agentId: target.agent_id,
-        logger: deps.logger,
-        memoryId: target.asset_id,
-      });
-
       await recordClearAudit(store, {
         memoryId: target.asset_id,
         teamId: target.team_id,
@@ -488,6 +489,11 @@ async function handleChatMemoryClear(
         requestId,
         logger: deps.logger,
         storage,
+      });
+      fenceCommitted = true;
+      const { result, attempts } = await clearChatMemoryContentWithRetry({
+        store, storage, teamId: target.team_id, agentId: target.agent_id,
+        logger: deps.logger, memoryId: target.asset_id,
       });
 
       items.push({
@@ -510,14 +516,16 @@ async function handleChatMemoryClear(
       items.push({
         memory_id: target.asset_id,
         cleared: false,
+        ...(fenceCommitted ? { fence_committed: true as const } : { fence_commit_unknown: true as const }),
+        counts_verified: false,
         l0_deleted: 0,
         l1_deleted: 0,
         profile_deleted: 0,
         reason: retryable
-          ? `clear failed after ${CLEAR_MAX_ATTEMPTS} attempts, please retry later`
+          ? "clear outcome may be partial; retry to finish physical cleanup"
           : "clear rejected due to invalid request or server configuration",
         retryable,
-        attempts: retryable ? CLEAR_MAX_ATTEMPTS : 1,
+        attempts: fenceCommitted && retryable ? CLEAR_MAX_ATTEMPTS : 1,
       });
     }
   }

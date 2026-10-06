@@ -22,9 +22,12 @@ describe("decodeMemoryEvent", () => {
 });
 
 describe("parseSupersedesJson", () => {
-  it("parses JSON arrays and treats malformed input as none", () => {
+  it("accepts absent legacy lineage but refuses malformed or typed-invalid lineage", () => {
     expect(parseSupersedesJson("[\"m_a\"]")).toEqual(["m_a"]);
-    expect(parseSupersedesJson("{not json")).toEqual([]);
+    expect(parseSupersedesJson("")).toEqual([]);
+    expect(() => parseSupersedesJson("{not json")).toThrow();
+    expect(() => parseSupersedesJson('[12]')).toThrow();
+    expect(() => parseSupersedesJson('{}')).toThrow();
   });
 });
 

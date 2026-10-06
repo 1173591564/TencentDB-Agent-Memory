@@ -18,11 +18,11 @@
  */
 
 import type { Collection, Db, Document } from "mongodb";
+import { assertClearGuard, resolveReviewRows, setReviewStatus, ReviewConflictError, validReview } from "../review.js";
 import {
   DEFAULT_REVIEW_STATUS,
   normalizeReviewStatus,
   resolveVisibilityScope,
-  visibilityMongoCondition,
   type ReviewStatus,
 } from "../visibility.js";
 import type { MongoConfig } from "../../instance-config-provider.js";
@@ -334,6 +334,7 @@ export class MongoMemoryStore implements IMemoryStore {
       return false;
     }
     const coll = await this.coll(COLLECTIONS.L1);
+    await assertClearGuard(this, record);
     const doc = l1RecordToDoc({ ...record, ...ts });
     // Filter carries the designated shard key prefix (team_id, agent_id) so the
     // upsert stays legal if the collection is ever sharded — on a sharded
@@ -343,13 +344,20 @@ export class MongoMemoryStore implements IMemoryStore {
     // 一起抹掉，于是任何一次合并更新都让被撤回的记忆复活。sqlite 靠 ON CONFLICT
     // 的显式列清单天然躲过，mongo 必须显式处理：业务字段走 $set，
     // 审核态只在**插入时**赋默认值。
-    const { _id: docId, ...rest } = doc as unknown as Record<string, unknown> & { _id: unknown };
-    await coll.updateOne(
-      { _id: docId, team_id: doc.team_id, agent_id: doc.agent_id } as never,
-      { $set: rest, $setOnInsert: { review_status: DEFAULT_REVIEW_STATUS } } as never,
-      { upsert: true },
+    const { _id: docId, review_sources_json: _sources, review_guard_at: guard, created_time: created, ...rest } = doc as unknown as Record<string, unknown> & { _id: unknown };
+    const result = await coll.updateOne(
+      { _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id } as never,
+      { $set: rest, $setOnInsert: { review_status: record.review_status ?? DEFAULT_REVIEW_STATUS, review_sources_json: "[]", review_guard_at: guard ?? "", created_time: created },
+        $addToSet: { review_sources: { $each: record.review_sources ?? [] } } } as never,
+      { upsert: !record.expected_existing },
     );
-    return true;
+    try {
+      await assertClearGuard(this, record);
+    } catch (err) {
+      if (err instanceof ReviewConflictError && record.review_guard_at) await coll.deleteOne({ _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id, review_guard_at: record.review_guard_at } as never);
+      throw err;
+    }
+    return result.matchedCount > 0 || result.upsertedCount > 0;
   }
 
   async deleteL1(recordId: string, filter?: IsolationFilter): Promise<boolean> {
@@ -392,19 +400,18 @@ export class MongoMemoryStore implements IMemoryStore {
 
   async countL1(filter?: L1CountFilter): Promise<number> {
     const coll = await this.coll(COLLECTIONS.L1);
+    if (resolveVisibilityScope(filter) !== "all") return (await this.queryL1Paginated({ ...filter, limit: 1, offset: 0 })).total;
     return coll.countDocuments(this.l1CountQuery(filter) as never);
   }
 
   private l1CountQuery(filter?: L1CountFilter): Record<string, unknown> {
     const q: Record<string, unknown> = {};
     // 可见性先于 early-return：filter 为 undefined 时也必须抑制（fail-safe）。
-    Object.assign(q, visibilityMongoCondition(resolveVisibilityScope(filter)) ?? {});
+
     if (!filter) return q;
     if (filter.type !== undefined) q.type = filter.type;
     if (filter.sessionId !== undefined) q.session_id = filter.sessionId;
-    if (filter.teamId !== undefined) q.team_id = filter.teamId;
-    if (filter.userId !== undefined) q.user_id = filter.userId;
-    if (filter.agentId !== undefined) q.agent_id = filter.agentId;
+    Object.assign(q, isolationToMatch({ teamId: filter.teamId, userId: filter.userId, agentId: filter.agentId }));
     if (filter.taskId !== undefined) q.task_id = filter.taskId;
     const range: Record<string, string> = {};
     if (filter.timeStart !== undefined) range.$gte = filter.timeStart;
@@ -413,68 +420,50 @@ export class MongoMemoryStore implements IMemoryStore {
     return q;
   }
 
-  async queryL1Records(filter?: L1QueryFilter): Promise<L1RecordRow[]> {
+  async queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean; review?: boolean; metadataOnly?: boolean }): Promise<L1RecordRow[]> {
     const coll = await this.coll(COLLECTIONS.L1);
     const q: Record<string, unknown> = {};
-    Object.assign(q, visibilityMongoCondition(resolveVisibilityScope(filter)) ?? {});
+
     if (filter?.recordIds && filter.recordIds.length > 0) q._id = { $in: filter.recordIds };
     if (filter?.sessionKey !== undefined) q.session_key = filter.sessionKey;
     if (filter?.sessionId !== undefined) q.session_id = filter.sessionId;
     if (filter?.taskId !== undefined) q.task_id = filter.taskId;
-    if (filter?.teamId !== undefined) q.team_id = filter.teamId;
-    if (filter?.userId !== undefined) q.user_id = filter.userId;
-    if (filter?.agentId !== undefined) q.agent_id = filter.agentId;
+    Object.assign(q, isolationToMatch({ teamId: filter?.teamId, userId: filter?.userId, agentId: filter?.agentId }));
     if (filter?.updatedAfter !== undefined) q.updated_time = { $gt: filter.updatedAfter };
-    const docs = await coll.find(q as never).toArray();
-    return docs.map((d) => docToL1RecordRow(d as unknown as L1Doc));
+    if (opts?.review === false && filter?.visibility === "quarantined") q.review_status = { $nin: [null, "", "active"] };
+    const docs = await coll.find(q as never, opts?.metadataOnly ? { projection: { content: 0, metadata_json: 0, tokens: 0 } } : {}).limit(50001).toArray();
+    if (docs.length > 50_000) throw new Error("Review row budget exceeded; narrow scope");
+    let rows = docs.map((d) => docToL1RecordRow(d as unknown as L1Doc));
+    const scope = resolveVisibilityScope(filter);
+    if (opts?.review !== false && (scope !== "all" || filter?.visibility !== undefined)) rows = await resolveReviewRows(this, rows);
+    return rows.filter((r) => scope === "all" || normalizeReviewStatus(r.review_status) === scope);
   }
 
   async getAllL1Texts(): Promise<Array<{ record_id: string; content: string; updated_time: string }>> {
-    const coll = await this.coll(COLLECTIONS.L1);
-    // 返回形状没有状态字段 ⇒ 只能给 active（与 sqlite 同口径，DP-27）。
-    const q = visibilityMongoCondition(resolveVisibilityScope(undefined)) ?? {};
-    const docs = await coll.find(q as never, { projection: { content: 1, updated_time: 1 } }).toArray();
-    return docs.map((d) => ({
-      record_id: String((d as { _id: unknown })._id),
-      content: String((d as { content?: string }).content ?? ""),
-      updated_time: String((d as { updated_time?: string }).updated_time ?? ""),
-    }));
+    const rows = await this.queryL1Records();
+    return rows.map(({ record_id, content, updated_time }) => ({ record_id, content, updated_time }));
   }
 
   async queryL1Paginated(filter: L1PaginatedFilter): Promise<L1PaginatedResult> {
     const coll = await this.coll(COLLECTIONS.L1);
     const q = this.l1CountQuery(filter);
     const total = await coll.countDocuments(q as never);
-    const docs = await coll
-      .find(q as never)
-      .sort({ updated_time_ms: -1 })
-      .skip(filter.offset)
-      .limit(filter.limit)
-      .toArray();
-    return { rows: docs.map((d) => docToL1RecordRow(d as unknown as L1Doc)), total };
+    const scope = resolveVisibilityScope(filter);
+    const reviewing = scope !== "all" || filter.visibility !== undefined;
+    if (reviewing && total > 50_000) throw new Error("Review pagination row budget exceeded; narrow tenant/time scope");
+    const docs = await coll.find(q as never).sort({ updated_time_ms: -1, _id: 1 })
+      .skip(reviewing ? 0 : filter.offset).limit(reviewing ? Math.max(total, 1) : filter.limit).toArray();
+    let rows = docs.map((d) => docToL1RecordRow(d as unknown as L1Doc));
+    if (reviewing) {
+      rows = (await resolveReviewRows(this, rows)).filter((r) => scope === "all" || r.review_status === scope);
+      return { rows: rows.slice(filter.offset, filter.offset + filter.limit), total: rows.length };
+    }
+    return { rows, total };
   }
 
   /** 事后审核：改一条 L1 的可见性状态（DP-01）。幂等语义与 sqlite 一致。 */
-  async setL1ReviewStatus(
-    recordId: string,
-    status: ReviewStatus,
-    filter?: IsolationFilter,
-  ): Promise<{ changed: boolean; previous: ReviewStatus } | undefined> {
-    const coll = await this.coll(COLLECTIONS.L1);
-    const q: Record<string, unknown> = { _id: recordId };
-    // DP-09：审核是跨记录操作，租户必须显式核对。
-    if (filter?.teamId !== undefined) q.team_id = filter.teamId;
-    if (filter?.userId !== undefined) q.user_id = filter.userId;
-    if (filter?.agentId !== undefined) q.agent_id = filter.agentId;
-    if (filter?.sessionId !== undefined) q.session_id = filter.sessionId;
-    if (filter?.taskId !== undefined) q.task_id = filter.taskId;
-
-    const existing = await coll.findOne(q as never, { projection: { review_status: 1 } });
-    if (!existing) return undefined;
-    const previous = normalizeReviewStatus((existing as { review_status?: unknown }).review_status);
-    if (previous === status) return { changed: false, previous };
-    await coll.updateOne(q as never, { $set: { review_status: status } } as never);
-    return { changed: true, previous };
+  async setL1ReviewStatus(recordId: string, status: ReviewStatus, filter?: IsolationFilter, operation?: Parameters<NonNullable<IMemoryStore["setL1ReviewStatus"]>>[3]) {
+    return setReviewStatus(this, recordId, status, filter, operation);
   }
 
   // ════════════════════════════════════════════════════════
@@ -491,8 +480,18 @@ export class MongoMemoryStore implements IMemoryStore {
     const searchText = ftsQueryToSearchText(ftsQuery);
     if (!searchText) return [];
     const coll = await this.coll(COLLECTIONS.L1);
-    const docs = await this.runSearch(coll, searchText, limit, filter);
-    return docs.map(({ doc, score }) => docToL1FtsResult(doc as unknown as L1Doc, score));
+    const scope = resolveVisibilityScope(filter);
+    const budget = scope === "all" ? limit : Math.max(limit, Math.min(limit * 15, 500));
+    const docs = await this.runSearch(coll, searchText, budget, filter);
+    if (!docs.length) return [];
+    const current = await this.queryL1Records({ ...filter, recordIds: docs.map(({ doc }) => String(doc._id)), visibility: scope }, { strict: true });
+    const byId = new Map(current.map((r) => [r.record_id, r]));
+    const kept = docs.filter(({ doc }) => byId.has(String(doc._id))).map(({ doc, score }) => {
+      const row = byId.get(String(doc._id))!;
+      return docToL1FtsResult({ ...doc, ...row, _id: row.record_id, content: row.content } as unknown as L1Doc, score);
+    });
+    if (kept.length < limit && docs.length >= budget) this.logger?.warn?.(`[memory-review] recall_truncated at mongo search: requested=${limit} kept=${kept.length}`);
+    return kept.slice(0, limit);
   }
 
   // ════════════════════════════════════════════════════════
@@ -593,9 +592,7 @@ export class MongoMemoryStore implements IMemoryStore {
     const q: Record<string, unknown> = {};
     if (!filter) return q;
     if (filter.sessionId !== undefined) q.session_id = filter.sessionId;
-    if (filter.teamId !== undefined) q.team_id = filter.teamId;
-    if (filter.userId !== undefined) q.user_id = filter.userId;
-    if (filter.agentId !== undefined) q.agent_id = filter.agentId;
+    Object.assign(q, isolationToMatch({ teamId: filter.teamId, userId: filter.userId, agentId: filter.agentId }));
     if (filter.taskId !== undefined) q.task_id = filter.taskId;
     const range: Record<string, number> = {};
     if (filter.timeStartMs !== undefined) range.$gte = filter.timeStartMs;
@@ -704,23 +701,12 @@ export class MongoMemoryStore implements IMemoryStore {
       must: [{ text: { query: searchText, path: "tokens" } }],
     };
     if (filters.length > 0) compound.filter = filters;
-    // 可见性：$search 的 compound 不支持 $ne，用 mustNot 表达"不是 quarantined"。
-    // 缺字段的老文档自然落在 mustNot 之外，仍然可见（DP-12）。
-    const visScope = resolveVisibilityScope(filter);
-    if (visScope === "active") {
-      compound.mustNot = [{ text: { query: "quarantined", path: "review_status" } }];
-    } else if (visScope === "quarantined") {
-      compound.must = [
-        ...(compound.must as unknown[]),
-        { text: { query: "quarantined", path: "review_status" } },
-      ];
-    }
     const pipeline: Record<string, unknown>[] = [
       { $search: { index: MEMORY_SEARCH_INDEX, compound } },
       { $limit: Math.max(1, limit) },
       { $addFields: { __searchScore: { $meta: "searchScore" } } },
     ];
-    const raw = await coll.aggregate(pipeline).toArray();
+    const raw = await coll.aggregate(pipeline, { readConcern: { level: "local" } }).toArray();
     return raw.map((d) => ({
       doc: d,
       score: mongoSearchScoreToScore(Number((d as { __searchScore?: number }).__searchScore ?? 0)),
@@ -982,6 +968,7 @@ export class MongoMemoryStore implements IMemoryStore {
   // ════════════════════════════════════════════════════════
 
   async appendMemoryEvent(event: MemoryEvent): Promise<void> {
+    if (event.review !== undefined && !validReview(event.review)) throw new Error("Invalid review protocol payload");
     const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
     // _id 由 Mongo 自动生成（ObjectId 自带时间序，作同 event_ts 内的稳定次序键）。
     // Normalize the optional fields to the same defaults sqlite/TCVDB persist:
@@ -1050,7 +1037,7 @@ export class MongoMemoryStore implements IMemoryStore {
     if (agentId !== undefined) q.agent_id = agentId;
     if (userId !== undefined) q.user_id = userId;
     if (filter.layer !== undefined) q.layer = filter.layer;
-    const res = await coll.updateMany(q as never, { $set: { content: "", snapshot_json: "" } } as never);
+    const res = await coll.updateMany(q as never, { $set: { content: "", snapshot_json: "", reason: "" } } as never);
     return res.modifiedCount;
   }
 
@@ -1069,9 +1056,11 @@ export class MongoMemoryStore implements IMemoryStore {
         : { $in: filter.record_ids };
     }
     if (filter.op !== undefined) q.op = filter.op;
+    if (filter.scope !== undefined) q.scope = filter.scope;
     if (filter.layer !== undefined) q.layer = filter.layer;
     if (filter.source !== undefined) q.source = filter.source;
     if (filter.request_id !== undefined) q.request_id = filter.request_id;
+    if (filter.event_id !== undefined) q.event_id = filter.event_id;
     const teamId = isoMatch(filter.team_id);
     const agentId = isoMatch(filter.agent_id);
     const userId = isoMatch(filter.user_id);
@@ -1091,7 +1080,7 @@ export class MongoMemoryStore implements IMemoryStore {
     const offset = Math.max(filter.offset ?? 0, 0);
     const dir = filter.order === "desc" ? -1 : 1;
     const docs = await coll
-      .find(q as never)
+      .find(q as never, filter.metadata_only ? { projection: { content: 0, snapshot_json: 0, reason: 0 } } : {})
       .sort({ event_ts: dir, _id: dir })
       .skip(offset)
       .limit(limit)
@@ -1100,7 +1089,8 @@ export class MongoMemoryStore implements IMemoryStore {
   }
 
   private docToMemoryEvent(d: Record<string, unknown>): MemoryEvent {
-    return decodeMemoryEvent(d, Array.isArray(d.supersedes) ? (d.supersedes as string[]) : []);
+    if (d.supersedes !== undefined && (!Array.isArray(d.supersedes) || !d.supersedes.every((id) => typeof id === "string" && id.length > 0 && id.length <= 1024))) throw new Error("Invalid supersession lineage");
+    return decodeMemoryEvent(d, (d.supersedes ?? []) as string[]);
   }
 
   // ════════════════════════════════════════════════════════

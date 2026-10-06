@@ -23,6 +23,16 @@ const TS = "2026-03-01T10:00:00.000Z";
 
 /** Representative rows: one per shape the writers actually produce. */
 const FIXTURES: MemoryEvent[] = [
+  {
+    event_id: id("6"), event_ts: TS, session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1",
+    op: "restored", record_id: "m_root", content: "", reason: "checked", source: "review", layer: "l1", version: 0,
+    review: { protocol: 1, operation_id: `rop-${"a".repeat(64)}`, request_hash: "b".repeat(64), observed: [id("7")] },
+  },
+  {
+    event_id: id("8"), event_ts: TS, session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1",
+    op: "created", record_id: "m_child", content: "new", source: "extraction", layer: "l1", version: 0,
+    review: { protocol: 1, sources: ["m_root"], guard_at: TS },
+  },
   { // extraction write replacing two records
     event_id: id("1"), event_ts: TS, session_key: "sk", session_id: "ses",
     team_id: "t1", user_id: "u1", agent_id: "a1", task_id: "task-9",
@@ -75,6 +85,10 @@ function makeTcvdb(): TcvdbMemoryStore {
   });
   (store as unknown as { client: unknown }).client = {
     upsert: async (_c: string, batch: Array<Record<string, unknown>>) => { for (const d of batch) docs.set(String(d.id), d); },
+    count: async (_c: string, filter?: string) => {
+      const m = filter ? /record_id = "([^"]*)"/.exec(filter) : null;
+      return [...docs.values()].filter((d) => !m || d.record_id === m[1]).length;
+    },
     query: async (_c: string, p: Record<string, unknown>) => {
       const ids = p.documentIds as string[] | undefined;
       const all = ids ? ids.flatMap((i) => (docs.has(i) ? [docs.get(i)!] : [])) : [...docs.values()];
@@ -100,6 +114,14 @@ describe("memory_events codec conformance (sqlite ↔ tcvdb)", () => {
   afterEach(() => {
     sqlite.close();
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it("invalid review metadata is rejected before commit on both durable implementations", async () => {
+    const event: MemoryEvent = { ...FIXTURES[0]!, review: { protocol: 1, observed: Array.from({ length: 50_001 }, () => "token") } };
+    expect(() => sqlite.appendMemoryEvent(event)).toThrow("Invalid review protocol payload");
+    await expect(tcvdb.appendMemoryEvent(event)).rejects.toThrow("Invalid review protocol payload");
+    expect(sqlite.queryMemoryEvents({})).toEqual([]);
+    expect(await tcvdb.queryMemoryEvents({})).toEqual([]);
   });
 
   for (const fx of FIXTURES) {

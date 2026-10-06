@@ -1,12 +1,11 @@
 /**
  * L1 审核可见性；契约与剩余门禁见 docs/change-ledger.md。
- * 消费读默认抑制，审计/去重显式指定范围；关闭开关只取消缺省抑制。
+ * 消费读默认抑制，审计/去重显式指定范围；开关只控制 HTTP 审核写入口。
  */
 export type ReviewStatus = "active" | "quarantined";
 export type VisibilityScope = "active" | "quarantined" | "all";
 
 const DEFAULT_VISIBILITY_SCOPE: VisibilityScope = "active";
-const REVIEW_STATUS_COLUMN = "review_status";
 export const DEFAULT_REVIEW_STATUS: ReviewStatus = "active";
 const VISIBILITY_OVERFETCH_FACTOR = 3;
 const VISIBILITY_OVERFETCH_CAP = 500;
@@ -30,7 +29,7 @@ export interface VisibilityAware {
 }
 
 export function resolveVisibilityScope(filter: VisibilityAware | undefined): VisibilityScope {
-  return filter?.visibility ?? (isMemoryReviewEnabled() ? DEFAULT_VISIBILITY_SCOPE : "all");
+  return filter?.visibility ?? DEFAULT_VISIBILITY_SCOPE;
 }
 
 export function visibilityNeedsFilter(scope: VisibilityScope): boolean {
@@ -44,9 +43,9 @@ export function rowMatchesVisibility(
   return scope === "all" || normalizeReviewStatus(row.review_status) === scope;
 }
 
-/** 老数据缺字段按 active；未知值也按 active 是当前兼容策略，不是 fail-closed。 */
+/** 老数据缺字段按 active；未知非空值按 quarantined，审计读另报异常。 */
 export function normalizeReviewStatus(v: unknown): ReviewStatus {
-  return v === "quarantined" ? "quarantined" : DEFAULT_REVIEW_STATUS;
+  return v === undefined || v === null || v === "" || v === "active" ? DEFAULT_REVIEW_STATUS : "quarantined";
 }
 
 /** 补偿封顶但不得缩减调用方原有预算；all 保留基线行为。 */
@@ -70,17 +69,4 @@ export function recallTruncationWarning(where: string, p: { requested: number; k
     `[memory-review] recall_truncated at ${where}: requested=${p.requested} kept=${p.kept} ` +
     `retrieveLimit=${p.retrieveLimit} — 被撤回记忆占满了超取窗口，召回结果可能不完整`
   );
-}
-
-/** $ne 保留缺字段的历史文档；active 等值查询会使它们消失。 */
-export function visibilityMongoCondition(scope: VisibilityScope): Record<string, unknown> | undefined {
-  if (!visibilityNeedsFilter(scope)) return undefined;
-  return scope === "quarantined"
-    ? { [REVIEW_STATUS_COLUMN]: "quarantined" }
-    : { [REVIEW_STATUS_COLUMN]: { $ne: "quarantined" } };
-}
-
-/** active 必须客户端后过滤；quarantined 下推仍需后端 filter 索引门禁。 */
-export function visibilityTcvdbCondition(scope: VisibilityScope): string | undefined {
-  return scope === "quarantined" ? `${REVIEW_STATUS_COLUMN}="quarantined"` : undefined;
 }

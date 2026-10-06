@@ -116,6 +116,11 @@ export interface L1QueryFilter extends VisibilityAware {
 export interface L1RecordRow {
   /** 审核状态；后端映射须覆盖。历史行可缺省，所以类型本身不能防止漏映射，需契约测试。 */
   review_status?: ReviewStatus;
+  review_sources_json?: string;
+  review_guard_at?: string;
+  review_tokens?: string[];
+  review_invalid?: boolean;
+  review_incomplete?: boolean;
   record_id: string;
   content: string;
   type: string;
@@ -526,8 +531,8 @@ export interface KnowledgeListResult {
  * - `SqliteMemoryStore` (sqlite.ts) — local SQLite + sqlite-vec + FTS5
  * - `TcvdbMemoryStore` (tcvdb.ts) — Tencent Cloud VectorDB (future)
  *
- * All methods are fault-tolerant: they return empty results or `false` on
- * failure rather than throwing, unless explicitly documented otherwise.
+ * Legacy writes may return `false`; ledger and review-aware reads propagate
+ * failures so callers cannot interpret an unavailable backend as empty data.
  */
 /**
  * Helper type: a value that may be sync or async.
@@ -647,11 +652,12 @@ export interface MemoryEvent {
   user_id?: string;
   agent_id?: string;
   task_id?: string;
+  review?: { protocol: 1; observed?: string[]; sources?: string[]; request_hash?: string; operation_id?: string; no_op?: boolean; content_hash?: string; fence_hash?: string; guard_at?: string };
   /** 变更类型。 */
   op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted" | "retracted" | "restored";
   /** 本事件对应的 record id（superseded 时为旧 record id）。 */
   record_id: string;
-  /** 审阅者（reverted 事件 = 驳回操作的执行人，来自 v3 isolation 三元组）。 */
+  /** 操作者的显式声明，不回落记忆所有者；不代表独立认证或授权。 */
   reviewer_id?: string;
   /** 内容快照（superseded 时为被替代的旧内容；deleted 事件为空串）。 */
   content: string;
@@ -711,6 +717,7 @@ export interface MemoryEventFilter {
   layer?: MemoryEvent["layer"];
   source?: MemoryEvent["source"];
   request_id?: string;
+  event_id?: string;
   team_id?: string;
   agent_id?: string;
   user_id?: string;
@@ -721,6 +728,8 @@ export interface MemoryEventFilter {
   until?: string;
   limit?: number;   // 默认 100，上限 1000
   offset?: number;
+  metadata_only?: boolean;
+  scope?: MemoryEvent["scope"];
   /** 排序方向：默认 "asc"（按追加序）。inbox 等"看最新"场景用 "desc"。 */
   order?: "asc" | "desc";
 }
@@ -755,13 +764,14 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
    *
    * 可选能力 —— 未实现的后端由网关返回 501，沿用 appendMemoryEvent 的惯例。
    * 返回 undefined = 记录不存在或不属于该租户；`changed:false` = 幂等空操作（DP-18）。
-   * 本方法只改状态列；账本由调用方另写，持久一致性门禁见 docs/change-ledger.md。
+   * 本方法持久提交审核事件；状态由统一解析器推导，返回 event 供已提交 outbox 镜像。
    */
   setL1ReviewStatus?(
     recordId: string,
     status: ReviewStatus,
     filter?: IsolationFilter,
-  ): MaybePromise<{ changed: boolean; previous: ReviewStatus } | undefined>;
+    operation?: { operation_id?: string; request_id?: string; reviewer_id?: string; reason?: string; persist_no_op?: boolean },
+  ): MaybePromise<{ changed: boolean; previous: ReviewStatus; event?: MemoryEvent } | undefined>;
 
   // ── L1 Read ──────────────────────────────────────────────
 
@@ -770,7 +780,7 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
    * `opts.strict`: rethrow backend errors instead of returning [] — required by
    * callers (e.g. revert guards) that must not read a failed query as "no rows".
    */
-  queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean }): MaybePromise<L1RecordRow[]>;
+  queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean; review?: boolean; metadataOnly?: boolean }): MaybePromise<L1RecordRow[]>;
   getAllL1Texts(): MaybePromise<Array<{ record_id: string; content: string; updated_time: string }>>;
 
   // ── L1 Search ────────────────────────────────────────────

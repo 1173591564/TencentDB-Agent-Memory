@@ -136,7 +136,35 @@ describe("被撤回的记忆不得通过合并复活", () => {
     expect(upsert).not.toHaveBeenCalled();
   });
 
-  it("开关关闭时守卫不生效，行为等同基线", async () => {
+  it("a failed successor commit never destroys its predecessor or claims supersession", async () => {
+    await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("prior"), decision: decision("prior", "store") });
+    vi.spyOn(store, "upsertL1").mockReturnValueOnce(false);
+    const deletion = vi.spyOn(store, "deleteL1Batch");
+    const result = await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("next"), decision: decision("next", "update", ["prior"]) });
+    expect(result).toBeNull();
+    expect(deletion).not.toHaveBeenCalled();
+    expect(store.queryL1Records(ISO).map((r) => r.record_id)).toEqual(["prior"]);
+    expect(store.queryMemoryEvents({ record_id: "next" })).toEqual([]);
+  });
+
+  it("a retraction during successor commit survives even when extraction ledger writes fail", async () => {
+    await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("prior"), decision: decision("prior", "store") });
+    const upsert = store.upsertL1.bind(store);
+    vi.spyOn(store, "upsertL1").mockImplementationOnce((record, embedding) => {
+      store.setL1ReviewStatus("prior", "quarantined", ISO);
+      return upsert(record, embedding);
+    });
+    const append = store.appendMemoryEvent.bind(store);
+    vi.spyOn(store, "appendMemoryEvent").mockImplementation((e) => {
+      if (e.source === "extraction") throw new Error("ledger unavailable");
+      return append(e);
+    });
+    await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("next"), decision: decision("next", "update", ["prior"]) });
+    expect(store.queryL1Records(ISO)).toEqual([]);
+    expect(store.queryL1Records({ ...ISO, visibility: "all" })[0]?.review_sources_json).toBe('["prior"]');
+  });
+
+  it("关闭审核写入口仍保留防复活守卫", async () => {
     await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("基线行为"), decision: decision("m_base", "store") });
     store.setL1ReviewStatus("m_base", "quarantined", ISO);
 
@@ -146,6 +174,6 @@ describe("被撤回的记忆不得通过合并复活", () => {
       memory: memory("基线行为更新"),
       decision: decision("m_base2", "update", ["m_base"], "基线行为更新"),
     });
-    expect(written).not.toBeNull();  // 关闭时不拦截
+    expect(written).toBeNull();  // 关闭审核写入口不取消已有抑制
   });
 });

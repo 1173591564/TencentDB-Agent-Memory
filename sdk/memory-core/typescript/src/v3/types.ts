@@ -229,7 +229,6 @@ export interface V3MemoryRevertResult {
   target_event_id?: string;
   operation_id?: string;
   outbox_pending?: boolean;
-  tombstone_pending?: boolean;
   status?: number;
   error?: string;
   commit_unknown?: boolean;

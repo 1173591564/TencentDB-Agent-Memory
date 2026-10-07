@@ -33,7 +33,7 @@ export async function queryMemoryRecords(
     throw new Error("Authoritative memory store unavailable");
   }
 
-  const rows = await vectorStore.queryL1Records(filter, { strict: true });
+  const rows = await vectorStore.queryL1Records(filter);
   return rows.map(rowToMemoryRecord);
 }
 

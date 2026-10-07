@@ -99,7 +99,7 @@ export interface L1FtsResult {
 
 /** Filter options for querying L1 records. */
 export interface L1QueryFilter extends VisibilityAware {
-  /** Query by document primary keys (maps to VDB `documentIds`, max 20). */
+  /** Query by primary keys; an empty selection matches nothing. Backend adapters own batching. */
   recordIds?: string[];
   sessionKey?: string;
   sessionId?: string;
@@ -782,11 +782,8 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
   // ── L1 Read ──────────────────────────────────────────────
 
   countL1(filter?: L1CountFilter): MaybePromise<number>;
-  /**
-   * `opts.strict`: rethrow backend errors instead of returning [] — required by
-   * callers (e.g. revert guards) that must not read a failed query as "no rows".
-   */
-  queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean; review?: boolean; metadataOnly?: boolean }): MaybePromise<L1RecordRow[]>;
+  /** Backend errors propagate; raw audit reads do not bypass failure reporting. */
+  queryL1Records(filter?: L1QueryFilter, opts?: { review?: boolean; metadataOnly?: boolean }): MaybePromise<L1RecordRow[]>;
   getAllL1Texts(): MaybePromise<Array<{ record_id: string; content: string; updated_time: string }>>;
 
   // ── L1 Search ────────────────────────────────────────────

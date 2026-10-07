@@ -5,7 +5,7 @@ import { TcvdbMemoryStore } from "./memory-store.js";
 import type { TcvdbClient } from "./client.js";
 import { __setMemoryReviewEnabledForTests } from "../visibility.js";
 import type { MemoryRecord } from "../../record/l1-writer.js";
-import type { MemoryEvent } from "../types.js";
+import type { IMemoryStore, MemoryEvent } from "../types.js";
 import { newMemoryEventId } from "../memory-event-id.js";
 import { ReviewCapabilityError, reviewEventId } from "../review.js";
 
@@ -138,9 +138,32 @@ describe("TCVDB review through the HTTP client contract", () => {
     __setMemoryReviewEnabledForTests(undefined);
   });
 
+  it("one L1 decoder gives identical primary, full-scan and paginated rows", async () => {
+    const l1 = [...collections.values()].find((c) => c.has("root"))!;
+    const old = { ...l1.get("root") }; delete old.priority;
+    l1.set("root", old);
+    const filter = { ...iso, visibility: "all" as const };
+    const direct = (await store.queryL1Records({ ...filter, recordIds: ["root"] }))[0];
+    const scanned = (await store.queryL1Records(filter)).find((r) => r.record_id === "root");
+    const paginated = (await store.queryL1Paginated({ ...filter, limit: 10, offset: 0 })).rows.find((r) => r.record_id === "root");
+    expect(direct.priority).toBe(0);
+    expect(scanned).toEqual(direct);
+    expect(paginated).toEqual(direct);
+  });
+
+  it("empty primary-key selections do not scan and raw reads still reject degradation", async () => {
+    const before = calls.length;
+    expect(await store.queryL1Records({ ...iso, recordIds: [] })).toEqual([]);
+    expect(calls).toHaveLength(before);
+    const state = store as unknown as { degraded: boolean };
+    state.degraded = true;
+    try { await expect(store.queryL1Records({ ...iso, visibility: "all" }, { review: false })).rejects.toThrow("degraded"); }
+    finally { state.degraded = false; }
+  });
+
   it("native TCVDB refuses new immutable commands before any event or L1 write", async () => {
     const before = calls.length;
-    await expect(store.setL1ReviewStatus("root", "quarantined", iso)).rejects.toBeInstanceOf(ReviewCapabilityError);
+    expect((store as IMemoryStore).setL1ReviewStatus).toBeUndefined();
     expect(calls).toHaveLength(before);
     const event: MemoryEvent = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", layer: "l1", content: "", op: "retracted", source: "review", review: { protocol: 2, operation_id: `rop-${"a".repeat(64)}`, request_hash: "b".repeat(64), previous_status: "active" } };
     event.event_id = reviewEventId(event);
@@ -156,7 +179,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     expect((await peer.searchL1Hybrid({ query: "kubernetes", topK: 2, filter: iso })).map((r) => r.record_id)).toEqual(["clean"]);
     expect((await peer.queryL1Paginated({ ...iso, visibility: "quarantined", limit: 10, offset: 0 })).rows[0]?.record_id).toBe("root");
     expect((await peer.getAllL1Texts()).map((r) => r.record_id)).toEqual(["clean"]);
-    await expect(peer.setL1ReviewStatus("root", "active", { ...iso, userId: "other" })).rejects.toBeInstanceOf(ReviewCapabilityError);
+    expect((peer as IMemoryStore).setL1ReviewStatus).toBeUndefined();
     await peer.appendMemoryEvent({ ...retract, event_id: newMemoryEventId(), op: "restored", review: { protocol: 1, observed: [retract.event_id!] } });
     expect(await store.countL1(iso)).toBe(2);
   });

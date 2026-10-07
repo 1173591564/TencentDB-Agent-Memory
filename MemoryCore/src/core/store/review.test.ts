@@ -45,7 +45,7 @@ describe("committed observed-retraction review protocol", () => {
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  const all = () => store.queryL1Records({ ...ISO, visibility: "all" }, { strict: true });
+  const all = () => store.queryL1Records({ ...ISO, visibility: "all" });
   const state = (id = "root") => all().find((r) => r.record_id === id)?.review_status;
 
   it("commit failure changes no materialized state and emits no phantom review", () => {
@@ -93,6 +93,32 @@ describe("committed observed-retraction review protocol", () => {
     expect(() => store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("same"), reason: "first" })).toThrow(ReviewConflictError);
     expect(() => store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("same"), reason: "second" })).toThrow(ReviewConflictError);
     expect(state()).toBe("quarantined");
+  });
+
+  it("legacy operation facts remain readable but are not guessed into current command receipts", () => {
+    const current = store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("current-fact") })!.event!;
+    const legacy = { ...current, event_id: "evt-" + "1".repeat(32), review: { protocol: 1 as const, operation_id: op("legacy-retry"), request_hash: current.review!.request_hash } };
+    store.appendMemoryEvent(legacy);
+    expect(state()).toBe("quarantined");
+    expect(() => store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("legacy-retry") })).toThrow("Legacy review receipts cannot be retried");
+    expect(store.queryMemoryEvents({ record_id: "root", operation_id: op("legacy-retry") })).toHaveLength(1);
+    expect(store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("current-restoration") })?.changed).toBe(true);
+    expect(state()).toBe("active");
+  });
+
+  it("legacy derived receipts cannot bypass the current acknowledgement protocol", async () => {
+    const legacy: MemoryEvent = { event_id: "evt-" + "2".repeat(32), event_ts: "2026-01-01T00:00:00.000Z", session_key: "", session_id: "", ...{ team_id: "t1", agent_id: "a1", user_id: "default" }, record_id: "persona.md", content: "", op: "updated", source: "review", layer: "l3", review: { protocol: 1, operation_id: op("old-derived"), request_hash: "a".repeat(64) } };
+    vi.spyOn(store, "queryMemoryEvents").mockReturnValueOnce([legacy]);
+    await expect(acknowledgeDerivedReview(store, "persona.md", "bytes", { content_hash: "a".repeat(64), fence_hash: "b".repeat(64) }, ISO, { operation_id: "old-derived", reason: "verified" })).rejects.toThrow("Legacy derived review receipts cannot be retried");
+    expect(store.queryMemoryEvents({ source: "review" })).toEqual([]);
+  });
+
+  it("legacy revert receipts cannot be guessed into a committed transactional result", async () => {
+    const legacy: MemoryEvent = { event_id: "evt-" + "3".repeat(32), event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", agent_id: "a1", user_id: "u1", record_id: "root", content: "", op: "reverted", source: "review", layer: "l1", review: { protocol: 1, operation_id: op("old-revert"), request_hash: "a".repeat(64) } };
+    vi.spyOn(store, "queryMemoryEvents").mockReturnValueOnce([legacy]);
+    expect(await revertMemory({ store, recordId: "root", options: { operationId: "old-revert" }, isolation: ISO, logger: { info() {}, debug() {}, warn() {}, error() {} } })).toMatchObject({ ok: false, status: 409, error: "Legacy revert receipts cannot be retried; use a new operation identity" });
+    expect(all().map((r) => r.record_id)).toEqual(["root"]);
+    expect(store.queryMemoryEvents({ source: "review" })).toEqual([]);
   });
 
   it("an explicit no-op receipt remains a no-op after a later review", () => {
@@ -533,7 +559,7 @@ describe("committed observed-retraction review protocol", () => {
 
   it("async and sync resolvers produce the same state", async () => {
     store.setL1ReviewStatus("root", "quarantined", ISO);
-    const raw = store.queryL1Records({ ...ISO, visibility: "all" }, { strict: true, review: false });
+    const raw = store.queryL1Records({ ...ISO, visibility: "all" }, { review: false });
     expect(await resolveReviewRows(store, raw)).toEqual(all());
   });
 
@@ -585,6 +611,20 @@ describe("committed observed-retraction review protocol", () => {
     store.appendMemoryEvent({ event_ts: new Date().toISOString(), session_key: "", session_id: "", team_id: "t1", agent_id: "a1", record_id: "clear", content: "", op: "deleted", scope: "agent", layer: "l1", source: "api_mutation" });
     await scoped.writeFile("persona.md", "late derived bytes");
     expect(await scoped.readFile("persona.md")).toBeNull();
+  });
+
+  it.each(["keyword", "embedding", "hybrid"] as const)("auto-recall %s preserves one formatted result and activity metadata", async (strategy) => {
+    const { performAutoRecall } = await import("../hooks/auto-recall.js");
+    const hit = { ...all()[0], score: 1, metadata_json: JSON.stringify({ activity_start_time: "2026-01-01T00:00:00.000Z", activity_end_time: "2026-02-01T00:00:00.000Z" }) };
+    vi.spyOn(store, "searchL1Fts").mockReturnValue([hit]);
+    vi.spyOn(store, "searchL1Vector").mockReturnValue([hit]);
+    const embedding = { embed: vi.fn(async () => new Float32Array([1])) };
+    const result = await performAutoRecall({ userText: "kubernetes", actorId: "u1", sessionKey: "sk", cfg: { recall: { strategy, timeoutMs: 5000, maxResults: 5, scoreThreshold: 0 } } as never, pluginDataDir: dir, vectorStore: store, embeddingService: embedding as never, storage, profileIsolation: ISO });
+    expect(result?.error).toBeUndefined();
+    expect(result?.recalledL1Memories).toHaveLength(1);
+    expect(result?.recalledL1Memories?.[0].content).toBe("fact root");
+    expect(result?.prependContext).toContain("2026-01-01 ~ 2026-02-01");
+    if (strategy === "keyword") expect(embedding.embed).not.toHaveBeenCalled();
   });
 
   it("auto-recall cannot fall back to raw profile files when its ledger is unavailable and writes are disabled", async () => {

@@ -426,8 +426,9 @@ export class MongoMemoryStore implements IMemoryStore {
     return q;
   }
 
-  async queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean; review?: boolean; metadataOnly?: boolean }): Promise<L1RecordRow[]> {
+  async queryL1Records(filter?: L1QueryFilter, opts?: { review?: boolean; metadataOnly?: boolean }): Promise<L1RecordRow[]> {
     const coll = await this.coll(COLLECTIONS.L1);
+    if (filter?.recordIds?.length === 0) return [];
     const q: Record<string, unknown> = {};
 
     if (filter?.recordIds && filter.recordIds.length > 0) q._id = { $in: filter.recordIds };
@@ -490,7 +491,7 @@ export class MongoMemoryStore implements IMemoryStore {
     const budget = scope === "all" ? limit : Math.max(limit, Math.min(limit * 15, 500));
     const docs = await this.runSearch(coll, searchText, budget, filter);
     if (!docs.length) return [];
-    const current = await this.queryL1Records({ ...filter, recordIds: docs.map(({ doc }) => String(doc._id)), visibility: scope }, { strict: true });
+    const current = await this.queryL1Records({ ...filter, recordIds: docs.map(({ doc }) => String(doc._id)), visibility: scope });
     const byId = new Map(current.map((r) => [r.record_id, r]));
     const kept = docs.filter(({ doc }) => byId.has(String(doc._id))).map(({ doc, score }) => {
       const row = byId.get(String(doc._id))!;

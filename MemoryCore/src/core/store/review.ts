@@ -281,7 +281,7 @@ function* reviewResolution(store: IMemoryStore, rows: L1RecordRow[]): ReviewProg
   const graph = new ReviewGraph(rows);
   for (let nodes = graph.next(); nodes.length; nodes = graph.next()) {
     const f = filters(nodes);
-    const raw = (yield store.queryL1Records(f.rows, { strict: true, review: false, metadataOnly: true })) as L1RecordRow[];
+    const raw = (yield store.queryL1Records(f.rows, { review: false, metadataOnly: true })) as L1RecordRow[];
     const events = (yield queryReviewHistory(store, f.events)) as MemoryEvent[];
     const ck = clearKey(nodes[0]!.scope);
     if (!graph.clears.has(ck)) graph.clears.set(ck, ((yield store.queryMemoryEvents(clearFilter({ team_id: nodes[0]!.scope.team_id, agent_id: nodes[0]!.scope.agent_id }))) as MemoryEvent[])[0]);
@@ -352,8 +352,10 @@ const requestHash = (id: string, status: ReviewStatus, op: Operation) => createH
   .update(JSON.stringify([id, status, op.reason ?? "", op.reviewer_id ?? ""])).digest("hex");
 
 function previousResult(e: MemoryEvent, id: string, status: ReviewStatus, op: Operation) {
-  if (e.review?.request_hash !== requestHash(id, status, op)) throw new ReviewConflictError("Review operation identity reused with different input");
-  return { changed: !e.review.no_op, previous: e.review.previous_status ?? (e.review.no_op ? status : status === "active" ? "quarantined" : "active") as ReviewStatus, event: e };
+  if (e.review?.protocol !== 2) throw new ReviewConflictError("Legacy review receipts cannot be retried; use a new operation identity");
+  assertReviewEvent(e);
+  if (e.review.request_hash !== requestHash(id, status, op)) throw new ReviewConflictError("Review operation identity reused with different input");
+  return { changed: !e.review.no_op, previous: e.review.previous_status!, event: e };
 }
 
 export function resolveReviewFacts(rows: L1RecordRow[], events: MemoryEvent[]): L1RecordRow[] {
@@ -395,7 +397,7 @@ function* reviewCommand(store: IMemoryStore, id: string, status: ReviewStatus, f
     if (prior.length > 1) throw new ReviewConflictError("Legacy duplicate review receipts require reconciliation");
     if (prior[0]) return filter?.taskId !== undefined && (prior[0].task_id ?? "") !== filter.taskId ? undefined : previousResult(prior[0], id, status, operation);
   }
-  const rows = (yield store.queryL1Records({ ...filter, recordIds: [id], visibility: "all" }, { strict: true })) as L1RecordRow[];
+  const rows = (yield store.queryL1Records({ ...filter, recordIds: [id], visibility: "all" })) as L1RecordRow[];
   const row = rows[0] ?? (yield* historicalReviewRow(store, id, filter));
   if (!row) return undefined;
   const candidate = change(row, status, operation);

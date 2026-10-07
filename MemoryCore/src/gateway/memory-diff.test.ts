@@ -296,7 +296,7 @@ describe("POST /memory/diff/revert", () => {
   let dir: string;
   let store: VectorStore;
   const writtenFiles = new Map<string, string>();
-  let failTombstone = false;
+  let failOutbox = false;
 
   const call = async (pathname: string, body: unknown, headers: Record<string, string> = ISO_HEADERS) => {
     // Local capture, not a shared `captured` — concurrent calls (the revert
@@ -314,7 +314,7 @@ describe("POST /memory/diff/revert", () => {
       getEmbedding: () => undefined,
       getStorage: () => ({
         appendFile: async (key: string, content: string) => {
-          if (failTombstone && content.includes('"tombstone":"l1"')) throw new Error("cos down");
+          if (failOutbox && key.startsWith("events/")) throw new Error("cos down");
           writtenFiles.set(key, (writtenFiles.get(key) ?? "") + content);
         },
       }) as never,
@@ -362,15 +362,14 @@ describe("POST /memory/diff/revert", () => {
     expect(change?.reverted_by).toBeUndefined();
   });
 
-  it("appends a JSONL tombstone so replay cannot resurrect the record", async () => {
-    await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    const tombstoneLines = [...writtenFiles.values()]
-      .flatMap((v) => v.split("\n"))
-      .filter((l) => l.includes('"tombstone":"l1"'));
-    expect(tombstoneLines).toHaveLength(1);
-    const tomb = JSON.parse(tombstoneLines[0]);
-    expect(tomb).toMatchObject({ record_id: "m_b" });
-    expect(tomb.reviewer_id).toBeUndefined();
+  it("revert publishes only its authoritative receipt and does not append a parallel record tombstone", async () => {
+    await call("/v3/memory/diff/revert", { record_id: "m_b", operation_id: "one-revert-receipt" });
+    expect([...writtenFiles.keys()].every((key) => key.startsWith("events/"))).toBe(true);
+    const lines = [...writtenFiles.values()].flatMap((v) => v.split("\n").filter(Boolean)).map((line) => JSON.parse(line));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ record_id: "m_b", op: "reverted", review: { protocol: 2 } });
+    expect(lines[0].event_id).toBe(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })[0].event_id);
+    expect(store.queryL1Records({ recordIds: ["m_a", "m_b"] }).map((r) => r.record_id)).toEqual(["m_a"]);
   });
 
   it("second revert is idempotent → 409", async () => {
@@ -467,28 +466,33 @@ describe("POST /memory/diff/revert", () => {
     expect(status).toBe(400);
   });
 
-  it("a failed JSONL tombstone is reported (single and batch) instead of a clean success", async () => {
-    failTombstone = true;
+  it("outbox failure is disclosed without losing the committed revert (single and batch)", async () => {
+    failOutbox = true;
     try {
       const single = await call("/v3/memory/diff/revert", { record_id: "m_b" });
       expect(single.status).toBe(200);
-      expect(single.data).toMatchObject({ reverted: true, tombstone_pending: true });
+      expect(single.data).toMatchObject({ reverted: true, outbox_pending: true });
+      expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })).toHaveLength(1);
       await writeMemory({ ...writeIso, sessionId: "ses-z", baseDir: dir, vectorStore: store, memory: memory("salary 7000"), decision: decision("m_c", "store") });
       const batch = await call("/v3/memory/diff/revert", { record_ids: ["m_c"] });
-      expect((batch.data!.results as Array<Record<string, unknown>>)[0]).toMatchObject({ reverted: true, tombstone_pending: true });
+      expect((batch.data!.results as Array<Record<string, unknown>>)[0]).toMatchObject({ reverted: true, outbox_pending: true });
+      expect(store.queryMemoryEvents({ record_id: "m_c", op: "reverted" })).toHaveLength(1);
     } finally {
-      failTombstone = false;
+      failOutbox = false;
     }
   });
 
-  it("tombstone line is newline-terminated so the next append cannot glue onto it", async () => {
-    await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    const file = [...writtenFiles.values()].find((v) => v.includes('"tombstone":"l1"'));
+  it("receipt outbox lines are newline-terminated and retries keep one durable receipt", async () => {
+    const body = { record_id: "m_b", operation_id: "receipt-lines" };
+    await call("/v3/memory/diff/revert", body);
+    await call("/v3/memory/diff/revert", body);
+    const file = [...writtenFiles.values()].find((v) => v.includes('"op":"reverted"'));
     expect(file?.endsWith("\n")).toBe(true);
     // 行级完整性：文件里每个非空行都必须能独立 JSON.parse（粘连行会挂）。
     for (const line of (file ?? "").split("\n").filter((l) => l.trim())) {
       expect(() => JSON.parse(line)).not.toThrow();
     }
+    expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })).toHaveLength(1);
   });
 
   it("blocks reverting a mid-chain record that was itself superseded", async () => {

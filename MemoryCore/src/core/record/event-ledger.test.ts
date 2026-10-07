@@ -55,7 +55,7 @@ describe("event ledger outbox", () => {
   });
 
   const outboxLines = async (date = "2026-03-01") =>
-    ((await storage.readFile(StoragePaths.event(date))) ?? "").split("\n").filter(Boolean).map((l) => JSON.parse(l) as MemoryEvent);
+    ((await storage.readFile(StoragePaths.eventShard(date))) ?? "").split("\n").filter(Boolean).map((l) => JSON.parse(l) as MemoryEvent);
 
   it("writes the same event_id to the outbox and the store", async () => {
     const r = await appendLedgerEvent({ store, storage, event: ev(), logger: silent });
@@ -131,7 +131,7 @@ describe("event ledger outbox", () => {
     await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_old", event_ts: "2026-02-01T00:00:00.000Z" }), logger: silent });
     await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_new" }), logger: silent });
     await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_other", team_id: "t2" }), logger: silent });
-    await storage.appendFile(StoragePaths.event("2026-03-01"), "{not json\n");
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"), "{not json\n");
 
     const r = await replayLedgerEvents({ store, storage, since: "2026-03-01T00:00:00.000Z", scope: { team_id: "t1" }, logger: silent });
     expect(r).toMatchObject({ files: 1, replayed: 1, skipped: 1, malformed: 1 });
@@ -139,7 +139,7 @@ describe("event ledger outbox", () => {
   });
 
   it("non-object outbox rows count as malformed without stopping later rows or shards", async () => {
-    await storage.appendFile(StoragePaths.event("2026-03-01"), "null\n42\n\"str\"\n[1,2]\n");
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"), "null\n42\n\"str\"\n[1,2]\n");
     await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_a" }), logger: silent });
     await appendLedgerEvent({ store: undefined, storage, event: ev({ record_id: "m_b", event_ts: "2026-03-02T00:00:00.000Z" }), logger: silent });
 
@@ -150,7 +150,7 @@ describe("event ledger outbox", () => {
 
   it("rows with non-string content or isolation ids are malformed, never coerced into the store", async () => {
     const good = ev({ event_id: eid(1) });
-    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"), [
       JSON.stringify({ ...good, event_id: eid(2), team_id: 123 }),
       JSON.stringify({ ...good, event_id: eid(3), content: { secret: "p" } }),
       JSON.stringify({ ...good, event_id: eid(4), session_key: 5 }),
@@ -169,7 +169,7 @@ describe("event ledger outbox", () => {
 
   it("rows with an unknown op or unparseable fields are malformed, not store failures", async () => {
     const good = ev({ event_id: eid(1) });
-    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"), [
       JSON.stringify({ ...good, event_id: eid(7), op: "exploded" }),
       JSON.stringify({ ...good, event_id: eid(8), event_ts: "yesterday" }),
       JSON.stringify({ ...good, event_id: "evt-not32hex" }),
@@ -195,14 +195,14 @@ describe("event ledger outbox", () => {
 
   it("a redact marker smuggling an unknown field counts malformed and erases nothing", async () => {
     await appendLedgerEvent({ store, storage, event: ev({ content: "secret" }), logger: silent });
-    await storage.appendFile(StoragePaths.event("2026-03-01"),
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"),
       JSON.stringify({ redact: { team_id: "t1", agent_id: "a1", task_id: "tk", until: "2026-12-31T00:00:00.000Z" }, marker_ts: "2026-03-01T10:00:01.000Z" }) + "\n");
     const r = await replayLedgerEvents({ store, storage, logger: silent });
     expect(r.malformed).toBe(1);
     // 被拒的 marker 未注册：同范围后续 append 仍是明文，历史行也未被骨架化。
     await appendLedgerEvent({ store, storage, event: ev({ record_id: "m_after", content: "still" }), logger: silent });
     expect(store.queryMemoryEvents({ record_id: "m_after" })[0]!.content).toBe("still");
-    expect(await storage.readFile(StoragePaths.event("2026-03-01"))).toContain("secret");
+    expect(await storage.readFile(StoragePaths.eventShard("2026-03-01"))).toContain("secret");
   });
 
   it("a '' team_id redact filter heals to 'default' — marker, registry and wipe agree", async () => {
@@ -224,7 +224,7 @@ describe("event ledger outbox", () => {
 
   it("a foreign marker carrying '' ids still covers 'default'-normalized events", async () => {
     await appendLedgerEvent({ store, storage, event: ev({ team_id: undefined, content: "secret" }), logger: silent });
-    await storage.appendFile(StoragePaths.event("2026-03-02"),
+    await storage.appendFile(StoragePaths.eventShard("2026-03-02"),
       JSON.stringify({ redact: { team_id: "", agent_id: "a1", until: "2026-12-31T00:00:00.000Z" }, marker_ts: "2026-03-02T00:00:01.000Z" }) + "\n");
     const r = await replayLedgerEvents({ store, storage, logger: silent });
     expect(r.redactions_applied).toBe(1);
@@ -238,7 +238,7 @@ describe("event ledger outbox", () => {
     expect(res).toMatchObject({ jsonl: false });
     expect(res.redacted).toBeUndefined();
     expect(store.queryMemoryEvents({ record_id: "m_x" })[0]!.content).toBe("secret");
-    expect(await storage.readFile(StoragePaths.event("2026-03-01"))).not.toContain('"redact"');
+    expect(await storage.readFile(StoragePaths.eventShard("2026-03-01"))).not.toContain('"redact"');
   });
 
   it("a failed store redaction degrades the ledger until backfill re-applies the marker", async () => {
@@ -307,7 +307,7 @@ describe("event ledger outbox", () => {
   });
 
   it("replay normalizes foreign event_ts forms and rejects ambiguous/lossy ones", async () => {
-    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"), [
       JSON.stringify({ ...ev({ record_id: "m_off" }), event_ts: "2026-03-01T18:00:00+08:00", event_id: eid(2) }),
       JSON.stringify({ ...ev({ record_id: "m_noms" }), event_ts: "2026-03-01T10:00:00Z", event_id: eid(3) }),
       // Parseable garbage and zone-less instants are malformed, never stored.
@@ -323,7 +323,7 @@ describe("event ledger outbox", () => {
 
   it("a marker's non-canonical until is normalized; a garbage until counts malformed and wipes nothing", async () => {
     await appendLedgerEvent({ store: undefined, storage, event: ev({ content: "secret" }), logger: silent });
-    await storage.appendFile(StoragePaths.event("2026-03-01"), [
+    await storage.appendFile(StoragePaths.eventShard("2026-03-01"), [
       // "+08:00" → 2026-12-30T16:00:00.000Z — still covers the March event.
       JSON.stringify({ redact: { team_id: "t1", agent_id: "a1", until: "2026-12-31T00:00:00+08:00" }, marker_ts: "2026-12-30T16:00:01.000Z" }),
       // A parseable-but-non-ISO until would lexically cover EVERY event row.

@@ -342,12 +342,6 @@ export class VectorStore implements IMemoryStore {
   private stmtDeleteMeta!: StatementSync;
   private stmtGetMeta!: StatementSync;
   private stmtSearchVec?: StatementSync;   // optional — only set when vecTablesReady
-  private stmtQueryBySessionId!: StatementSync;
-  private stmtQueryBySessionIdSince!: StatementSync;
-  private stmtQueryBySessionKey!: StatementSync;
-  private stmtQueryBySessionKeySince!: StatementSync;
-  private stmtQueryAll!: StatementSync;
-  private stmtQueryAllSince!: StatementSync;
 
   // Prepared statements — L0 (initialized in init())
   private stmtL0UpsertMeta!: StatementSync;
@@ -1306,48 +1300,8 @@ export class VectorStore implements IMemoryStore {
 
     // Mark vec0 tables as ready only when they were actually created
     this.vecTablesReady = this.dimensions > 0;
-    // L1 query statements (for l1-reader)
-    // user_id / agent_id surfaced in every L1 read so callers (router /
-    // candidate-pool / l1-reader) can enforce isolation downstream.
-    const l1QueryCols = L1_QUERY_COLS;
-
-    this.stmtQueryBySessionId = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
-      WHERE session_id = ?
-      ORDER BY updated_time ASC
-    `);
-
-    this.stmtQueryBySessionIdSince = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
-      WHERE session_id = ? AND updated_time > ?
-      ORDER BY updated_time ASC
-    `);
-
-    this.stmtQueryBySessionKey = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
-      WHERE session_key = ?
-      ORDER BY updated_time ASC
-    `);
-
-    this.stmtQueryBySessionKeySince = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
-      WHERE session_key = ? AND updated_time > ?
-      ORDER BY updated_time ASC
-    `);
-
-    this.stmtQueryAll = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
-      ORDER BY updated_time ASC
-    `);
-
-    this.stmtQueryAllSince = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
-      WHERE updated_time > ?
-      ORDER BY updated_time ASC
-    `);
-
     this.stmtL1QueryMigrationCursor = this.db.prepare(`
-      SELECT ${l1QueryCols} FROM l1_records
+      SELECT ${L1_QUERY_COLS} FROM l1_records
       WHERE record_id > ?
       ORDER BY record_id ASC
       LIMIT ?
@@ -1724,10 +1678,7 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
-  /**
-   * 事后审核：改一条 L1 的可见性状态（DP-01）。
-   * 幂等：已处于目标状态时返回 changed:false，调用方据此不写第二条账本事件（DP-18）。
-   */
+  /** 事后审核：提交独立撤回或观察集合恢复；同身份返回原收据。 */
   setL1ReviewStatus(recordId: string, status: ReviewStatus, filter?: IsolationFilter, operation?: Parameters<NonNullable<IMemoryStore["setL1ReviewStatus"]>>[3]) {
     if (this.degraded) throw new Error("L1 review rejected: sqlite store is degraded");
     return setReviewStatusSync(this, recordId, status, filter, operation);
@@ -1927,97 +1878,27 @@ export class VectorStore implements IMemoryStore {
 
   /**
    * Query L1 records with optional record-id, session and time filters.
-   *
-   * A non-empty `recordIds` list takes the primary-key IN path; otherwise the
-   * composite index `idx_l1_session_updated(session_id, updated_time)` is used
-   * for efficient filtering. All timestamps are compared as UTC ISO 8601 strings.
-   *
-   * Review-aware and strict reads propagate failures; only explicitly raw
-   * non-strict compatibility reads may return an empty array on failure.
+   * All supplied predicates intersect; backend failures propagate for audit and consumption alike.
    */
-  queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean; review?: boolean; metadataOnly?: boolean }): L1RecordRow[] {
-    if (this.degraded) {
-      this.logger?.warn(`${TAG} [L1-query] SKIPPED (degraded mode)`);
-      if (opts?.strict || opts?.review !== false) throw new Error("L1 query rejected: sqlite store is degraded");
-      return [];
-    }
+  queryL1Records(filter?: L1QueryFilter, opts?: { review?: boolean; metadataOnly?: boolean }): L1RecordRow[] {
+    if (this.degraded) throw new Error("L1 query rejected: sqlite store is degraded");
+    if (filter?.recordIds?.length === 0) return [];
     try {
       const { sessionKey, sessionId, taskId, updatedAfter, recordIds } = filter ?? {};
-
-      let raw: Record<string, unknown>[];
-
-      // Targeted lookup by primary key. Matches MongoDB ($in on _id) and
-      // TCVDB (documentIds) semantics: an empty/absent list falls through to
-      // the session/time statement matrix; a non-empty list narrows by
-      // record_id while the remaining predicates still apply.
-      if (opts?.metadataOnly || filter?.teamId !== undefined || filter?.userId !== undefined || filter?.agentId !== undefined || filter?.taskId !== undefined) {
-        const conditions: string[] = [];
-        const args: SQLInputValue[] = [];
-        if (recordIds !== undefined) { conditions.push(recordIds.length ? `record_id IN (${recordIds.map(() => "?").join(",")})` : "0"); args.push(...recordIds); }
-        pushIsoCond(conditions, args, "team_id", filter?.teamId);
-        pushIsoCond(conditions, args, "user_id", filter?.userId);
-        pushIsoCond(conditions, args, "agent_id", filter?.agentId);
-        if (taskId !== undefined) { conditions.push("task_id = ?"); args.push(taskId); }
-        if (sessionId !== undefined) { conditions.push("session_id = ?"); args.push(sessionId); }
-        if (sessionKey !== undefined) { conditions.push("session_key = ?"); args.push(sessionKey); }
-        if (updatedAfter !== undefined) { conditions.push("updated_time > ?"); args.push(updatedAfter); }
-        if (opts?.review === false && filter?.visibility === "quarantined") conditions.push("COALESCE(review_status,'active') NOT IN ('','active')");
-        const cols = opts?.metadataOnly ? L1_QUERY_COLS.replace(/\bcontent\b/, "'' AS content").replace(/\bmetadata_json\b/, "'{}' AS metadata_json") : L1_QUERY_COLS;
-        raw = this.db.prepare(`SELECT ${cols} FROM l1_records ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""} ORDER BY updated_time, record_id LIMIT 50001`).all(...args) as Record<string, unknown>[];
-        if (raw.length > 50_000) throw new Error("Review row budget exceeded; narrow scope");
-      } else if (recordIds && recordIds.length > 0) {
-        const conditions = [`record_id IN (${recordIds.map(() => "?").join(",")})`];
-        const params: SQLInputValue[] = [...recordIds];
-        // Priority: sessionId > sessionKey (sessionId is more specific)
-        if (sessionId) {
-          conditions.push("session_id = ?");
-          params.push(sessionId);
-        } else if (sessionKey) {
-          conditions.push("session_key = ?");
-          params.push(sessionKey);
-        }
-        if (updatedAfter) {
-          conditions.push("updated_time > ?");
-          params.push(updatedAfter);
-        }
-        raw = this.db
-          .prepare(
-            `SELECT ${L1_QUERY_COLS} FROM l1_records WHERE ${conditions.join(" AND ")} ORDER BY updated_time ASC`,
-          )
-          .all(...params) as Record<string, unknown>[];
-      } else if (sessionId && updatedAfter) {
-        raw = this.stmtQueryBySessionIdSince.all(sessionId, updatedAfter) as Record<string, unknown>[];
-      } else if (sessionId) {
-        raw = this.stmtQueryBySessionId.all(sessionId) as Record<string, unknown>[];
-      } else if (sessionKey && updatedAfter) {
-        raw = this.stmtQueryBySessionKeySince.all(sessionKey, updatedAfter) as Record<string, unknown>[];
-      } else if (sessionKey) {
-        raw = this.stmtQueryBySessionKey.all(sessionKey) as Record<string, unknown>[];
-      } else if (updatedAfter) {
-        raw = this.stmtQueryAllSince.all(updatedAfter) as Record<string, unknown>[];
-      } else {
-        raw = this.stmtQueryAll.all() as Record<string, unknown>[];
-      }
-
-      // Runtime sanity check: verify first row has expected columns (guards against schema drift)
-      if (raw.length > 0 && !("record_id" in raw[0] && "content" in raw[0])) {
-        this.logger?.warn(
-          `${TAG} [L1-query] Schema mismatch: first row missing expected columns. ` +
-          `Got keys: [${Object.keys(raw[0]).join(", ")}]`,
-        );
-        return [];
-      }
-
-      let rows = raw as unknown as L1RecordRow[];
-      // Prepared statements above optimize the common session/time predicates.
-      // Isolation dimensions are optional and can be combined with any query
-      // shape (notably L2 profile queries use teamId+agentId+updatedAfter
-      // without sessionKey). Apply them in memory to keep the statement matrix
-      // bounded and to match queryL1Paginated semantics.
-      if (filter?.teamId !== undefined) rows = rows.filter((r) => healIsoId(r.team_id ?? "") === healIsoId(filter.teamId));
-      if (filter?.userId !== undefined) rows = rows.filter((r) => healIsoId(r.user_id ?? "") === healIsoId(filter.userId));
-      if (filter?.agentId !== undefined) rows = rows.filter((r) => healIsoId(r.agent_id ?? "") === healIsoId(filter.agentId));
-      if (taskId !== undefined) rows = rows.filter((r) => r.task_id === taskId);
+      const conditions: string[] = [];
+      const args: SQLInputValue[] = [];
+      if (recordIds !== undefined) { conditions.push(`record_id IN (${recordIds.map(() => "?").join(",")})`); args.push(...recordIds); }
+      pushIsoCond(conditions, args, "team_id", filter?.teamId);
+      pushIsoCond(conditions, args, "user_id", filter?.userId);
+      pushIsoCond(conditions, args, "agent_id", filter?.agentId);
+      if (taskId !== undefined) { conditions.push("task_id = ?"); args.push(taskId); }
+      if (sessionId !== undefined) { conditions.push("session_id = ?"); args.push(sessionId); }
+      if (sessionKey !== undefined) { conditions.push("session_key = ?"); args.push(sessionKey); }
+      if (updatedAfter !== undefined) { conditions.push("updated_time > ?"); args.push(updatedAfter); }
+      if (opts?.review === false && filter?.visibility === "quarantined") conditions.push("COALESCE(review_status,'active') NOT IN ('','active')");
+      const cols = opts?.metadataOnly ? L1_QUERY_COLS.replace(/\bcontent\b/, "'' AS content").replace(/\bmetadata_json\b/, "'{}' AS metadata_json") : L1_QUERY_COLS;
+      let rows = this.ledgerStmt(`SELECT ${cols} FROM l1_records ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""} ORDER BY updated_time, record_id LIMIT 50001`).all(...args) as unknown as L1RecordRow[];
+      if (rows.length > 50_000) throw new Error("Review row budget exceeded; narrow scope");
       // DP-03：可见性与隔离在同一后过滤点生效。缺省 scope = active（fail-safe）。
       const visScope = resolveVisibilityScope(filter);
       if (opts?.review !== false && (visibilityNeedsFilter(visScope) || filter?.visibility !== undefined)) rows = resolveReviewRowsSync(this, rows);
@@ -2029,11 +1910,8 @@ export class VectorStore implements IMemoryStore {
       );
       return rows;
     } catch (err) {
-      this.logger?.warn(
-        `${TAG} [L1-query] FAILED${opts?.strict ? " (strict, rethrowing)" : " (non-fatal, returning empty)"}: ${err instanceof Error ? err.message : String(err)}`
-      );
-      if (opts?.strict || opts?.review !== false) throw err;
-      return [];
+      this.logger?.warn(`${TAG} [L1-query] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -2460,7 +2338,7 @@ export class VectorStore implements IMemoryStore {
     try {
       // 返回形状里没有 review_status，调用方无从判断 ⇒ 只能给 active（fail-safe）。
       // 需要全量（导出/迁移）的调用方请用 queryL1RecordsCursor，它的行带状态。
-      return this.queryL1Records(undefined, { strict: true }).map(({ record_id, content, updated_time }) => ({ record_id, content, updated_time }));
+      return this.queryL1Records(undefined).map(({ record_id, content, updated_time }) => ({ record_id, content, updated_time }));
     } catch (err) {
       this.logger?.warn(
         `${TAG} getAllL1Texts failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -3352,7 +3230,7 @@ export class VectorStore implements IMemoryStore {
     const CHUNK = 400; // 避开 SQLITE_MAX_VARIABLE_NUMBER
     for (let i = 0; i < ids.length; i += CHUNK) {
       const batch = ids.slice(i, i + CHUNK);
-      for (const row of this.queryL1Records({ ...filter, recordIds: batch, visibility: scope }, { strict: true })) current.set(row.record_id, row);
+      for (const row of this.queryL1Records({ ...filter, recordIds: batch, visibility: scope })) current.set(row.record_id, row);
     }
     return current;
   }

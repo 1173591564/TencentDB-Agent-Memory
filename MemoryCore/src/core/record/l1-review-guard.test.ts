@@ -131,7 +131,7 @@ describe("被撤回的记忆不得通过合并复活", () => {
     const upsert = vi.spyOn(store, "upsertL1");
     const written = await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("replacement"), decision: decision("m_new", "update", ["m_guard"]) });
     expect(written).toBeNull();
-    expect(read.mock.calls[0]?.[1]).toEqual({ strict: true });
+    expect(read.mock.calls[0]?.[0]).toMatchObject({ recordIds: ["m_guard"], visibility: "all" });
     expect(deletion).not.toHaveBeenCalled();
     expect(upsert).not.toHaveBeenCalled();
   });

@@ -248,8 +248,7 @@ async function findCandidates(
   // DP-14：去重**必须**能看见被撤回的记忆。
   // 否则同一事实下次抽取时判不出重，会以一个新 record_id 重新写入，
   // 审核员上次的撤回对新 id 无效 —— 被撤回的内容原样复活。
-  // 判重命中一条 quarantined 记录时，写入走 ON CONFLICT 更新该行，
-  // review_status 不在更新列清单里，因此它保持隔离（见 l1_records upsert）。
+  // 命中 quarantined 目标时，writer 拒绝该次替换；后到撤回由持久来源继续抑制。
   const dedupFilter: IsolationFilter = { ...(filter ?? {}), visibility: "all" };
   const nativeHybrid = !!(
     typeof vectorStore.getCapabilities === "function" &&

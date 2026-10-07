@@ -13,13 +13,12 @@
  */
 
 import type { MemoryRecord } from "../../record/l1-writer.js";
-import { assertClearGuard, resolveReviewRows, setReviewStatus, ReviewConflictError, ReviewCapabilityError, assertReviewEvent, decodeReview } from "../review.js";
+import { assertClearGuard, resolveReviewRows, ReviewConflictError, ReviewCapabilityError, assertReviewEvent, decodeReview } from "../review.js";
 import { MEMORY_EVENT_HISTORY_LIMIT } from "../types.js";
 import {
   DEFAULT_REVIEW_STATUS,
   resolveVisibilityScope,
   rowMatchesVisibility,
-  type ReviewStatus,
 } from "../visibility.js";
 import type { EmbeddingProviderInfo } from "../embedding.js";
 import type {
@@ -222,6 +221,21 @@ function isoCond(field: string, v: string | undefined): string | undefined {
   return healed === DEFAULT_ISOLATION_ID
     ? `(${field} = "" or ${field} = "${DEFAULT_ISOLATION_ID}")`
     : eqFilter(field, healed);
+}
+
+function l1DocToRow(doc: Record<string, unknown>): L1RecordRow {
+  return {
+    record_id: String(doc.id ?? ""), content: String(doc.text ?? ""), type: String(doc.type ?? ""),
+    priority: Number(doc.priority ?? 0), scene_name: String(doc.scene_name ?? ""),
+    session_key: String(doc.session_key ?? ""), session_id: String(doc.session_id ?? ""), task_id: String(doc.task_id ?? ""),
+    team_id: String(doc.team_id ?? ""), user_id: String(doc.user_id ?? ""), agent_id: String(doc.agent_id ?? ""),
+    version: Number(doc.version ?? 0), timestamp_str: String(doc.timestamp_str ?? ""),
+    timestamp_start: String(doc.timestamp_start ?? ""), timestamp_end: String(doc.timestamp_end ?? ""),
+    created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)), updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
+    metadata_json: String(doc.metadata_json ?? "{}"), review_status: doc.review_status as L1RecordRow["review_status"],
+    review_sources_json: doc.review_sources_json as string | undefined, review_guard_at: doc.review_guard_at as string | undefined,
+    review_epoch: doc.review_epoch as number | undefined,
+  };
 }
 
 function buildIsolationConditions(filter?: IsolationFilter): string[] {
@@ -922,15 +936,6 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  /**
-   * 事后审核：改一条 L1 的可见性状态（DP-01）。幂等语义与 sqlite/mongo 一致。
-   *
-   * 共用审核协议，只追加账本事实，不改写 L1 文档或向量。
-   */
-  async setL1ReviewStatus(recordId: string, status: ReviewStatus, filter?: IsolationFilter, operation?: Parameters<NonNullable<IMemoryStore["setL1ReviewStatus"]>>[3]) {
-    return setReviewStatus(this, recordId, status, filter, operation);
-  }
-
   // ── L1 Read Operations ───────────────────────────────────
 
   async countL1(filter?: L1CountFilter): Promise<number> {
@@ -962,13 +967,11 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async queryL1Records(filter?: L1QueryFilter, opts?: { strict?: boolean; review?: boolean; metadataOnly?: boolean }): Promise<L1RecordRow[]> {
+  async queryL1Records(filter?: L1QueryFilter, opts?: { review?: boolean; metadataOnly?: boolean }): Promise<L1RecordRow[]> {
     try {
       await this._ensureInit();
-      if (this.degraded) {
-        if (opts?.strict || opts?.review !== false) throw new Error("L1 query rejected: tcvdb store is degraded");
-        return [];
-      }
+      if (this.degraded) throw new Error("L1 query rejected: tcvdb store is degraded");
+      if (filter?.recordIds?.length === 0) return [];
 
       // Build filter expression
       const conditions = buildIsolationConditions(filter);
@@ -995,30 +998,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
           docs.push(...(resp.documents ?? []));
         }
         // DP-05：active 口径靠客户端后过滤（服务端等值会排除缺字段的老文档）。
-        const rows: L1RecordRow[] = docs.map((doc: Record<string, unknown>) => ({
-          record_id: String(doc.id ?? ""),
-          content: String(doc.text ?? ""),
-          type: String(doc.type ?? ""),
-          priority: Number(doc.priority ?? 0),
-          scene_name: String(doc.scene_name ?? ""),
-          session_key: String(doc.session_key ?? ""),
-          session_id: String(doc.session_id ?? ""),
-          task_id: String(doc.task_id ?? ""),
-          team_id: String(doc.team_id ?? ""),
-          user_id: String(doc.user_id ?? ""),
-          agent_id: String(doc.agent_id ?? ""),
-          version: Number(doc.version ?? 0),
-          timestamp_str: String(doc.timestamp_str ?? ""),
-          timestamp_start: String(doc.timestamp_start ?? ""),
-          timestamp_end: String(doc.timestamp_end ?? ""),
-          created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)),
-          updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
-          metadata_json: String(doc.metadata_json ?? "{}"),
-          review_status: doc.review_status as L1RecordRow["review_status"],
-          review_sources_json: doc.review_sources_json as string | undefined,
-          review_guard_at: doc.review_guard_at as string | undefined,
-          review_epoch: doc.review_epoch as number | undefined,
-        }));
+        const rows = docs.map(l1DocToRow);
         return this.reviewRows(rows, filter, opts);
       }
 
@@ -1033,35 +1013,11 @@ export class TcvdbMemoryStore implements IMemoryStore {
       );
 
       if (docs.length > 50_000) throw new Error("Review row budget exceeded; narrow scope");
-      const rows: L1RecordRow[] = docs.map((doc) => ({
-        record_id: String(doc.id ?? ""),
-        content: String(doc.text ?? ""),
-        type: String(doc.type ?? ""),
-        priority: Number(doc.priority ?? 0),
-        scene_name: String(doc.scene_name ?? ""),
-        session_key: String(doc.session_key ?? ""),
-        session_id: String(doc.session_id ?? ""),
-        task_id: String(doc.task_id ?? ""),
-        team_id: String(doc.team_id ?? ""),
-        user_id: String(doc.user_id ?? ""),
-        agent_id: String(doc.agent_id ?? ""),
-        version: Number(doc.version ?? 0),
-        timestamp_str: String(doc.timestamp_str ?? ""),
-        timestamp_start: String(doc.timestamp_start ?? ""),
-        timestamp_end: String(doc.timestamp_end ?? ""),
-        created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)),
-        updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
-        metadata_json: String(doc.metadata_json ?? "{}"),
-        review_status: doc.review_status as L1RecordRow["review_status"],
-        review_sources_json: doc.review_sources_json as string | undefined,
-        review_guard_at: doc.review_guard_at as string | undefined,
-        review_epoch: doc.review_epoch as number | undefined,
-      }));
+      const rows = docs.map(l1DocToRow);
       return this.reviewRows(rows, filter, opts);
     } catch (err) {
-      this.logger?.warn(`${TAG} [L1-query] FAILED${opts?.strict ? " (strict, rethrowing)" : ""}: ${err instanceof Error ? err.message : String(err)}`);
-      if (opts?.strict || opts?.review !== false) throw err;
-      return [];
+      this.logger?.warn(`${TAG} [L1-query] FAILED: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
@@ -1077,7 +1033,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       await this._ensureInit();
       if (this.degraded) throw new Error("L1 texts unavailable: store degraded");
 
-      return (await this.queryL1Records(undefined, { strict: true })).map(({ record_id, content, updated_time }) => ({ record_id, content, updated_time }));
+      return (await this.queryL1Records(undefined)).map(({ record_id, content, updated_time }) => ({ record_id, content, updated_time }));
     } catch (err) {
       this.logger?.warn(`${TAG} [L1-getAllTexts] FAILED: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
@@ -2071,30 +2027,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         ? await this._queryAllDocs(this.l1Collection, filterExpr, L1_OUTPUT_FIELDS, Math.max(total, 1), [{ fieldName: "updated_time_ms", direction: "desc" }])
         : (await this.client.query(this.l1Collection, { retrieveVector: false, limit: filter.limit, offset: filter.offset, filter: filterExpr, outputFields: L1_OUTPUT_FIELDS, sort: [{ fieldName: "updated_time_ms", direction: "desc" }] })).documents ?? [];
       if (reviewing && docs.length !== total) throw new Error("TCVDB pagination incomplete or concurrently changed; retry");
-      let rows: L1RecordRow[] = docs.map((d: Record<string, unknown>) => ({
-        record_id: d.id,
-        content: d.text ?? "",
-        type: d.type ?? "",
-        priority: d.priority ?? 50,
-        scene_name: d.scene_name ?? "",
-        session_key: d.session_key ?? "",
-        session_id: d.session_id ?? "",
-        team_id: d.team_id ?? "",
-        task_id: d.task_id ?? "",
-        user_id: d.user_id ?? "",
-        agent_id: d.agent_id ?? "",
-        version: Number(d.version ?? 0),
-        timestamp_str: d.timestamp_str ?? "",
-        timestamp_start: d.timestamp_start ?? "",
-        timestamp_end: d.timestamp_end ?? "",
-        created_time: d.created_time_ms ? new Date(Number(d.created_time_ms)).toISOString() : "",
-        updated_time: d.updated_time_ms ? new Date(Number(d.updated_time_ms)).toISOString() : "",
-        metadata_json: d.metadata_json ?? "{}",
-        review_status: d.review_status as L1RecordRow["review_status"],
-        review_sources_json: d.review_sources_json as string | undefined,
-        review_guard_at: d.review_guard_at as string | undefined,
-        review_epoch: d.review_epoch as number | undefined,
-      })) as L1RecordRow[];
+      let rows = docs.map(l1DocToRow);
       if (reviewing) {
         rows = await this.reviewRows(rows, filter);
         return { rows: rows.slice(filter.offset, filter.offset + filter.limit), total: rows.length };
@@ -2197,7 +2130,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     // hybridSearch/search returns [[doc, doc, ...]] (one array per query)
     const docs = docArrays?.[0] ?? [];
     if (!docs.length) return results;
-    const current = await this.queryL1Records({ ...filter, recordIds: docs.map((d) => String(d.id)), visibility: resolveVisibilityScope(filter) }, { strict: true });
+    const current = await this.queryL1Records({ ...filter, recordIds: docs.map((d) => String(d.id)), visibility: resolveVisibilityScope(filter) });
     const byId = new Map(current.map((r) => [r.record_id, r]));
     for (const hit of docs) {
       const row = byId.get(String(hit.id));
@@ -2704,13 +2637,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
     // 上限 128）。不能拼 record_id 等业务字段——管理面 asset_id 之类的长
     // record_id 会把 id 撑过上限、upsert 被拒、事件静默丢失。
     //
-    // 幂等语义必须与 sqlite（ON CONFLICT DO NOTHING）/ mongo（11000 = 已写入）
-    // 一致：先写为准。TCVDB 只有 upsert（整行替换），因此先按主键探测，已存在
-    // 即 no-op——否则一次重放（截断扫描、看不到别节点 marker 的本地存储部署等）
-    // 会用明文整行覆盖已被 clear/TTL 擦成骨架的行。探测与写入之间的竞态有两类：
-    // 同一 event_id 的并发写（内容相同或后者为骨架，无害），以及并发 store 擦除
-    // 在探测缺席后插入（wipe 扫不到尚不存在的行）——后者由 appendLedgerEvent
-    // 落库后的晚到标记复查兜底（本进程内）。
+    // Sequential replay deduplication only: query-then-upsert is not atomic.
+    // New immutable review receipts are rejected above.
     // Defense-in-depth (same as sqlite/mongo): non-canonical event_ts must
     // never reach a lexical compare.
     const eventTs = canonIsoTs(event.event_ts);

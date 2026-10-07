@@ -156,73 +156,6 @@ export function generateMemoryId(): string {
   return `m_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
 }
 
-// ── Revert tombstones (JSONL replay protection) ─────────────────────────────
-//
-// JSONL is the declared source of truth for backup/recovery, but the review
-// revert path only deletes from the vector store — a later replay/recovery
-// from JSONL would silently resurrect reverted records. A tombstone line is
-// appended to the day's shard on revert; readers (l1-reader) collect
-// tombstoned ids first and skip those records. Tombstones are shaped nothing
-// like MemoryRecord (no sessionKey/content fields), so legacy readers that
-// don't know them simply drop the line.
-
-/** Shape of a JSONL tombstone line appended by the review revert path. */
-export interface L1RevertTombstone {
-  /** Marker + layer tag; lets future L0/L3 tombstones reuse the mechanism. */
-  tombstone: "l1";
-  /** The reverted (deleted) record — replay must skip this id. */
-  record_id: string;
-  /** When the revert landed (ISO 8601). */
-  reverted_at: string;
-  /** Who rejected the change (v3 isolation user), when known. */
-  reviewer_id?: string;
-}
-
-export function buildRevertTombstoneLine(
-  recordId: string,
-  reviewerId?: string,
-  at: string = new Date().toISOString(),
-): string {
-  const tombstone: L1RevertTombstone = {
-    tombstone: "l1",
-    record_id: recordId,
-    reverted_at: at,
-    ...(reviewerId ? { reviewer_id: reviewerId } : {}),
-  };
-  return JSON.stringify(tombstone);
-}
-
-/**
- * Append a revert tombstone to today's JSONL shard (best-effort).
- *
- * The gateway has no local baseDir, so no fs fallback is attempted here —
- * when no StorageAdapter is available the tombstone is skipped with a warn.
- * The `reverted` event in the store remains the authoritative audit trail;
- * the JSONL tombstone only protects replay/recovery from resurrection.
- */
-export async function appendRevertTombstone(params: {
-  recordId: string;
-  reviewerId?: string;
-  storage?: StorageAdapter;
-  logger?: Logger;
-}): Promise<boolean> {
-  const { recordId, reviewerId, storage, logger } = params;
-  if (!storage) {
-    logger?.warn?.(`${TAG} revert tombstone skipped: no storage adapter (replay protection relies on store events only)`);
-    return false;
-  }
-  const shardDate = formatLocalDate(new Date());
-  try {
-    await storage.appendFile(StoragePaths.record(shardDate), buildRevertTombstoneLine(recordId, reviewerId) + "\n");
-    return true;
-  } catch (err) {
-    logger?.warn?.(
-      `${TAG} revert tombstone append failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return false;
-  }
-}
-
 /**
  * Write a memory record according to the dedup decision.
  *
@@ -268,17 +201,13 @@ export async function writeMemory(params: {
 
   let nextVersion = 0;
   // Superseded targets snapshot — reused for memory_events `superseded` rows so
-  // the diff can show old content. Empty when the query fails or there are no
-  // targets (store action): superseded events are best-effort, the authoritative
-  // write path (JSONL + vector upsert) is unaffected either way.
+  // the diff can show old content. A failed target read aborts this write.
   //
   // `queryL1Records` honors `recordIds` on all backends (sqlite PK-IN lookup,
   // MongoDB $in, TCVDB documentIds), so `existing` is already narrowed to the
   // targeted lineage — the same rows drive both the superseded snapshots and
   // the next-version computation.
   let supersededTargets: Awaited<ReturnType<NonNullable<typeof vectorStore>["queryL1Records"]>> = [];
-  /** The scoped target read succeeded — `supersededTargets` is then the authoritative target set. */
-  let targetsQueried = false;
   if ((decision.action === "update" || decision.action === "merge") && decision.target_ids.length > 0 && vectorStore) {
     try {
       // Scope the snapshot read to the same tenant filter used for the delete:
@@ -294,8 +223,7 @@ export async function writeMemory(params: {
         // 若这里走默认 active 口径，被撤回的目标查不到 ⇒ 代码当作"目标不存在"
         // 继续往下写 ⇒ 同一事实以新 record_id 落库 ⇒ 被撤回的内容复活。
         visibility: "all",
-      }, { strict: true });
-      targetsQueried = true;
+      });
 
       // 被撤回的记忆**不得通过合并复活**（DP-14）。
       // 已知隔离源在模型决策落地前拦截；读后发生的撤回由持久来源图继续抑制。
@@ -434,9 +362,9 @@ export async function writeMemory(params: {
       upsertOk = await vectorStore.upsertL1(record, embedding);
       logger?.debug?.(`${TAG} [vec-dual-write] upsert result=${upsertOk} id=${record.id}`);
     } catch (err) {
-      // Vector write failure should NOT block the main JSONL write
+      // A failed authoritative write stops before publishing the JSONL mirror.
       logger?.warn?.(
-        `${TAG} [vec-dual-write] FAILED (JSONL already written) id=${record.id}: ${err instanceof Error ? err.message : String(err)}`,
+        `${TAG} [vec-dual-write] FAILED id=${record.id}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   } else {
@@ -478,11 +406,9 @@ export async function writeMemory(params: {
   // proposed: a hallucinated or out-of-tenant target id was neither read nor
   // deleted (both are tenant-scoped), and claiming it would make the diff
   // report an incomplete group forever and make revert 409 on a
-  // "snapshot-less restore target". When the scoped read succeeded, its rows
-  // ARE the replaced set; only when it failed do we fall back to the
-  // decision (the delete used the same filter, so those ids were real).
-  const replacedIds = targetsQueried ? supersededTargets.map((r) => r.record_id) : decision.target_ids;
-  if (targetsQueried && replacedIds.length < decision.target_ids.length) {
+  // "snapshot-less restore target". The successfully read rows define the replaced set.
+  const replacedIds = supersededTargets.map((r) => r.record_id);
+  if (vectorStore && replacedIds.length < decision.target_ids.length) {
     const found = new Set(replacedIds);
     logger?.warn?.(
       `${TAG} ${decision.action} id=${record.id}: target ids not found in scope, excluded from supersedes: ` +
@@ -502,7 +428,7 @@ export async function writeMemory(params: {
         agent_id: record.agentId ?? "",
         task_id: record.taskId ?? "",
       };
-      if (decision.action === "store" || !targetsDeleted) {
+      if (decision.action === "store" || !vectorStore || !targetsDeleted) {
         if (!targetsDeleted) {
           logger?.warn?.(
             `${TAG} supersede delete failed for ${decision.action} id=${record.id}; ` +

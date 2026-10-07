@@ -6,7 +6,6 @@ import type { Logger } from "../types.js";
 import { confirmReviewCommit, queryReviewHistory, ReviewCapabilityError, ReviewConflictError, reviewEventId, runAsync } from "../store/review.js";
 import { healIsoId } from "../store/memory-event-id.js";
 import { appendLedgerEvent, hasPendingLedgerEvent } from "./event-ledger.js";
-import { appendRevertTombstone } from "./l1-writer.js";
 import { rowToMemoryRecord } from "./l1-reader.js";
 
 type RevertStore = IMemoryStore & Required<Pick<IMemoryStore, "queryMemoryEvents" | "commitMemoryEvent" | "executeMemoryTransaction">>;
@@ -21,11 +20,9 @@ export interface RevertOptions {
   operationId?: string;
 }
 
-/** 提交状态无法确认时披露可能的恢复行；事务故障不会用手工删除作为回滚。 */
-export type RevertPartial = { restored: string[]; verified: boolean; missing?: string[] };
 export type RevertOutcome =
-  | { ok: true; record_id: string; restored: string[]; missing?: string[]; target_event_id?: string; operation_id: string; outbox_pending?: boolean; tombstone_pending?: boolean }
-  | { ok: false; record_id: string; status: number; error: string; operation_id?: string; commit_unknown?: boolean; partial?: RevertPartial };
+  | { ok: true; record_id: string; restored: string[]; missing?: string[]; target_event_id?: string; operation_id: string; outbox_pending?: boolean }
+  | { ok: false; record_id: string; status: number; error: string; operation_id?: string; commit_unknown?: boolean };
 type RevertPlan =
   | { ok: false; status: number; error: string }
   | { ok: true; target: MemoryEvent; restores: Array<{ targetId: string; snap?: MemoryEvent }> };
@@ -35,11 +32,11 @@ const WRITE_OPS: ReadonlySet<MemoryEvent["op"]> = new Set(["created", "updated",
 const rowFilter = (iso?: IsolationFilter) => ({ teamId: iso?.teamId, userId: iso?.userId, agentId: iso?.agentId, taskId: iso?.taskId });
 const eventScope = (iso?: IsolationFilter): MemoryEventFilter => ({ team_id: iso?.teamId, user_id: iso?.userId, agent_id: iso?.agentId });
 
-/** 返回 ids 中当前仍有存活行的记录。strict: 后端把查询失败吞成 [] 时重抛——守卫必须 fail-closed。 */
+/** 返回 ids 中当前仍有存活行的记录；查询失败传播，守卫必须 fail-closed。 */
 function* liveRecordIds(store: RevertStore, ids: string[], filter: IsolationFilter): Program<string[]> {
   const result: string[] = [];
-  for (let i = 0; i < ids.length; i += 20) { // TCVDB documentIds 单查上限 20
-    const rows = (yield store.queryL1Records({ recordIds: ids.slice(i, i + 20), ...filter, visibility: "all" }, { strict: true, review: false, metadataOnly: true })) as L1RecordRow[];
+  for (let i = 0; i < ids.length; i += 400) { // 避开 SQLite 绑定参数上限
+    const rows = (yield store.queryL1Records({ recordIds: ids.slice(i, i + 400), ...filter, visibility: "all" }, { review: false, metadataOnly: true })) as L1RecordRow[];
     result.push(...rows.map((r) => r.record_id));
   }
   return result;
@@ -48,14 +45,6 @@ function* liveRecordIds(store: RevertStore, ids: string[], filter: IsolationFilt
 /** agent 级管理面删除（clear/archive）；旧事件无 scope 时要求 user_id 为空。 */
 export function isManagementScopeDelete(event: MemoryEvent): boolean {
   return event.source === "api_mutation" && event.op === "deleted" && (event.scope === "agent" || (event.scope === undefined && !event.user_id));
-}
-
-/**
- * 完整读取目标历史；批量历史原语不得把最早一页冒充完整记录。
- * 事务中的各次读取共享同一快照；超出预算拒绝，不根据截断历史撤销。
- */
-function recordEvents(store: RevertStore, id: string, scope: MemoryEventFilter): MaybePromise<MemoryEvent[]> {
-  return queryReviewHistory(store, { ...scope, record_id: id });
 }
 
 /**
@@ -70,7 +59,7 @@ function* planRevert(store: RevertStore, recordId: string, opts: RevertOptions, 
   const scope = eventScope(iso);
   const filter = rowFilter(iso);
   const fail = (status: number, error: string): RevertPlan => ({ ok: false, status, error });
-  const events = (yield recordEvents(store, recordId, scope)) as MemoryEvent[];
+  const events = (yield queryReviewHistory(store, { ...scope, record_id: recordId })) as MemoryEvent[];
   const writes = events.filter((event) => WRITE_OPS.has(event.op));
   const reverts = events.filter((event) => event.op === "reverted");
   const revertedIds = new Set(reverts.map((event) => event.target_event_id).filter((id): id is string => !!id));
@@ -95,7 +84,7 @@ function* planRevert(store: RevertStore, recordId: string, opts: RevertOptions, 
   // 行存在性：记录已被删除 / 清空 / TTL 过期 → 不可撤销（恢复快照即复活）。
   if (!(yield* liveRecordIds(store, [recordId], filter)).length) return fail(409, `Record ${recordId} no longer exists (deleted, cleared or expired)`);
   const currentEpoch = store.getClearEpoch ? (yield store.getClearEpoch({ teamId: iso?.teamId, agentId: iso?.agentId })) as number : 0;
-  const targetRows = (yield store.queryL1Records({ ...filter, recordIds: [recordId], visibility: "all" }, { strict: true, review: false, metadataOnly: true })) as L1RecordRow[];
+  const targetRows = (yield store.queryL1Records({ ...filter, recordIds: [recordId], visibility: "all" }, { review: false, metadataOnly: true })) as L1RecordRow[];
   if (currentEpoch > 0 && targetRows[0]?.review_epoch !== currentEpoch) return fail(409, "Record generation was invalidated by clear; refusing resurrection");
   const later = writes.slice(writes.indexOf(target) + 1).filter((event) => !isReverted(event));
   if (!isExtraction(target)) {
@@ -117,7 +106,7 @@ function* planRevert(store: RevertStore, recordId: string, opts: RevertOptions, 
     if (live.length) return fail(409, `Record ${recordId} is currently superseded by ${live.join(", ")}`);
     for (const id of chunk) {
       visited.add(id);
-      const childEvents = (yield recordEvents(store, id, scope)) as MemoryEvent[];
+      const childEvents = (yield queryReviewHistory(store, { ...scope, record_id: id })) as MemoryEvent[];
       for (const event of childEvents) if (event.op === "superseded" && event.superseded_by && !visited.has(event.superseded_by)) frontier.push(event.superseded_by);
     }
   }
@@ -126,7 +115,7 @@ function* planRevert(store: RevertStore, recordId: string, opts: RevertOptions, 
   // supersede 了同一条），恢复它会与那个后继共存 → 409。
   const restores: Array<{ targetId: string; snap?: MemoryEvent }> = [];
   if (target.op !== "created") for (const targetId of target.supersedes ?? []) {
-    const history = (yield recordEvents(store, targetId, scope)) as MemoryEvent[];
+    const history = (yield queryReviewHistory(store, { ...scope, record_id: targetId })) as MemoryEvent[];
     if (history.some((event) => event.op === "deleted")) return fail(409, `Restore target ${targetId} was deleted; refusing resurrection`);
     const superseded = history.filter((event) => event.op === "superseded");
     const siblings = [...new Set(superseded.map((event) => event.superseded_by).filter((id): id is string => !!id && id !== recordId))];
@@ -154,12 +143,13 @@ const receiptOutcome = (event: MemoryEvent, operationId: string): Extract<Revert
   ...(event.review?.missing?.length ? { missing: event.review.missing } : {}), ...(event.target_event_id ? { target_event_id: event.target_event_id } : {}),
 });
 
-function* commitRevert(store: RevertStore, recordId: string, opts: RevertOptions, identity: string, embeddings: Map<string, { content: string; vector?: Float32Array }>, iso?: IsolationFilter): Program<{ event: MemoryEvent; tombstone: boolean }> {
+function* commitRevert(store: RevertStore, recordId: string, opts: RevertOptions, identity: string, embeddings: Map<string, { content: string; vector?: Float32Array }>, iso?: IsolationFilter): Program<MemoryEvent> {
   const prior = (yield store.queryMemoryEvents({ ...eventScope(iso), record_id: recordId, source: "review", op: "reverted", operation_id: identity, limit: 2 })) as MemoryEvent[];
   if (prior.length > 1) throw new ReviewConflictError("Duplicate legacy revert receipts require reconciliation");
   if (prior[0]) {
-    if (prior[0].review?.request_hash !== requestHash(recordId, opts)) throw new ReviewConflictError("Revert operation identity reused with different input");
-    return { event: prior[0], tombstone: !prior[0].supersedes?.includes(recordId) };
+    if (prior[0].review?.protocol !== 2) throw new ReviewConflictError("Legacy revert receipts cannot be retried; use a new operation identity");
+    if (prior[0].review.request_hash !== requestHash(recordId, opts)) throw new ReviewConflictError("Revert operation identity reused with different input");
+    return prior[0];
   }
   // pending 守卫只提供额外的进程内告警保护；最终判断与动作仍由事务负责。
   // 未完成的旧写入必须先补齐，不能把不可用历史当作没有冲突。
@@ -187,7 +177,7 @@ function* commitRevert(store: RevertStore, recordId: string, opts: RevertOptions
       if (healIsoId(actual ?? "") !== healIsoId(expected ?? "")) throw new RevertAbort(409, "Snapshot belongs to another isolation scope");
     }
     if (iso?.taskId !== undefined && (record.taskId ?? "") !== iso.taskId) throw new RevertAbort(409, "Snapshot is outside the requested task scope");
-    const existing = (yield store.queryL1Records({ ...filter, recordIds: [item.targetId], visibility: "all" }, { strict: true, review: false })) as L1RecordRow[];
+    const existing = (yield store.queryL1Records({ ...filter, recordIds: [item.targetId], visibility: "all" }, { review: false })) as L1RecordRow[];
     if (!manual && existing[0]) {
       if (existing[0].content !== record.content || existing[0].version !== (record.version ?? 0)) throw new RevertAbort(409, "A restore target has independent live changes");
     } else {
@@ -211,7 +201,7 @@ function* commitRevert(store: RevertStore, recordId: string, opts: RevertOptions
   };
   event.event_id = reviewEventId(event);
   const committed = (yield store.commitMemoryEvent(event)) as MemoryEvent;
-  return { event: confirmReviewCommit(event, committed), tombstone: !manual };
+  return confirmReviewCommit(event, committed);
 }
 
 /**
@@ -239,9 +229,9 @@ export async function revertMemory(params: { store: IMemoryStore; recordId: stri
   } catch {
     return { ok: false, record_id: recordId, status: 503, error: "Revert preparation failed; nothing was changed, retry later", operation_id: operationId };
   }
-  let result: { event: MemoryEvent; tombstone: boolean };
+  let event: MemoryEvent;
   try {
-    result = await supported.executeMemoryTransaction(() => commitRevert(supported, recordId, opts, identity, embeddings, iso));
+    event = await supported.executeMemoryTransaction(() => commitRevert(supported, recordId, opts, identity, embeddings, iso));
   } catch (err) {
     // Raw backend errors carry DSN/topology — do not log or echo their text.
     logger.warn(`[memory-revert] transaction could not be confirmed record_id=${recordId}`);
@@ -249,14 +239,12 @@ export async function revertMemory(params: { store: IMemoryStore; recordId: stri
     try {
       const receipts = await supported.queryMemoryEvents({ ...eventScope(iso), record_id: recordId, operation_id: identity, limit: 2 });
       if (receipts.length !== 1 || receipts[0].review?.request_hash !== requestHash(recordId, opts)) throw new Error("Revert receipt unavailable");
-      result = { event: receipts[0], tombstone: !receipts[0].supersedes?.includes(recordId) };
+      event = receipts[0];
     } catch {
       return { ok: false, record_id: recordId, status: 503, error: "Revert commit could not be confirmed; retry with the same operation_id", operation_id: operationId, commit_unknown: true };
     }
   }
   // 撤销事实已随事务提交；outbox 失败不能撤销权威收据或冒充账本未提交。
-  const mirrored = await appendLedgerEvent({ store, storage, event: result.event, logger, storeAlreadyCommitted: true });
-  // JSONL 墓碑只保护兼容正文备份；完整恢复必须同时携带权威账本。
-  const tombstone = !result.tombstone || await appendRevertTombstone({ recordId, reviewerId: opts.reviewerId, storage, logger });
-  return { ...receiptOutcome(result.event, operationId), ...(storage && !mirrored.jsonl ? { outbox_pending: true } : {}), ...(!tombstone ? { tombstone_pending: true } : {}) };
+  const mirrored = await appendLedgerEvent({ store, storage, event, logger, storeAlreadyCommitted: true });
+  return { ...receiptOutcome(event, operationId), ...(storage && !mirrored.jsonl ? { outbox_pending: true } : {}) };
 }

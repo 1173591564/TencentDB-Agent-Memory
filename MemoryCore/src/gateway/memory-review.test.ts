@@ -418,6 +418,8 @@ describe("POST /memory/review/retract|restore", () => {
     expect(store.queryL1Records({ recordIds: ["m_key"] })).toHaveLength(1);
     const changed = await call("/v3/memory/review/retract", { record_id: "m_key", reason: "different", operation_id: "first" });
     expect(changed.status).toBe(409);
+    expect(changed.message).toContain("different input");
+    expect(changed.data?.commit_unknown).toBe(false);
   });
 
   it("historical controls remain listable and restorable without recreating rows", async () => {

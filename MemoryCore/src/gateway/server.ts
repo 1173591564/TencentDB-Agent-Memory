@@ -747,7 +747,7 @@ export class TdaiGateway {
           }
         });
       }
-      wrapWithTrace(req, res, () => this.handleRequest(req, res)).catch((err) => {
+      wrapWithTrace(req, res, () => this.handleRequest(req, res)).catch(() => {
         // wrapWithTrace 内部已经记录了错误，这里只做 fallback
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -1045,8 +1045,6 @@ export class TdaiGateway {
       // Service mode: inject per-instance resolvers (storePool + configProvider + COS)
       if (this.storePool && this.configProvider) {
         const storePool = this.storePool;
-        const configProvider = this.configProvider;
-        const logger = this.logger;
 
         v2Deps.resolveStore = async (instanceId: string) => {
           const { vdbConfig, mongoConfig } = await this.resolveStoreBackendConfigs(instanceId);

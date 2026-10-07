@@ -6,7 +6,7 @@
  *          审核员的撤回等于没做。
  *  - DP-04 被撤回记忆会占用召回超取窗口，不补偿就会静默降低召回，
  *          而且接口不报错、断言不失败。
- * 外加：DP-23 开关关闭时行为必须等同基线；DP-12 老数据不得凭空消失。
+ * 外加：DP-23 关闭只停新审核写，不取消既有抑制；DP-12 老数据不得凭空消失。
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -106,6 +106,29 @@ describe("memory review visibility", () => {
 
     const onlyBad = store.queryL1Records({ ...ISO, visibility: "quarantined" });
     expect(onlyBad.map((r) => r.record_id)).toEqual(["m_bad"]);
+  });
+
+  it("one query path intersects session key/id predicates without changing isolation", () => {
+    store.upsertL1(rec({ id: "match", content: "matched", sessionKey: "sk-a", sessionId: "ses-a" }), undefined);
+    store.upsertL1(rec({ id: "other-key", content: "other", sessionKey: "sk-b", sessionId: "ses-a" }), undefined);
+    expect(store.queryL1Records({ sessionId: "ses-a", sessionKey: "sk-a" }).map((r) => r.record_id)).toEqual(["match"]);
+    expect(store.queryL1Records({ ...ISO, sessionId: "ses-a", sessionKey: "sk-a" }).map((r) => r.record_id)).toEqual(["match"]);
+    expect(store.queryL1Records({ sessionId: "ses-a", updatedAfter: "2025-01-01T00:00:00.000Z" })).toHaveLength(2);
+    expect(store.queryL1Records({ sessionKey: "sk-b" }).map((r) => r.record_id)).toEqual(["other-key"]);
+  });
+
+  it("empty primary-key selections never turn into a full scan", () => {
+    store.upsertL1(rec({ id: "not-selected", content: "fact" }), undefined);
+    expect(store.queryL1Records({ recordIds: [] })).toEqual([]);
+    expect(store.queryL1Records({ ...ISO, recordIds: [] })).toEqual([]);
+    expect(store.queryL1Records({ recordIds: [], visibility: "all" }, { review: false })).toEqual([]);
+  });
+
+  it("raw audit reads cannot mask an unavailable store as an empty result", () => {
+    const state = store as unknown as { degraded: boolean };
+    state.degraded = true;
+    try { expect(() => store.queryL1Records({ visibility: "all" }, { review: false })).toThrow("degraded"); }
+    finally { state.degraded = false; }
   });
 
   it("撤回后 FTS 搜索不再命中；visibility:'all' 仍命中（FTS 表没有状态列，走回查）", () => {
@@ -218,8 +241,7 @@ describe("memory review visibility", () => {
   it("FTS does not expose quarantined content when its visibility lookup fails", () => {
     store.upsertL1(rec({ id: "m_fts_failure", content: "suppression failure" }), undefined);
     store.setL1ReviewStatus("m_fts_failure", "quarantined", ISO);
-    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync }).db;
-    vi.spyOn(db, "prepare").mockImplementationOnce(() => { throw new Error("database unavailable"); });
+    vi.spyOn(store, "queryL1Records").mockImplementationOnce(() => { throw new Error("database unavailable"); });
     expect(() => store.searchL1Fts("suppression", 10, ISO)).toThrow("database unavailable");
   });
 

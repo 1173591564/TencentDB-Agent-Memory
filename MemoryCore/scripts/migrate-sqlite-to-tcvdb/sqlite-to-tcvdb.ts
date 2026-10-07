@@ -279,13 +279,6 @@ async function ensureReadablePath(filePath: string, label: string): Promise<void
   }
 }
 
-async function ensureReadableDirectory(dirPath: string, label: string): Promise<void> {
-  const stat = await fs.stat(dirPath).catch(() => null);
-  if (!stat?.isDirectory()) {
-    throw new Error(`${label} is not a directory: ${dirPath}`);
-  }
-}
-
 function safeParseMetadata(raw: string): Record<string, unknown> {
   if (!raw) return {};
   try {

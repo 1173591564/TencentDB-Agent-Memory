@@ -285,8 +285,6 @@ export const StoragePaths = {
   conversation: (date: string) => `conversations/${date}.jsonl`,
   /** Build memory record JSONL path */
   record: (date: string) => `records/${date}.jsonl`,
-  /** Build memory change-ledger outbox JSONL path (legacy / single-writer shard) */
-  event: (date: string) => `events/${date}.jsonl`,
   /** Build a per-writer change-ledger outbox shard path: `events/YYYY-MM-DD.<writerId>.jsonl` */
   eventShard: (date: string, writerId?: string) => (writerId ? `events/${date}.${writerId}.jsonl` : `events/${date}.jsonl`),
   /** Build persona backup path */

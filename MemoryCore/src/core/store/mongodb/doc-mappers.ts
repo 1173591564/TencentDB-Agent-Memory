@@ -14,10 +14,8 @@ import type { MemoryRecord } from "../../record/l1-writer.js";
 import type {
   L0Record,
   L0QueryRow,
-  L0SearchResult,
   L0FtsResult,
   L1RecordRow,
-  L1SearchResult,
   L1FtsResult,
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID } from "../isolation.js";
@@ -83,10 +81,6 @@ export function docToL0QueryRow(doc: L0Doc): L0QueryRow {
     recorded_at: doc.recorded_at,
     timestamp: doc.timestamp ?? 0,
   };
-}
-
-export function docToL0SearchResult(doc: L0Doc, score: number): L0SearchResult {
-  return { ...docToL0QueryRow(doc), score };
 }
 
 export function docToL0FtsResult(doc: L0Doc, score: number): L0FtsResult {
@@ -185,7 +179,7 @@ export function docToL1RecordRow(doc: L1Doc): L1RecordRow {
   };
 }
 
-export function docToL1SearchResult(doc: L1Doc, score: number): L1SearchResult {
+export function docToL1FtsResult(doc: L1Doc, score: number): L1FtsResult {
   const row = docToL1RecordRow(doc);
   return {
     record_id: row.record_id,
@@ -206,10 +200,6 @@ export function docToL1SearchResult(doc: L1Doc, score: number): L1SearchResult {
     agent_id: row.agent_id,
     metadata_json: row.metadata_json,
   };
-}
-
-export function docToL1FtsResult(doc: L1Doc, score: number): L1FtsResult {
-  return docToL1SearchResult(doc, score);
 }
 
 // ════════════════════════════════════════════════════════

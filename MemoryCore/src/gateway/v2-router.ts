@@ -27,12 +27,11 @@ import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
-import { isManagementScopeDelete, revertMemory, type RevertOptions, type RevertPartial } from "../core/record/memory-revert.js";
+import { isManagementScopeDelete, revertMemory, type RevertOptions } from "../core/record/memory-revert.js";
 import { appendLedgerEvent, getLedgerHealth, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
 import type { ReviewStatus } from "../core/store/visibility.js";
 import { ReviewCapabilityError, ReviewConflictError, historicalReviewRows, queryReviewHistory, resolveReviewRows } from "../core/store/review.js";
 import { acknowledgeDerivedReview, inspectDerivedReview } from "../core/store/derived-review.js";
-import { newMemoryEventId } from "../core/store/memory-event-id.js";
 import { normalizeReviewStatus, isMemoryReviewEnabled } from "../core/store/visibility.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
@@ -110,7 +109,6 @@ import {
   type TaskData,
 } from "./v2-schemas.js";
 import type { ConversationAddRequest } from "./v2-schemas.js";
-import { createKeyedMutex } from "../utils/keyed-mutex.js";
 import { stripSceneNavigation } from "../core/scene/scene-navigation.js";
 import { buildProfileIsolationScope, buildProfileStableId, DEFAULT_PROFILE_SCOPE } from "../core/profile/profile-scope.js";
 
@@ -1281,7 +1279,7 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
 
   // Read existing record by primary key — strict: a failed query returning []
   // would misreport a degraded backend as "not found".
-  const existing = await store.queryL1Records({ recordIds: [id], visibility: "all" }, { strict: true });
+  const existing = await store.queryL1Records({ recordIds: [id], visibility: "all" });
   if (!existing || existing.length === 0) {
     return errorEnvelope(404, `Atomic note not found: ${id}`, requestId);
   }
@@ -1534,22 +1532,18 @@ async function handleMemoryLedgerBackfill(body: unknown, _auth: V2AuthContext, r
 const REVERT_MARKER_CHUNK = 100;
 
 /**
- * 给定记录的全部 reverted 标记：按 record_id 分块 IN 查询、块内翻页到底——
+ * 给定记录的全部 reverted 标记：按 record_id 分块使用有界完整历史查询——
  * 工作量随页面卡片数走，不把全局事件上限当成完整状态。
  */
 async function revertMarkersFor(
-  query: NonNullable<IMemoryStore["queryMemoryEvents"]>,
+  store: IMemoryStore,
   recordIds: string[],
   scope: Omit<MemoryEventFilter, "record_ids" | "op" | "limit" | "offset">,
 ): Promise<MemoryEvent[]> {
   const out: MemoryEvent[] = [];
   for (let i = 0; i < recordIds.length; i += REVERT_MARKER_CHUNK) {
     const record_ids = recordIds.slice(i, i + REVERT_MARKER_CHUNK);
-    for (let offset = 0; ; offset += 1000) {
-      const batch = await query({ ...scope, record_ids, op: "reverted", limit: 1000, offset });
-      out.push(...batch);
-      if (batch.length < 1000) break;
-    }
+    out.push(...await queryReviewHistory(store, { ...scope, record_ids, op: "reverted", metadata_only: true }));
   }
   return out;
 }
@@ -1611,7 +1605,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   // 反查它们的全部标记；取 session 内最新 N 条会在 >N 条 reverted 时截掉旧
   // 写入的标记 → 卡片显示"未撤销"，UI 继续放出 Revert 按钮 → 核心 409。
   const revertedEvents = await revertMarkersFor(
-    store.queryMemoryEvents.bind(store),
+    store,
     [...new Set(events.filter((e) => e.op !== "reverted" && e.op !== "superseded").map((e) => e.record_id))],
     {
       session_id: parsed.data.session_id,
@@ -1780,15 +1774,11 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
  * 幂等：同一 record_id 已存在 reverted 事件 → 409。
  * 撤销动作本身追加一条 reverted 事件（record_id=被撤销的新 record，
  * supersedes=本次恢复的旧 record_id 列表），保持事件流 append-only。
- * 恢复或删除失败时返回 500 且**不追加** reverted 事件（否则 409 会永久挡住
- * 重试），并回滚本次写入的恢复行（只删本次 absent→live 的，先前部分撤销
- * 留下的存活行保持原状）：确认回滚干净 = 什么都没改；否则 data.partial
- * 列出仍存活的恢复行（verified=false 表示读不到行状态）。
- * delete/upsert 均幂等，重试即续完撤销。
+ * 恢复、删除和收据由同一事务提交；失败回滚，提交未知时按 operation_id 确认收据。
  *
  * 批量：body 可传 record_ids[]（≤50）。逐条独立处理互不影响——单条失败
  * 不阻塞其他记录；批量响应恒为 200 + results[]，每项携带各自的
- * status/error（或 restored/missing/partial）。单条 record_id 调用保持原响应形态。
+ * status/error（或 restored/missing）。单条 record_id 调用保持原响应形态。
  */
 
 async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1814,7 +1804,7 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
   // 单条调用保持原响应形态；传了 record_ids（哪怕只有一个元素）就是批量调用。
   if (!record_ids && recordIds.length === 1) {
     const outcome = await execute(recordIds[0]);
-    if (!outcome.ok) return errorEnvelope(outcome.status, outcome.error, requestId, operation_id || outcome.status >= 500 || outcome.partial ? { operation_id: outcome.operation_id, ...(outcome.commit_unknown ? { commit_unknown: true } : {}), ...(outcome.partial ? { partial: outcome.partial } : {}) } : undefined);
+    if (!outcome.ok) return errorEnvelope(outcome.status, outcome.error, requestId, operation_id || outcome.status >= 500 ? { operation_id: outcome.operation_id, ...(outcome.commit_unknown ? { commit_unknown: true } : {}) } : undefined);
     return successEnvelope({
       record_id: outcome.record_id,
       reverted: true,
@@ -1823,13 +1813,12 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
       ...(outcome.target_event_id ? { target_event_id: outcome.target_event_id } : {}),
       operation_id: outcome.operation_id,
       ...(outcome.outbox_pending ? { outbox_pending: true } : {}),
-      ...(outcome.tombstone_pending ? { tombstone_pending: true } : {}),
     }, requestId);
   }
 
   const results = [] as Array<
-    | { record_id: string; reverted: true; restored: string[]; operation_id?: string; missing?: string[]; target_event_id?: string; outbox_pending?: boolean; tombstone_pending?: boolean }
-    | { record_id: string; reverted: false; status: number; error: string; operation_id?: string; commit_unknown?: boolean; partial?: RevertPartial }
+    | { record_id: string; reverted: true; restored: string[]; operation_id?: string; missing?: string[]; target_event_id?: string; outbox_pending?: boolean }
+    | { record_id: string; reverted: false; status: number; error: string; operation_id?: string; commit_unknown?: boolean }
   >;
   for (const id of recordIds) {
     const outcome = await execute(id);
@@ -1841,9 +1830,8 @@ async function handleMemoryDiffRevert(body: unknown, _auth: V2AuthContext, reque
           ...(outcome.target_event_id ? { target_event_id: outcome.target_event_id } : {}),
           operation_id: outcome.operation_id,
           ...(outcome.outbox_pending ? { outbox_pending: true } : {}),
-          ...(outcome.tombstone_pending ? { tombstone_pending: true } : {}),
         }
-        : { record_id: id, reverted: false, status: outcome.status, error: outcome.error, operation_id: outcome.operation_id, ...(outcome.commit_unknown ? { commit_unknown: true } : {}), ...(outcome.partial ? { partial: outcome.partial } : {}) },
+        : { record_id: id, reverted: false, status: outcome.status, error: outcome.error, operation_id: outcome.operation_id, ...(outcome.commit_unknown ? { commit_unknown: true } : {}) },
     );
   }
   const succeeded = results.filter((r) => r.reverted).length;
@@ -1977,7 +1965,7 @@ async function handleMemoryReviewStatusChange(
       (result.changed ? changed : noOp).push(recordId);
     } catch (err) {
       deps.logger.warn(`${TAG} review ${mode} failed for ${recordId}: ${err instanceof Error ? err.message : String(err)}`);
-      return errorEnvelope(err instanceof ReviewConflictError ? 409 : 503, "Review operation could not be confirmed; retry with the same operation_id", requestId, {
+      return errorEnvelope(err instanceof ReviewConflictError ? 409 : 503, err instanceof ReviewConflictError ? err.message : "Review operation could not be confirmed; retry with the same operation_id", requestId, {
         operation_id: operationId, partial: { changed, no_op: noOp, not_found: notFound, event_ids: events },
         failed_record_id: recordId, commit_unknown: !(err instanceof ReviewConflictError),
       });

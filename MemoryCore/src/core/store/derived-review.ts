@@ -14,7 +14,7 @@ export async function profileReviewFence(store: IMemoryStore, isolation?: Profil
   if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
   const scope: { team_id?: string; agent_id?: string; user_id?: string } = isolation ? { team_id: isolation.teamId || "default", agent_id: isolation.agentId || "default", ...(isolation.teamId ? {} : { user_id: isolation.userId || "default" }) } : {};
   const events = await queryReviewHistory(store, { ...scope, layer: "l1", source: "review", metadata_only: true });
-  const current = await store.queryL1Records({ teamId: scope.team_id, userId: scope.user_id, agentId: scope.agent_id, visibility: "quarantined" }, { strict: true, review: false, metadataOnly: true });
+  const current = await store.queryL1Records({ teamId: scope.team_id, userId: scope.user_id, agentId: scope.agent_id, visibility: "quarantined" }, { review: false, metadataOnly: true });
   const roots = new Map(historicalReviewRows(events).map((r) => [rowKey(r), r]));
   for (const row of current) roots.set(rowKey(row), { ...row, review_sources_json: "[]" });
   const tokens = new Set(resolveReviewFacts([...roots.values()], events).flatMap((r) => r.review_tokens ?? []));
@@ -52,7 +52,8 @@ export async function acknowledgeDerivedReview(store: IMemoryStore, path: string
   const prior = await store.queryMemoryEvents({ record_id: path, layer: path === "persona.md" ? "l3" : "l2", source: "review", team_id: isolation.teamId, agent_id: isolation.agentId, operation_id: identity, limit: 2 });
   if (prior.length > 1) throw new ReviewConflictError("Legacy duplicate derived receipts require reconciliation");
   if (prior[0]) {
-    if (prior[0].review?.request_hash !== requestHash) throw new ReviewConflictError("Derived review operation identity reused with different input");
+    if (prior[0].review?.protocol !== 2) throw new ReviewConflictError("Legacy derived review receipts cannot be retried; use a new operation identity");
+    if (prior[0].review.request_hash !== requestHash) throw new ReviewConflictError("Derived review operation identity reused with different input");
     return prior[0];
   }
   if (hashOf(content) !== expected.content_hash) throw new ReviewConflictError("Derived artifact changed; review the current content");

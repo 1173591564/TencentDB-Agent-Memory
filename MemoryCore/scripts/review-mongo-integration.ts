@@ -31,6 +31,9 @@ try {
   await second.init();
   await first.upsertL1(rec("root"));
   await first.upsertL1(rec("clean"));
+  assert.deepEqual(await first.queryL1Records({ ...iso, recordIds: [] }), []);
+  assert.deepEqual(await second.queryL1Records({ recordIds: [], visibility: "all" }, { review: false }), []);
+  assert.deepEqual(await first.queryL1Records({ ...iso, sessionId: "ses", sessionKey: "wrong-key" }), []);
   assert.equal(await first.refreshSearchIndexReady(30_000), true);
   let found = false;
   for (let attempt = 0; attempt < 60; attempt++) {

@@ -32,6 +32,8 @@ import type {
   V3MemoryClientConfig,
   V3MemoryReviewRequest,
   V3MemoryReviewData,
+  V3MemoryRevertRequest,
+  V3MemoryRevertData,
   V3MemoryReviewListRequest,
   V3MemoryReviewListData,
   V3DerivedReviewRequest,
@@ -328,6 +330,10 @@ export class MemoryClient {
       time_start: params.time_start,
       time_end: params.time_end,
     }));
+  }
+
+  revertMemory(params: V3MemoryRevertRequest): Promise<V3MemoryRevertData> {
+    return this.http.post(`${V3}/memory/diff/revert`, stripUndefined({ ...params, ...this.iso.baseBody() }));
   }
 
   retractMemory(params: V3MemoryReviewRequest & { reason: string }): Promise<V3MemoryReviewData> {

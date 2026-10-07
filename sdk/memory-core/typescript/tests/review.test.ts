@@ -19,6 +19,10 @@ describe("memory review SDK contract", () => {
     await client.reviewDerivedArtifact({ path: "persona.md" });
     expect(post.mock.lastCall?.[0]).toBe("/v3/memory/review/derived");
     expect(post.mock.lastCall?.[1]).not.toHaveProperty("session_id");
+    await client.revertMemory({ record_id: "m", event_id: "evt", operation_id: "revert-retry" });
+    expect(post.mock.lastCall?.[0]).toBe("/v3/memory/diff/revert");
+    expect(post.mock.lastCall?.[1]).toMatchObject({ operation_id: "revert-retry", team_id: "t1", user_id: "u1", agent_id: "a1" });
+    expect(post.mock.lastCall?.[1]).not.toHaveProperty("session_id");
   });
 
   it("uses only explicit operator attribution and rejects header injection", async () => {

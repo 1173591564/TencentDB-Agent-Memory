@@ -212,6 +212,31 @@ export interface V3CoreWriteRequest {
 export type V3CoreWriteData = CoreWriteData;
 export type V3CountData = CountData;
 
+export interface V3MemoryRevertRequest {
+  record_id?: string;
+  record_ids?: string[];
+  event_id?: string;
+  operation_id?: string;
+  reason?: string;
+  force?: boolean;
+}
+
+export interface V3MemoryRevertResult {
+  record_id: string;
+  reverted: boolean;
+  restored?: string[];
+  missing?: string[];
+  target_event_id?: string;
+  operation_id?: string;
+  outbox_pending?: boolean;
+  tombstone_pending?: boolean;
+  status?: number;
+  error?: string;
+  commit_unknown?: boolean;
+}
+
+export type V3MemoryRevertData = V3MemoryRevertResult | { results: V3MemoryRevertResult[]; succeeded: number; failed: number };
+
 export interface V3MemoryReviewRequest {
   record_id?: string;
   record_ids?: string[];
@@ -258,7 +283,7 @@ export interface V3MemoryReviewListData {
   next_offset?: number;
   items: Array<{
     record_id: string; type: string; content: string; review_status: "active" | "quarantined";
-    exists: boolean; invalid_legacy_status?: true; invalidated_by_clear?: true; lineage_incomplete?: true;
+    exists: boolean; invalid_legacy_status?: true; invalidated_by_clear?: true; invalidated_by_revert?: true; lineage_incomplete?: true;
     session_id: string; version: number; created_at: string; updated_at: string;
   }>;
 }

@@ -627,6 +627,42 @@ describe("committed observed-retraction review protocol", () => {
     if (strategy === "keyword") expect(embedding.embed).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])("auto-recall checks the native method before using capability (client embedding=%s)", async (clientEmbedding) => {
+    const { performAutoRecall } = await import("../hooks/auto-recall.js");
+    const hit = { ...all()[0], score: 1 };
+    vi.spyOn(store, "getCapabilities").mockReturnValue({ ...store.getCapabilities(), nativeHybridSearch: true });
+    const fts = vi.spyOn(store, "searchL1Fts").mockReturnValue([hit]);
+    const vector = vi.spyOn(store, "searchL1Vector").mockReturnValue([hit]);
+    const embedding = { embed: vi.fn(async () => new Float32Array([1])) };
+    const result = await performAutoRecall({ userText: "kubernetes", actorId: "u1", sessionKey: "sk", cfg: { recall: { strategy: "hybrid", timeoutMs: 5000, maxResults: 5, scoreThreshold: 0 } } as never, pluginDataDir: dir, vectorStore: store, embeddingService: clientEmbedding ? embedding as never : undefined, storage, profileIsolation: ISO });
+    expect(result?.error).toBeUndefined();
+    expect(result?.recalledL1Memories).toHaveLength(1);
+    expect(result?.recalledL1Memories?.[0].content).toBe("fact root");
+    expect(fts).toHaveBeenCalled();
+    expect(vector).toHaveBeenCalledTimes(clientEmbedding ? 1 : 0);
+    expect(embedding.embed).toHaveBeenCalledTimes(clientEmbedding ? 1 : 0);
+  });
+
+  it("auto-recall invokes a real native method with its store receiver and no client embedding", async () => {
+    const { performAutoRecall } = await import("../hooks/auto-recall.js");
+    const hit = { ...all()[0], score: 0.75 };
+    vi.spyOn(store, "getCapabilities").mockReturnValue({ ...store.getCapabilities(), nativeHybridSearch: true });
+    const native = vi.fn(function (this: IMemoryStore, params: { query?: string; topK?: number }) {
+      expect(this).toBe(store);
+      expect(params).toEqual({ query: "kubernetes", topK: 5 });
+      return [hit];
+    });
+    (store as IMemoryStore).searchL1Hybrid = native;
+    const fts = vi.spyOn(store, "searchL1Fts");
+    const vector = vi.spyOn(store, "searchL1Vector");
+    const result = await performAutoRecall({ userText: "kubernetes", actorId: "u1", sessionKey: "sk", cfg: { recall: { strategy: "hybrid", timeoutMs: 5000, maxResults: 5, scoreThreshold: 0 } } as never, pluginDataDir: dir, vectorStore: store, storage, profileIsolation: ISO });
+    expect(result?.error).toBeUndefined();
+    expect(result?.recalledL1Memories).toMatchObject([{ content: "fact root", score: 0.75 }]);
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(fts).not.toHaveBeenCalled();
+    expect(vector).not.toHaveBeenCalled();
+  });
+
   it("auto-recall cannot fall back to raw profile files when its ledger is unavailable and writes are disabled", async () => {
     const { performAutoRecall } = await import("../hooks/auto-recall.js");
     __setMemoryReviewEnabledForTests(false);

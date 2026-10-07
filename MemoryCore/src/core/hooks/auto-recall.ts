@@ -416,13 +416,16 @@ async function searchMemories(
   const maxResults = cfg.recall.maxResults ?? 5;
   const threshold = cfg.recall.scoreThreshold ?? 0.3;
 
-  const nativeHybrid =
+  const nativeHybridSearch =
     strategy === "hybrid" &&
-    !!vectorStore &&
+    vectorStore &&
     typeof vectorStore.getCapabilities === "function" &&
-    !!vectorStore.getCapabilities().nativeHybridSearch;
+    vectorStore.getCapabilities().nativeHybridSearch &&
+    typeof vectorStore.searchL1Hybrid === "function"
+      ? vectorStore.searchL1Hybrid.bind(vectorStore)
+      : undefined;
   const embeddingAvailable =
-    !!vectorStore && (hasClientEmbedding(embeddingService) || nativeHybrid);
+    !!vectorStore && (hasClientEmbedding(embeddingService) || !!nativeHybridSearch);
 
   logger?.debug?.(
     `${TAG} [searchMemories] strategy=${strategy}, embeddingAvailable=${embeddingAvailable}, ` +
@@ -464,9 +467,9 @@ async function searchMemories(
     // Hybrid: if the store natively supports hybrid search (e.g. TCVDB does
     // server-side dense + sparse + RRF in a single API call), short-circuit
     // to avoid a redundant second HTTP request and a wasted local embed().
-    if (vectorStore?.getCapabilities().nativeHybridSearch) {
+    if (nativeHybridSearch) {
       const tNative = performance.now();
-      const results = await vectorStore.searchL1Hybrid({ query: cleanText, topK: maxResults });
+      const results = await nativeHybridSearch({ query: cleanText, topK: maxResults });
       const nativeMs = performance.now() - tNative;
       logger?.debug?.(`${TAG} [hybrid-native] Single-call hybrid: ${results.length} results in ${nativeMs.toFixed(0)}ms`);
       const lines = results.map((r) => formatMemoryLine(searchResultToFormatable(r)));

@@ -99,7 +99,6 @@ import {
 } from "./doc-mappers.js";
 
 const TAG = "[memory-tdai][mongo]";
-const CANON_MIGRATION = "memory-events-canonical-v1";
 
 export interface MongoMemoryStoreOptions {
   pool: MongoClientPool;
@@ -155,7 +154,6 @@ export class MongoMemoryStore implements IMemoryStore {
         );
       }
       await this.ensureSupportingIndexes(db);
-      await this.normalizeLegacyMemoryEvents(db);
       await this.ensureSearchIndexes(db);
       this.db = db;
       this.degraded = false;
@@ -170,47 +168,6 @@ export class MongoMemoryStore implements IMemoryStore {
       throw err;
     });
     return this.initPromise;
-  }
-
-  /**
-   * Same one-shot normalization as the sqlite store: event_ts is compared
-   * lexically, so pre-contract rows (`…ssZ`, `+08:00`) are rewritten to the
-   * canonical instant; unrepresentable ones are left and reported. Isolation
-   * ids converge on "default". Best-effort — filters already match both id
-   * forms, and a failure here must not block init.
-   */
-  private async normalizeLegacyMemoryEvents(db: Db): Promise<void> {
-    const coll = db.collection(COLLECTIONS.MEMORY_EVENTS);
-    // One-shot: the $not-regex scan + three updateMany are full collection
-    // passes; a marker doc skips them on every later start.
-    const migrations = db.collection<{ _id: string; done_at: string }>(COLLECTIONS.MIGRATIONS);
-    try {
-      if (await migrations.findOne({ _id: CANON_MIGRATION })) return;
-    } catch { /* marker unreadable — fall through and run the (idempotent) pass */ }
-    try {
-      const legacy = coll.find(
-        { event_ts: { $not: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/ } } as never,
-        { projection: { _id: 1, event_ts: 1 } },
-      );
-      let fixed = 0, bad = 0;
-      for await (const d of legacy) {
-        const canon = typeof d.event_ts === "string" ? canonIsoTs(d.event_ts) : null;
-        if (canon === null) { bad += 1; continue; }
-        await coll.updateOne({ _id: d._id }, { $set: { event_ts: canon } });
-        fixed += 1;
-      }
-      if (fixed > 0) this.logger?.info?.(`${TAG} normalized ${fixed} legacy memory_events.event_ts docs to canonical form`);
-      if (bad > 0) this.logger?.warn?.(`${TAG} ${bad} memory_events docs hold unrepresentable event_ts (left as-is)`);
-      let migrated = 0;
-      for (const col of ["team_id", "user_id", "agent_id"]) {
-        const res = await coll.updateMany({ [col]: "" } as never, { $set: { [col]: DEFAULT_ISOLATION_ID } } as never);
-        migrated += res.modifiedCount;
-      }
-      if (migrated > 0) this.logger?.info?.(`${TAG} normalized ${migrated} legacy memory_events isolation ids to '${DEFAULT_ISOLATION_ID}'`);
-      await migrations.updateOne({ _id: CANON_MIGRATION }, { $setOnInsert: { done_at: new Date().toISOString() } }, { upsert: true });
-    } catch (err) {
-      this.logger?.warn?.(`${TAG} memory_events normalization failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
   }
 
   private async ensureSupportingIndexes(db: Db): Promise<void> {
@@ -360,7 +317,7 @@ export class MongoMemoryStore implements IMemoryStore {
     try {
       if (!options?.import) await assertClearGuard(this, record);
     } catch (err) {
-      if (err instanceof ReviewConflictError && record.review_guard_at) await coll.deleteOne({ _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id, review_guard_at: record.review_guard_at } as never);
+      if (err instanceof ReviewConflictError && record.review_guard_at && !this.memorySession.getStore()) await coll.deleteOne({ _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id, review_guard_at: record.review_guard_at } as never);
       throw err;
     }
     return result.matchedCount > 0 || result.upsertedCount > 0;
@@ -375,7 +332,7 @@ export class MongoMemoryStore implements IMemoryStore {
   async deleteL1Batch(recordIds: string[], filter?: IsolationFilter): Promise<boolean> {
     if (recordIds.length === 0) return true;
     const coll = await this.coll(COLLECTIONS.L1);
-    await coll.deleteMany({ _id: { $in: recordIds }, ...isolationToMatch(filter) } as never);
+    await coll.deleteMany({ _id: { $in: recordIds }, ...isolationToMatch(filter) } as never, { session: this.memorySession.getStore() });
     return true;
   }
 
@@ -992,7 +949,7 @@ export class MongoMemoryStore implements IMemoryStore {
         { upsert: true, returnDocument: "after", session: store.memorySession.getStore() })) as Document | null;
       const epoch = scope?.epoch as number;
       if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error("Generation epoch exhausted");
-      yield store.appendMemoryEvent({ ...event, review: { protocol: 1, guard_epoch: epoch } });
+      yield store.appendMemoryEvent({ ...event, review: { protocol: 2, guard_epoch: epoch } });
       return ((yield store.queryMemoryEvents({ event_id: event.event_id, limit: 1 })) as MemoryEvent[])[0]!;
     });
   }

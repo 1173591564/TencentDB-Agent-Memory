@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { MemoryEvent } from "./types.js";
 import { TcvdbMemoryStore } from "./tcvdb/memory-store.js";
 import { VectorStore } from "./sqlite/memory-store.js";
+import { reviewEventId } from "./review.js";
 
 const id = (c: string) => `evt-${c.repeat(32)}`;
 const TS = "2026-03-01T10:00:00.000Z";
@@ -26,12 +27,12 @@ const FIXTURES: MemoryEvent[] = [
   {
     event_id: id("6"), event_ts: TS, session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1",
     op: "restored", record_id: "m_root", content: "", reason: "checked", source: "review", layer: "l1", version: 0,
-    review: { protocol: 1, operation_id: `rop-${"a".repeat(64)}`, request_hash: "b".repeat(64), observed: [id("7")] },
+    review: { protocol: 2, operation_id: `rop-${"a".repeat(64)}`, request_hash: "b".repeat(64), previous_status: "quarantined", observed: [id("7")] },
   },
   {
     event_id: id("8"), event_ts: TS, session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1",
     op: "created", record_id: "m_child", content: "new", source: "extraction", layer: "l1", version: 0,
-    review: { protocol: 1, sources: ["m_root"], guard_at: TS },
+    review: { protocol: 2, sources: ["m_root"], guard_at: TS },
   },
   { // extraction write replacing two records
     event_id: id("1"), event_ts: TS, session_key: "sk", session_id: "ses",
@@ -52,7 +53,7 @@ const FIXTURES: MemoryEvent[] = [
     team_id: "t1", user_id: "u1", agent_id: "a1",
     op: "reverted", record_id: "m_new", content: "", version: 0,
     supersedes: ["m_a"], reviewer_id: "reviewer-1", reason: "wrong", target_event_id: id("1"),
-    layer: "l1", source: "review",
+    layer: "l1", source: "review", review: { protocol: 2, operation_id: `rop-${"c".repeat(64)}`, request_hash: "d".repeat(64), missing: [] },
   },
   { // userless agent-scope management clear
     event_id: id("4"), event_ts: TS, session_key: "", session_id: "",
@@ -117,16 +118,22 @@ describe("memory_events codec conformance (sqlite ↔ tcvdb)", () => {
   });
 
   it("invalid review metadata is rejected before commit on both durable implementations", async () => {
-    const event: MemoryEvent = { ...FIXTURES[0]!, review: { protocol: 1, observed: Array.from({ length: 50_001 }, () => "token") } };
+    const event: MemoryEvent = { ...FIXTURES[0]!, review: { protocol: 2, observed: Array.from({ length: 50_001 }, () => "token") } };
     expect(() => sqlite.appendMemoryEvent(event)).toThrow("Invalid review protocol payload");
     await expect(tcvdb.appendMemoryEvent(event)).rejects.toThrow("Invalid review protocol payload");
     expect(sqlite.queryMemoryEvents({})).toEqual([]);
     expect(await tcvdb.queryMemoryEvents({})).toEqual([]);
   });
 
-  for (const fx of FIXTURES) {
-    it(`${fx.op}/${fx.layer}/${fx.source} round-trips identically`, async () => {
+  for (const fixture of FIXTURES) {
+    const fx = fixture.source === "review" ? { ...fixture, event_id: reviewEventId(fixture) } : fixture;
+    it(`${fx.op}/${fx.layer}/${fx.source} ${fx.source === "review" ? "round-trips in SQLite and rejects native TCVDB writes" : "round-trips identically"}`, async () => {
       await sqlite.appendMemoryEvent(fx);
+      if (fx.source === "review") {
+        await expect(tcvdb.appendMemoryEvent(fx)).rejects.toThrow("shared atomic ledger");
+        expect(normalize(sqlite.queryMemoryEvents({ record_id: fx.record_id })[0]!)).toEqual(normalize(fx));
+        return;
+      }
       await tcvdb.appendMemoryEvent(fx);
       const [a] = await sqlite.queryMemoryEvents({ record_id: fx.record_id });
       const [b] = await tcvdb.queryMemoryEvents({ record_id: fx.record_id });

@@ -623,8 +623,7 @@ export interface AuditQueryFilter {
  *   - deleted    : 记录被显式删除（管理面 mutation API：atomic/delete、
  *                  chat-memory/clear 等）。content 为空（删除无新内容）。
  *
- * source 语义（变更来源；写入方显式标记；无该列时代的旧行在迁移回填时
- * 按 op 推断：reverted → review，其余 → extraction）：
+ * source 语义（变更来源；写入方显式标记）：
  *   - extraction  : writeMemory 自动提取路径（dedup 决策）
  *   - api_mutation: 显式管理 API（atomic/*、scenario/*、core/write、chat-memory/clear）
  *   - review      : 审阅驳回（revert）
@@ -636,7 +635,7 @@ export interface MemoryEvent {
   /**
    * 事件唯一身份（`evt-` + 32 hex）。写入点生成一次，JSONL outbox 与各
    * store 共用，同一 event_id 重复写入是幂等的（回放不产生重复事件）。
-   * 老数据为空；store 在缺省时自动补生成。
+   * 非审核事件在缺省时由 store 生成；审核收据必须提供确定性身份。
    */
   event_id?: string;
   /** 事件发生时间（ISO 8601）。 */
@@ -654,7 +653,7 @@ export interface MemoryEvent {
   user_id?: string;
   agent_id?: string;
   task_id?: string;
-  review?: { protocol: 1 | 2; observed?: string[]; sources?: string[]; request_hash?: string; operation_id?: string; no_op?: boolean; previous_status?: ReviewStatus; missing?: string[]; content_hash?: string; fence_hash?: string; guard_at?: string; guard_epoch?: number; legacy_token?: string };
+  review?: { protocol: 2; observed?: string[]; sources?: string[]; request_hash?: string; operation_id?: string; no_op?: boolean; previous_status?: ReviewStatus; missing?: string[]; content_hash?: string; fence_hash?: string; guard_at?: string; guard_epoch?: number };
   /** 变更类型。 */
   op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted" | "retracted" | "restored";
   /** 本事件对应的 record id（superseded 时为旧 record id）。 */
@@ -675,7 +674,7 @@ export interface MemoryEvent {
   snapshot_json?: string;
   /** 事件所属记忆层（l1/l2/l3）。未填按 l1 处理。 */
   layer?: "l1" | "l2" | "l3";
-  /** 变更来源（extraction / api_mutation / review / retention）。写入方应显式标记——未标记的新行读回 undefined，按 source 过滤不会命中（"按 op 推断"仅适用于迁移回填的旧行）。 */
+  /** 变更来源（extraction / api_mutation / review / retention）。未标记的行不命中 source 过滤。 */
   source?: "extraction" | "api_mutation" | "review" | "retention";
   /** Gateway request_id（api_mutation 来源时由调用方透传，便于与 audit 表对账）。 */
   request_id?: string;

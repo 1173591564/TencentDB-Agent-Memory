@@ -11,7 +11,7 @@ import { StorageAdapter } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { StoragePaths } from "../storage/types.js";
 import type { IMemoryStore, MemoryEvent } from "../store/types.js";
-import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, hasPendingLedgerEvent, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, registerLedgerState, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId, startLedgerOutboxRetention } from "./event-ledger.js";
+import { appendLedgerEvent, getLedgerHealth, getLedgerWriterId, loadLedgerWriterId, newLedgerWriterId, redactLedgerEvents, registerLedgerState, replayLedgerEvents, resetLedgerHealth, setLedgerWriterId, startLedgerOutboxRetention } from "./event-ledger.js";
 import { resolveLedgerOutboxRetentionDays } from "../../utils/env-config.js";
 import { LocalMemoryCleaner } from "../../utils/memory-cleaner.js";
 import { canonIsoTs } from "../store/memory-event-id.js";
@@ -347,7 +347,7 @@ describe("event ledger outbox", () => {
     const bad = await appendLedgerEvent({ store, storage, event: ev({ team_id: "", agent_id: "", event_ts: "2026-02-30T00:00:00Z" }), logger: silent });
     expect(bad.store).toBe(false);
     expect(getLedgerHealth(store, { team_id: "", agent_id: "" })).toMatchObject({ degraded: true, pending_store_events: 1 });
-    expect(hasPendingLedgerEvent(store, "m_x", { team_id: "", agent_id: "" })).toBe(true);
+    expect(getLedgerHealth(store, { team_id: "", agent_id: "" }).pending_store_events).toBe(1);
   });
 
   it("a contract-rejected append or redaction degrades ledger health instead of vanishing", async () => {
@@ -913,7 +913,7 @@ describe("known redaction set bounds", () => {
   });
 });
 
-describe("unrecoverable gaps gate only their own record", () => {
+describe("unrecoverable outbox health reporting", () => {
   let dir: string;
   let store: VectorStore;
   beforeEach(() => {
@@ -926,11 +926,10 @@ describe("unrecoverable gaps gate only their own record", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("a rejected append gates reverts of that record, not the whole tenant", async () => {
+  it("a rejected append records the missing mirror event", async () => {
     await appendLedgerEvent({ store, event: ev({ event_ts: "not-a-date", record_id: "m_bad" }), logger: silent });
     const scope = { team_id: "t1", agent_id: "a1" };
     expect(getLedgerHealth(store, scope).degraded).toBe(true);
-    expect(hasPendingLedgerEvent(store, "m_bad", scope)).toBe(true);
-    expect(hasPendingLedgerEvent(store, "m_other", scope)).toBe(false);
+    expect(getLedgerHealth(store, scope).pending_store_events).toBe(1);
   });
 });

@@ -2629,7 +2629,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
   async appendMemoryEvent(event: MemoryEvent): Promise<void> {
     assertReviewEvent(event);
-    if (event.review?.protocol === 2 || (event.scope === "agent" && event.review?.guard_epoch !== undefined)) throw new ReviewCapabilityError("TCVDB native upsert cannot commit immutable review receipts or epochs; a shared atomic ledger is required");
+    if (event.source === "review" || (event.scope === "agent" && event.review?.guard_epoch !== undefined)) throw new ReviewCapabilityError("TCVDB native upsert cannot commit immutable review receipts or epochs; a shared atomic ledger is required");
     await this._ensureInit();
     if (this.degraded) throw new Error("memory_events append rejected: tcvdb store is degraded");
 

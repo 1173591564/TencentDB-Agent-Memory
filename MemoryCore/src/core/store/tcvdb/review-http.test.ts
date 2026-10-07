@@ -63,14 +63,20 @@ describe("TCVDB review through the HTTP client contract", () => {
     return collections.get(name)!;
   };
 
-  async function legacyRetract(id: string, ownership = iso): Promise<MemoryEvent> {
-    const event: MemoryEvent = {
-      event_id: newMemoryEventId(), event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
-      team_id: ownership.teamId, user_id: ownership.userId, agent_id: ownership.agentId, record_id: id,
-      content: "", op: "retracted", source: "review", layer: "l1", review: { protocol: 1 },
-    };
-    await store.appendMemoryEvent(event);
+  function seedReceipt(event: MemoryEvent): MemoryEvent {
+    event.event_id = reviewEventId(event);
+    const collection = (store as unknown as { eventsCollection: string }).eventsCollection;
+    docs(collection).set(event.event_id, { ...event, id: event.event_id, supersedes: JSON.stringify(event.supersedes ?? []), review_json: JSON.stringify(event.review) });
     return event;
+  }
+
+  async function committedRetract(id: string, ownership = iso): Promise<MemoryEvent> {
+    return seedReceipt({
+      event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
+      team_id: ownership.teamId, user_id: ownership.userId, agent_id: ownership.agentId, record_id: id,
+      content: "", op: "retracted", source: "review", layer: "l1",
+      review: { protocol: 2, operation_id: `rop-${newMemoryEventId().slice(4).repeat(2)}`, request_hash: "a".repeat(64), previous_status: "active" },
+    });
   }
 
   beforeEach(async () => {
@@ -172,15 +178,15 @@ describe("TCVDB review through the HTTP client contract", () => {
     expect((await peer.queryL1Records(iso)).map((r) => r.record_id)).toEqual(["clean", "root"]);
   });
 
-  it("committed legacy retraction reaches reads, pagination, count and texts on another instance", async () => {
-    const retract = await legacyRetract("root");
+  it("imported committed retraction reaches reads, pagination, count and texts on another instance", async () => {
+    const retract = await committedRetract("root");
     expect((await peer.queryL1Records(iso)).map((r) => r.record_id)).toEqual(["clean"]);
     expect(await peer.countL1(iso)).toBe(1);
     expect((await peer.searchL1Hybrid({ query: "kubernetes", topK: 2, filter: iso })).map((r) => r.record_id)).toEqual(["clean"]);
     expect((await peer.queryL1Paginated({ ...iso, visibility: "quarantined", limit: 10, offset: 0 })).rows[0]?.record_id).toBe("root");
     expect((await peer.getAllL1Texts()).map((r) => r.record_id)).toEqual(["clean"]);
     expect((peer as IMemoryStore).setL1ReviewStatus).toBeUndefined();
-    await peer.appendMemoryEvent({ ...retract, event_id: newMemoryEventId(), op: "restored", review: { protocol: 1, observed: [retract.event_id!] } });
+    seedReceipt({ ...retract, op: "restored", review: { ...retract.review!, operation_id: `rop-${"c".repeat(64)}`, previous_status: "quarantined", observed: [retract.review!.operation_id!] } });
     expect(await store.countL1(iso)).toBe(2);
   });
 
@@ -188,7 +194,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     const defaults = { teamId: "default", userId: "default", agentId: "default" };
     expect(await store.upsertL1({ ...rec("default-root"), teamId: undefined, userId: undefined, agentId: undefined })).toBe(true);
     expect((await peer.queryL1Records(defaults)).map((r) => r.record_id)).toEqual(["default-root"]);
-    await legacyRetract("default-root", defaults);
+    await committedRetract("default-root", defaults);
     expect(await store.queryL1Records(defaults)).toEqual([]);
   });
 
@@ -196,7 +202,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     const l1 = [...collections.values()].find((c) => c.has("root"))!;
     l1.set("root", { ...l1.get("root"), vector: [7, 9], private_extra: "preserved" });
     const before = JSON.stringify(l1.get("root"));
-    await legacyRetract("root");
+    await committedRetract("root");
     expect(JSON.stringify(l1.get("root"))).toBe(before);
     expect(await peer.upsertL1({ ...rec("root"), content: "new bytes" })).toBe(true);
     expect(l1.get("root")?.vector).toEqual(["new bytes".length]);
@@ -210,7 +216,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     expect(await store.upsertL1Batch(batch)).toBe(25);
     expect((await store.queryL1Records({ ...iso, recordIds: batch.map((r) => r.id), visibility: "all" })).length).toBe(25);
     await store.upsertL1(rec("child", ["root"]));
-    await legacyRetract("root");
+    await committedRetract("root");
     expect(await store.queryL1Records({ ...iso, recordIds: ["child"] })).toEqual([]);
     const l1 = [...collections.values()].find((c) => c.has("clean"))!;
     const old = { ...l1.get("clean") }; delete old.review_status; delete old.review_sources_json;
@@ -259,7 +265,7 @@ describe("TCVDB review through the HTTP client contract", () => {
   });
 
   it("review resolution scans a multi-page event window only once", async () => {
-    const event = await legacyRetract("root");
+    const event = await committedRetract("root");
     const collection = (store as unknown as { eventsCollection: string }).eventsCollection;
     const data = docs(collection);
     const original = data.get(event.event_id!)!;
@@ -273,7 +279,7 @@ describe("TCVDB review through the HTTP client contract", () => {
   });
 
   it("a server-side paging tie omission is rejected, not reported as complete history", async () => {
-    const event: MemoryEvent = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", content: "", op: "retracted", source: "review", review: { protocol: 1 } };
+    const event: MemoryEvent = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", content: "", op: "created", source: "extraction" };
     for (let i = 0; i < 201; i++) await store.appendMemoryEvent({ ...event, event_id: `evt-${i.toString(16).padStart(32, "0")}` });
     unstable = true;
     await expect(store.queryMemoryEvents({ record_id: "root", limit: 1000 })).rejects.toThrow(/incomplete|concurrently/);

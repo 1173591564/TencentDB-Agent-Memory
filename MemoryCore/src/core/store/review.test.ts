@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VectorStore } from "./sqlite/memory-store.js";
 import { __setMemoryReviewEnabledForTests } from "./visibility.js";
-import { resolveReviewRows, setReviewStatus, ReviewConflictError } from "./review.js";
+import { resolveReviewRows, setReviewStatus, ReviewConflictError, reviewEventId } from "./review.js";
 import { acknowledgeDerivedReview, derivedProfileAllowed, inspectDerivedReview, profileReviewFence } from "./derived-review.js";
 import type { MemoryRecord } from "../record/l1-writer.js";
 import type { IMemoryStore, MemoryEvent } from "./types.js";
@@ -95,30 +95,11 @@ describe("committed observed-retraction review protocol", () => {
     expect(state()).toBe("quarantined");
   });
 
-  it("legacy operation facts remain readable but are not guessed into current command receipts", () => {
-    const current = store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("current-fact") })!.event!;
-    const legacy = { ...current, event_id: "evt-" + "1".repeat(32), review: { protocol: 1 as const, operation_id: op("legacy-retry"), request_hash: current.review!.request_hash } };
-    store.appendMemoryEvent(legacy);
-    expect(state()).toBe("quarantined");
-    expect(() => store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("legacy-retry") })).toThrow("Legacy review receipts cannot be retried");
-    expect(store.queryMemoryEvents({ record_id: "root", operation_id: op("legacy-retry") })).toHaveLength(1);
-    expect(store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("current-restoration") })?.changed).toBe(true);
-    expect(state()).toBe("active");
-  });
-
-  it("legacy derived receipts cannot bypass the current acknowledgement protocol", async () => {
-    const legacy: MemoryEvent = { event_id: "evt-" + "2".repeat(32), event_ts: "2026-01-01T00:00:00.000Z", session_key: "", session_id: "", ...{ team_id: "t1", agent_id: "a1", user_id: "default" }, record_id: "persona.md", content: "", op: "updated", source: "review", layer: "l3", review: { protocol: 1, operation_id: op("old-derived"), request_hash: "a".repeat(64) } };
-    vi.spyOn(store, "queryMemoryEvents").mockReturnValueOnce([legacy]);
-    await expect(acknowledgeDerivedReview(store, "persona.md", "bytes", { content_hash: "a".repeat(64), fence_hash: "b".repeat(64) }, ISO, { operation_id: "old-derived", reason: "verified" })).rejects.toThrow("Legacy derived review receipts cannot be retried");
-    expect(store.queryMemoryEvents({ source: "review" })).toEqual([]);
-  });
-
-  it("legacy revert receipts cannot be guessed into a committed transactional result", async () => {
-    const legacy: MemoryEvent = { event_id: "evt-" + "3".repeat(32), event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", agent_id: "a1", user_id: "u1", record_id: "root", content: "", op: "reverted", source: "review", layer: "l1", review: { protocol: 1, operation_id: op("old-revert"), request_hash: "a".repeat(64) } };
-    vi.spyOn(store, "queryMemoryEvents").mockReturnValueOnce([legacy]);
-    expect(await revertMemory({ store, recordId: "root", options: { operationId: "old-revert" }, isolation: ISO, logger: { info() {}, debug() {}, warn() {}, error() {} } })).toMatchObject({ ok: false, status: 409, error: "Legacy revert receipts cannot be retried; use a new operation identity" });
-    expect(all().map((r) => r.record_id)).toEqual(["root"]);
-    expect(store.queryMemoryEvents({ source: "review" })).toEqual([]);
+  it("retired protocol payloads and unreceipted review commands are rejected", () => {
+    const event = store.setL1ReviewStatus("root", "quarantined", ISO)!.event!;
+    expect(() => store.appendMemoryEvent({ ...event, review: { ...event.review, protocol: 1 } } as unknown as MemoryEvent)).toThrow("Invalid review protocol payload");
+    expect(() => store.appendMemoryEvent({ ...event, review: undefined })).toThrow("identity");
+    expect(store.queryMemoryEvents({ source: "review" })).toHaveLength(1);
   });
 
   it("an explicit no-op receipt remains a no-op after a later review", () => {
@@ -192,12 +173,14 @@ describe("committed observed-retraction review protocol", () => {
 
   it("restore only cancels observed tokens, regardless of clock ordering", () => {
     const first = store.setL1ReviewStatus("root", "quarantined", ISO)!.event!;
-    const restore: MemoryEvent = { ...first, event_id: "evt-" + "2".repeat(32), event_ts: "2001-01-01T00:00:00.000Z", op: "restored", review: { protocol: 1, observed: [first.review!.operation_id!] } };
-    const second: MemoryEvent = { ...first, event_id: "evt-" + "3".repeat(32), event_ts: "2000-01-01T00:00:00.000Z", review: { protocol: 1 } };
+    const restore: MemoryEvent = { ...first, event_ts: "2001-01-01T00:00:00.000Z", op: "restored", review: { ...first.review!, operation_id: op("clock-restore"), previous_status: "quarantined", observed: [first.review!.operation_id!] } };
+    const second: MemoryEvent = { ...first, event_ts: "2000-01-01T00:00:00.000Z", review: { ...first.review!, operation_id: op("clock-retract") } };
+    restore.event_id = reviewEventId(restore);
+    second.event_id = reviewEventId(second);
     store.appendMemoryEvent(second);
     store.appendMemoryEvent(restore);
     expect(state()).toBe("quarantined");
-    expect(all()[0]?.review_tokens).toEqual([second.event_id]);
+    expect(all()[0]?.review_tokens).toEqual([second.review!.operation_id]);
   });
 
   it("duplicate physical deliveries use one logical token and delayed delivery cannot undo restore", () => {
@@ -310,12 +293,13 @@ describe("committed observed-retraction review protocol", () => {
     try {
       const restoring = setReviewStatus(store, "root", "active", ISO);
       await observed;
-      const concurrent = { ...initial, event_id: "evt-" + "8".repeat(32), event_ts: "2000-01-01T00:00:00.000Z", review: { protocol: 1 as const } };
+      const concurrent = { ...initial, event_ts: "2000-01-01T00:00:00.000Z", review: { ...initial.review!, operation_id: op("peer-retract") } };
+      concurrent.event_id = reviewEventId(concurrent);
       peer.appendMemoryEvent(concurrent);
       release();
       await restoring;
       expect(state()).toBe("quarantined");
-      expect(all()[0]?.review_tokens).toEqual([concurrent.event_id]);
+      expect(all()[0]?.review_tokens).toEqual([concurrent.review.operation_id]);
     } finally { release(); peer.close(); }
   });
 
@@ -380,20 +364,14 @@ describe("committed observed-retraction review protocol", () => {
     finally { target.close(); }
   });
 
-  it("legacy migration identities retain the original logical suppression token", async () => {
-    const base = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", content: "", source: "review" as const, layer: "l1" as const };
-    store.appendMemoryEvent({ ...base, op: "retracted", event_id: "evt-" + "e".repeat(32) });
+  it("migration rejects missing event identity instead of inventing historical control tokens", async () => {
+    store.setL1ReviewStatus("root", "quarantined", ISO);
     store.getRawDb().prepare("UPDATE memory_events SET event_id='' WHERE record_id=?").run("root");
-    const old = store.queryMemoryEvents({ record_id: "root" })[0]!;
-    const token = `legacy-event-${createHash("sha256").update(JSON.stringify([old.record_id, old.event_ts, old.op, old.session_key, old.session_id])).digest("hex")}`;
-    store.appendMemoryEvent({ ...base, op: "restored", event_id: "evt-" + "f".repeat(32), review: { protocol: 1, observed: [token] } });
-    const target = new VectorStore(path.join(dir, "legacy-ledger-target.db"), 0);
-    target.init(); target.upsertL1(record("root"), undefined);
+    const target = new VectorStore(path.join(dir, "invalid-ledger-target.db"), 0);
+    target.init();
     try {
-      expect(await migrateReviewLedger(store, target)).toBe(2);
-      expect(target.queryL1Records(ISO).map((row) => row.record_id)).toEqual(["root"]);
-      expect(await migrateReviewLedger(store, target)).toBe(2);
-      expect(target.queryMemoryEvents({ record_id: "root" })).toHaveLength(2);
+      await expect(migrateReviewLedger(store, target)).rejects.toThrow("Ledger event has no valid identity");
+      expect(target.queryMemoryEvents({})).toEqual([]);
     } finally { target.close(); }
   });
 
@@ -598,7 +576,7 @@ describe("committed observed-retraction review protocol", () => {
     expect(await scoped.readFileBuffer("persona.md")).toBeNull();
     const content = await scoped.readFile("persona.md", { review: false });
     const fence = await profileReviewFence(store, ISO);
-    store.appendMemoryEvent({ event_ts: new Date().toISOString(), session_key: "", session_id: "", team_id: "t1", user_id: "u1", agent_id: "a1", op: "updated", source: "review", layer: "l3", record_id: "persona.md", content: "", review: { protocol: 1, fence_hash: createHash("sha256").update(JSON.stringify([...fence].sort())).digest("hex"), content_hash: createHash("sha256").update(content!).digest("hex") } });
+    await acknowledgeDerivedReview(store, "persona.md", content!, { fence_hash: createHash("sha256").update(JSON.stringify([...fence].sort())).digest("hex"), content_hash: createHash("sha256").update(content!).digest("hex") }, ISO, { operation_id: "profile-read", reason: "verified" });
     expect(await scoped.readFile("persona.md")).toBe(content);
     await scoped.writeFile("persona.md", "changed after acknowledgement");
     expect(await scoped.readFile("persona.md")).toBeNull();

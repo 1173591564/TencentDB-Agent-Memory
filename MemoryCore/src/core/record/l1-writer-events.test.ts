@@ -11,8 +11,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VectorStore } from "../store/sqlite/memory-store.js";
+import type { StorageAdapter } from "../storage/adapter.js";
 import { writeMemory, type ExtractedMemory, type DedupDecision } from "./l1-writer.js";
 
 const memory = (content: string): ExtractedMemory => ({
@@ -60,6 +61,61 @@ describe("writeMemory memory events", () => {
     const events = store.queryMemoryEvents({ session_id: "ses-x" });
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ op: "created", record_id: "m_a", content: "salary is 5000", session_id: "ses-x" });
+  });
+
+  it("a ledger failure rolls back the successor, target deletion and partial event group", async () => {
+    await writeMemory({ ...iso(), memory: memory("original"), decision: decision("before", "store") });
+    const append = store.appendMemoryEvent.bind(store);
+    vi.spyOn(store, "appendMemoryEvent").mockImplementation((event) => {
+      if (event.op === "updated") throw new Error("ledger unavailable");
+      return append(event);
+    });
+    expect(await writeMemory({ ...iso(), memory: memory("replacement"), decision: decision("after", "update", ["before"]) })).toBeNull();
+    expect(store.queryL1Records({ visibility: "all" }).map((row) => row.record_id)).toEqual(["before"]);
+    expect(store.queryMemoryEvents({}).map((event) => event.op)).toEqual(["created"]);
+    store.close();
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    expect(store.queryL1Records({}).map((row) => row.record_id)).toEqual(["before"]);
+    expect(store.queryMemoryEvents({}).map((event) => event.op)).toEqual(["created"]);
+  });
+
+  it("a refused target deletion aborts replacement rather than publishing a created fallback", async () => {
+    await writeMemory({ ...iso(), memory: memory("original"), decision: decision("before", "store") });
+    vi.spyOn(store, "deleteL1Batch").mockReturnValueOnce(false);
+    expect(await writeMemory({ ...iso(), memory: memory("replacement"), decision: decision("after", "update", ["before"]) })).toBeNull();
+    expect(store.queryL1Records({}).map((row) => row.record_id)).toEqual(["before"]);
+    expect(store.queryMemoryEvents({}).map((event) => event.op)).toEqual(["created"]);
+  });
+
+  it("a decision naming a retired known target cannot become an unrelated new lineage", async () => {
+    await writeMemory({ ...iso(), memory: memory("original"), decision: decision("before", "store") });
+    await writeMemory({ ...iso(), memory: memory("first successor"), decision: decision("winner", "update", ["before"]) });
+    expect(await writeMemory({ ...iso(), memory: memory("late successor"), decision: decision("late", "update", ["before"]) })).toBeNull();
+    expect(store.queryL1Records({}).map((row) => row.record_id)).toEqual(["winner"]);
+    expect(store.queryMemoryEvents({ record_id: "late" })).toEqual([]);
+  });
+
+  it("a clear committed before mirror publication prevents late plaintext mirrors", async () => {
+    const execute = store.executeMemoryTransaction.bind(store);
+    vi.spyOn(store, "executeMemoryTransaction").mockImplementationOnce((program) => {
+      const result = execute(program);
+      store.commitClearFence({ event_id: "evt-" + "c".repeat(32), event_ts: new Date().toISOString(),
+        session_key: "", session_id: "", team_id: "t1", agent_id: "a1", op: "deleted", scope: "agent",
+        layer: "l1", source: "api_mutation", record_id: "clear", content: "" });
+      return result;
+    });
+    const appendFile = vi.fn(async () => {});
+    expect(await writeMemory({ ...iso(), storage: { appendFile } as unknown as StorageAdapter,
+      memory: memory("cleared fact"), decision: decision("cleared", "store") })).not.toBeNull();
+    expect(appendFile).not.toHaveBeenCalled();
+    expect(store.queryL1Records({})).toEqual([]);
+    expect(store.queryMemoryEvents({ record_id: "cleared" })).toHaveLength(1);
+  });
+
+  it("missing authority never succeeds as a JSONL-only write", async () => {
+    expect(await writeMemory({ ...iso(), vectorStore: undefined, memory: memory("orphan"), decision: decision("orphan", "store") })).toBeNull();
+    expect(store.queryMemoryEvents({})).toEqual([]);
   });
 
   it("skip action appends nothing", async () => {

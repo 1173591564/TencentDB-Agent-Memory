@@ -3,7 +3,9 @@ import { randomUUID } from "node:crypto";
 import { MongoClientPool, buildMongoClientOptions } from "../src/core/store/mongodb/client-pool.js";
 import { MongoMemoryStore } from "../src/core/store/mongodb/memory-store.js";
 import { __setMemoryReviewEnabledForTests } from "../src/core/store/visibility.js";
-import type { MemoryRecord } from "../src/core/record/l1-writer.js";
+import { writeMemory, type MemoryRecord } from "../src/core/record/l1-writer.js";
+import type { MemoryEvent } from "../src/core/store/types.js";
+import type { StorageAdapter } from "../src/core/storage/adapter.js";
 import { revertMemory } from "../src/core/record/memory-revert.js";
 
 const config = {
@@ -64,6 +66,30 @@ try {
   assert.equal((await second.queryL1Records(defaults)).length, 1);
   await second.setL1ReviewStatus("default-bucket", "quarantined", defaults);
   assert.equal((await first.queryL1Records(defaults)).length, 0);
+  const writing = { baseDir: ".", sessionKey: "sk", sessionId: "ses", ...iso, storage: { appendFile: async () => {} } as unknown as StorageAdapter, logger: silent };
+  const memory = (content: string) => ({ content, type: "work_fact" as const, priority: 50, scene_name: "default", source_message_ids: [], metadata: {} });
+  assert.ok(await writeMemory({ ...writing, vectorStore: first, memory: memory("atomic original"), decision: { record_id: "atomic-parent", action: "store", target_ids: [] } }));
+  const extractionAppend = first.appendMemoryEvent.bind(first);
+  first.appendMemoryEvent = async (event: MemoryEvent) => {
+    if (event.op === "updated" && event.source === "extraction") throw new Error("injected extraction ledger failure");
+    await extractionAppend(event);
+  };
+  assert.equal(await writeMemory({ ...writing, vectorStore: first, memory: memory("uncommitted successor"), decision: { record_id: "atomic-child", action: "update", target_ids: ["atomic-parent"] } }), null);
+  first.appendMemoryEvent = extractionAppend;
+  assert.deepEqual((await second.queryL1Records({ ...iso, recordIds: ["atomic-parent", "atomic-child"], visibility: "all" })).map((r) => r.record_id), ["atomic-parent"]);
+  assert.equal((await second.queryMemoryEvents({ record_id: "atomic-parent", op: "superseded" })).length, 0);
+  assert.equal((await second.queryMemoryEvents({ record_id: "atomic-child" })).length, 0);
+  assert.ok(await writeMemory({ ...writing, vectorStore: second, memory: memory("atomic replacement"), decision: { record_id: "atomic-child", action: "update", target_ids: ["atomic-parent"] } }));
+  assert.deepEqual((await first.queryL1Records({ ...iso, recordIds: ["atomic-parent", "atomic-child"] })).map((r) => r.record_id), ["atomic-child"]);
+  assert.equal((await first.queryMemoryEvents({ record_id: "atomic-parent", op: "superseded" })).length, 1);
+  assert.equal((await first.queryMemoryEvents({ record_id: "atomic-child", op: "updated" })).length, 1);
+  assert.equal(await writeMemory({ ...writing, vectorStore: first, memory: memory("late replacement"), decision: { record_id: "retired-target-child", action: "update", target_ids: ["atomic-parent"] } }), null);
+  assert.deepEqual(await second.queryMemoryEvents({ record_id: "retired-target-child" }), []);
+  assert.ok(await writeMemory({ ...writing, vectorStore: first, memory: memory("race original"), decision: { record_id: "race-parent", action: "store", target_ids: [] } }));
+  const race = await Promise.all([first, second].map((vectorStore, i) => writeMemory({ ...writing, vectorStore,
+    memory: memory(`race replacement ${i}`), decision: { record_id: `race-child-${i}`, action: "update", target_ids: ["race-parent"] } })));
+  assert.equal(race.filter(Boolean).length, 1);
+  assert.equal((await first.queryMemoryEvents({ record_id: "race-parent", op: "superseded" })).length, 1);
   await first.upsertL1(rec("revert-parent"));
   const preimage = (await first.queryL1Records({ ...iso, recordIds: ["revert-parent"], visibility: "all" }))[0]!;
   await second.upsertL1(rec("revert-child", ["revert-parent"]));

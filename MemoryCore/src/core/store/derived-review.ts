@@ -27,15 +27,9 @@ export async function profileReviewFence(store: IMemoryStore, isolation?: Profil
 export async function derivedProfileAllowed(store: IMemoryStore, path: string, content: string, fence: readonly string[], isolation?: ProfileScope): Promise<boolean> {
   if (!fence.length) return true;
   const events = await queryReviewHistory(store, { record_id: path, layer: path === "persona.md" ? "l3" : "l2", source: "review", op: "updated", team_id: isolation?.teamId || "default", agent_id: isolation?.agentId || "default", metadata_only: true });
-  const hashes = new Map<string, Set<string>>();
-  for (const event of events) if (event.review?.protocol === 1 && event.review.operation_id) {
-    const values = hashes.get(event.review.operation_id) ?? new Set<string>();
-    values.add(event.review.request_hash ?? "");
-    hashes.set(event.review.operation_id, values);
-  }
   const contentHash = hashOf(content);
   const currentFence = fenceHash(fence);
-  return events.some((event) => event.review?.content_hash === contentHash && (event.review.protocol === 2 || !event.review.operation_id || hashes.get(event.review.operation_id)!.size === 1) && event.review.fence_hash === currentFence);
+  return events.some((event) => event.review?.content_hash === contentHash && event.review.fence_hash === currentFence);
 }
 
 export async function inspectDerivedReview(store: IMemoryStore, path: string, content: string, isolation: ProfileScope) {
@@ -50,9 +44,9 @@ export async function acknowledgeDerivedReview(store: IMemoryStore, path: string
   const identity = `rop-${hashOf(JSON.stringify(["derived", isolation.teamId, isolation.agentId, path, operation.operation_id]))}`;
   const requestHash = hashOf(JSON.stringify([expected.content_hash, expected.fence_hash, operation.reason, operation.reviewer_id ?? ""]));
   const prior = await store.queryMemoryEvents({ record_id: path, layer: path === "persona.md" ? "l3" : "l2", source: "review", team_id: isolation.teamId, agent_id: isolation.agentId, operation_id: identity, limit: 2 });
-  if (prior.length > 1) throw new ReviewConflictError("Legacy duplicate derived receipts require reconciliation");
+  if (prior.length > 1) throw new ReviewConflictError("Duplicate derived receipts violate immutable identity");
   if (prior[0]) {
-    if (prior[0].review?.protocol !== 2) throw new ReviewConflictError("Legacy derived review receipts cannot be retried; use a new operation identity");
+    if (!prior[0].review?.operation_id) throw new Error("Derived receipt identity required");
     if (prior[0].review.request_hash !== requestHash) throw new ReviewConflictError("Derived review operation identity reused with different input");
     return prior[0];
   }

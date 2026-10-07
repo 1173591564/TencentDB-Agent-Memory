@@ -135,12 +135,9 @@ export async function extractL1Memories(params: {
   /** Plugin instance ID for metric reporting (optional — metrics skipped if absent) */
   instanceId?: string;
   /**
-   * StorageAdapter for L1 JSONL writes.
-   * - service mode: must be provided (CosStorageBackend) — JSONL is the source of
-   *   truth for backup/recovery; without storage, writes silently fall back to local
-   *   pod fs and are lost on pod restart (CR-2 root cause, fixed 2026-05-19).
-   * - standalone mode: caller usually provides LocalStorageBackend; if absent,
-   *   writeMemory falls back to fs at `{baseDir}/records/{date}.jsonl`.
+   * StorageAdapter for post-commit L1/ledger mirrors.
+   * Service callers provide their durable adapter; standalone callers use
+   * LocalStorageBackend at baseDir. The authoritative store is required.
    */
   storage?: StorageAdapter;
 }): Promise<L1ExtractionResult> {

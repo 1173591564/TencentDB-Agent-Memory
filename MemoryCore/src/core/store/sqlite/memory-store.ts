@@ -189,7 +189,7 @@ function pushIsoCond(conds: string[], args: SQLInputValue[], col: string, v: str
   else { conds.push(`${col} = ?`); args.push(healed); }
 }
 
-/** memory_events 新表 DDL 主体（CHECK 重建迁移与建表共用同一份定义）。 */
+/** memory_events 表的最终定义。 */
 const MEMORY_EVENTS_DDL_BODY = `
         seq                INTEGER PRIMARY KEY AUTOINCREMENT,
         event_ts           TEXT NOT NULL,
@@ -962,62 +962,14 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_record ON memory_events(record_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_origin ON memory_events(origin_session_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_isolation ON memory_events(team_id, agent_id, user_id, seq)");
-    // Existing installs: backfill columns added after the first release
-    // (reviewer_id for review reverts; snapshot_json for revert restore) so
-    // the copy below can reference them regardless of which schema the
-    // pre-existing table was created with.
-    try { this.db.exec("ALTER TABLE memory_events ADD COLUMN reviewer_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
-    try { this.db.exec("ALTER TABLE memory_events ADD COLUMN snapshot_json TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
-    // event_id: stable per-event identity; the partial unique index makes
-    // re-appending the same event (outbox replay) a no-op while legacy rows
-    // (event_id='') stay unconstrained.
-    try { this.db.exec("ALTER TABLE memory_events ADD COLUMN event_id TEXT NOT NULL DEFAULT ''"); } catch { /* exists */ }
-    for (const col of ["reason", "target_event_id", "scope", "until_ts", "review_json"]) {
-      try { this.db.exec(`ALTER TABLE memory_events ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`); } catch { /* exists */ }
-    }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_ts ON memory_events(event_ts, seq)");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_event_id ON memory_events(event_id) WHERE event_id != ''");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_review_operation ON memory_events(json_extract(NULLIF(review_json, ''), '$.operation_id'))");
 
-    try {
-      const evT = this.db.prepare(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_events'",
-      ).get() as { sql?: string } | undefined;
-      if (evT?.sql && (!evT.sql.includes("'deleted'") || !evT.sql.includes("'retracted'") || !evT.sql.includes("'restored'"))) {
-        this.db.exec("BEGIN IMMEDIATE");
-        try {
-          const oldCols = (this.db.prepare("PRAGMA table_info(memory_events)").all() as Array<{ name: string }>).map((c) => c.name);
-          const schemaSql = (this.db.prepare(
-            "SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger') AND tbl_name='memory_events' AND sql IS NOT NULL",
-          ).all() as Array<{ sql: string }>).map((r) => r.sql);
-          const sequence = (this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'memory_events'").get() as { seq: number } | undefined)?.seq ?? 0;
-          this.db.exec(`CREATE TABLE memory_events_oprebuild (${MEMORY_EVENTS_DDL_BODY})`);
-          const newCols = (this.db.prepare("PRAGMA table_info(memory_events_oprebuild)").all() as Array<{ name: string }>).map((c) => c.name);
-          if (oldCols.some((name) => !newCols.includes(name))) throw new Error("memory_events has unknown columns; migration requires explicit schema reconciliation");
-          const copiedCols = newCols.filter((name) => oldCols.includes(name) || name === "source");
-          const quotedCols = copiedCols.map((name) => `"${name}"`).join(", ");
-          const selectCols = copiedCols.map((name) => oldCols.includes(name) ? `"${name}"` : "CASE WHEN op = 'reverted' THEN 'review' ELSE 'extraction' END").join(", ");
-          this.db.exec(`INSERT INTO memory_events_oprebuild (${quotedCols}) SELECT ${selectCols} FROM memory_events ORDER BY seq`);
-          this.db.exec("DROP TABLE memory_events");
-          this.db.exec("ALTER TABLE memory_events_oprebuild RENAME TO memory_events");
-          const sequenceUpdate = this.db.prepare("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'memory_events'").run(sequence);
-          if (sequenceUpdate.changes === 0) this.db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('memory_events', ?)").run(sequence);
-          for (const sql of schemaSql) this.db.exec(sql);
-          this.db.exec("COMMIT");
-          this.logger?.info?.(`[memory-tdai][sqlite] memory_events op CHECK 已重建（+deleted/retracted/restored），拷贝列: ${copiedCols.length}`);
-        } catch (migErr) {
-          this.db.exec("ROLLBACK");
-          throw migErr;
-        }
-      }
-    } catch (err) {
-      this.logger?.warn?.(`[memory-tdai][sqlite] memory_events op CHECK (retracted) migration failed: ${err instanceof Error ? err.message : String(err)}`);
-      throw err;
-    }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_clear_epoch ON memory_events(team_id, agent_id, scope, source, layer, json_extract(NULLIF(review_json, ''), '$.guard_epoch'))");
 
-    // One-shot legacy normalization (below): each pass is a full scan of
-    // memory_events / l1_records / l0_conversations, so it must not run on
+    // One-shot content normalization (below): each pass is a full scan of
+    // l1_records / l0_conversations, so it must not run on
     // every start. Once all passes complete, a marker row skips them for good
     // — every writer since this contract stores canonical forms only.
     this.db.exec("CREATE TABLE IF NOT EXISTS tdai_migrations (name TEXT PRIMARY KEY, done_at TEXT NOT NULL)");
@@ -1025,49 +977,6 @@ export class VectorStore implements IMemoryStore {
     const canonDone = this.db.prepare("SELECT 1 FROM tdai_migrations WHERE name = ?").get(CANON_MIGRATION) !== undefined;
     if (!canonDone) {
       let canonOk = true;
-      // event_ts 契约：全链路裸字符串比较要求规范形 `…ss.sssZ`。老库可能存着
-      // 无毫秒/带偏移的非规范行（schema 收紧前写入或回放进来），此处一次性
-      // 归一化；连无损归一都做不到的行原样保留并告警。
-      try {
-        const legacy = this.db
-          .prepare("SELECT seq, event_ts FROM memory_events WHERE event_ts NOT GLOB '????-??-??T??:??:??.???Z'")
-          .all() as Array<{ seq: number; event_ts: string }>;
-        const fix = this.db.prepare("UPDATE memory_events SET event_ts = ? WHERE seq = ?");
-        let fixed = 0, bad = 0;
-        this.db.exec("BEGIN");
-        try {
-          for (const r of legacy) {
-            const canon = canonIsoTs(r.event_ts);
-            if (canon === null) { bad += 1; continue; }
-            fix.run(canon, r.seq);
-            fixed += 1;
-          }
-          this.db.exec("COMMIT");
-        } catch (err) {
-          this.db.exec("ROLLBACK");
-          throw err;
-        }
-        if (fixed > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${fixed} legacy memory_events.event_ts rows to canonical form`);
-        if (bad > 0) this.logger?.warn?.(`[memory-tdai][sqlite] ${bad} memory_events rows hold unrepresentable event_ts (left as-is)`);
-      } catch (err) {
-        canonOk = false;
-        this.logger?.warn?.(`[memory-tdai][sqlite] event_ts normalization failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-
-      // 4-id 契约：team/user/agent 的空形态统一为 "default"（对齐记录存储与
-      // resolveIsolation），历史 '' 行回填；task_id 保持 ''（无 default 约定）。
-      try {
-        let migrated = 0;
-        for (const col of ["team_id", "user_id", "agent_id"]) {
-          const res = this.db.prepare(`UPDATE memory_events SET ${col} = 'default' WHERE ${col} = ''`).run();
-          migrated += Number(res.changes);
-        }
-        if (migrated > 0) this.logger?.info?.(`[memory-tdai][sqlite] normalized ${migrated} legacy memory_events isolation ids to 'default'`);
-      } catch (err) {
-        canonOk = false;
-        this.logger?.warn?.(`[memory-tdai][sqlite] memory_events isolation-id normalization failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-
       // l1/l0 的 instant 列与 event_ts 同一契约：'…ss.sssZ' 或 ''（不朽哨兵，
       // TTL 守卫跳过）。老库可能存着非规范形态，同样一次性归一化。
       for (const [table, col] of [
@@ -1730,7 +1639,7 @@ export class VectorStore implements IMemoryStore {
     if (recordIds.length === 0) return true;
 
     try {
-      this.db.exec("BEGIN");
+      if (!this.memoryTransaction) this.db.exec("BEGIN");
       try {
         for (const id of recordIds) {
           if (filter) {
@@ -1743,10 +1652,10 @@ export class VectorStore implements IMemoryStore {
             try { this.stmtL1FtsDelete.run(id); } catch { /* non-fatal */ }
           }
         }
-        this.db.exec("COMMIT");
+        if (!this.memoryTransaction) this.db.exec("COMMIT");
       } catch (err) {
         try {
-          this.db.exec("ROLLBACK");
+          if (!this.memoryTransaction) this.db.exec("ROLLBACK");
         } catch { /* ignore rollback errors */ }
         throw err;
       }
@@ -3660,7 +3569,7 @@ export class VectorStore implements IMemoryStore {
       if (existing) return existing;
       const epoch = store.getClearEpoch({ teamId: event.team_id, agentId: event.agent_id }) + 1;
       if (!Number.isSafeInteger(epoch)) throw new Error("Generation epoch exhausted");
-      const committed = { ...event, review: { protocol: 1 as const, guard_epoch: epoch } };
+      const committed = { ...event, review: { protocol: 2 as const, guard_epoch: epoch } };
       yield store.appendMemoryEvent(committed);
       return store.queryMemoryEvents({ event_id: event.event_id, limit: 1 })[0]!;
     });

@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type http from "node:http";
 import { classifyError } from "./error-handler.js";
-import type { IMemoryStore, L0Record, L1RecordRow, MemoryEvent, MemoryEventFilter, ProfileSyncRecord } from "../core/store/types.js";
+import type { IMemoryStore, L0Record, L1RecordRow, MemoryEvent, MemoryEventFilter, MaybePromise, ProfileSyncRecord } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { scopeProfileStorageView, StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
@@ -30,9 +30,10 @@ import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { isManagementScopeDelete, revertMemory, type RevertOptions } from "../core/record/memory-revert.js";
 import { appendLedgerEvent, getLedgerHealth, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
 import type { ReviewStatus } from "../core/store/visibility.js";
-import { ReviewCapabilityError, ReviewConflictError, historicalReviewRows, queryReviewHistory, resolveReviewRows } from "../core/store/review.js";
+import { ReviewCapabilityError, ReviewConflictError, historicalReviewRows, queryReviewHistory, resolveReviewRows, runAsync } from "../core/store/review.js";
 import { acknowledgeDerivedReview, inspectDerivedReview } from "../core/store/derived-review.js";
 import { normalizeReviewStatus, isMemoryReviewEnabled } from "../core/store/visibility.js";
+import { withMemoryEventId } from "../core/store/memory-event-id.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
 
 // ── Zod schemas (validated types + defaults) ──
@@ -225,13 +226,12 @@ interface MutationRecord {
  *   - 5 个 mutation handler 各调一次：
  *     atomic/update + atomic/delete + scenario/write + scenario/rm + core/write
  *
- * 统一变更账：同一 mutation 镜像一条 memory_events（source=api_mutation），
- * 让 diff/history/inbox 的审阅面能看到管理面变更。audit（API 访问日志）
- * 与 events（变更事实流）双写并行，互不依赖、各自 best-effort。
+ * L1 handler 传入随正文提交的事件，本函数只补审计与 outbox。
+ * L2/L3 不可物理撤销，操作事实镜像仍为 best-effort。
  */
-async function recordMutation(store: IMemoryStore | undefined, args: MutationRecord): Promise<void> {
+async function recordMutation(store: IMemoryStore | undefined, args: MutationRecord, committedEvent?: MemoryEvent): Promise<void> {
   await appendMutationAudit(store, args);
-  await mirrorMutationToLedger(store, args);
+  await mirrorMutationToLedger(store, args, committedEvent);
 }
 
 /** 写一条审计事件到 store.appendAudit。失败只告警（容忍 audit 丢失）。 */
@@ -259,37 +259,29 @@ async function appendMutationAudit(store: IMemoryStore | undefined, args: Mutati
   }
 }
 
+function mutationEvent(args: MutationRecord): MemoryEvent {
+  return withMemoryEventId({
+    event_ts: new Date().toISOString(),
+    // 管理面 mutation 无 session 语义，session 维度留空。
+    session_key: "", session_id: "",
+    // Ledger rows are keyed by the record's tenancy (as extraction events
+    // are) so the owner's history and revert guards see the mutation even
+    // when the request carried fewer isolation headers than the row.
+    ...(args.snapshot
+      ? { team_id: args.snapshot.team_id, user_id: args.snapshot.user_id, agent_id: args.snapshot.agent_id, task_id: args.snapshot.task_id || undefined }
+      : { team_id: args.iso?.teamId, user_id: args.iso?.userId, agent_id: args.iso?.agentId, task_id: args.iso?.taskId }),
+    op: args.action === "delete" ? "deleted" : "updated", record_id: args.record_id,
+    content: args.content ?? "", version: args.version,
+    ...(args.snapshot ? { snapshot_json: JSON.stringify(args.snapshot) } : {}),
+    ...(args.action === "delete" ? { scope: "record" as const } : {}),
+    layer: args.layer.toLowerCase() as "l1" | "l2" | "l3", source: "api_mutation", request_id: args.requestId,
+  });
+}
+
 /** 镜像一条 memory_events（source=api_mutation）。失败只告警。 */
-async function mirrorMutationToLedger(store: IMemoryStore | undefined, args: MutationRecord): Promise<void> {
-  if (store?.appendMemoryEvent || args.storage) {
-    try {
-      await appendLedgerEvent({ store, storage: args.storage, logger: { warn: (m: string) => args.logger?.warn?.(m) }, event: {
-        event_ts: new Date().toISOString(),
-        // 管理面 mutation 无 session 语义，session 维度留空。
-        session_key: "",
-        session_id: "",
-        // Ledger rows are keyed by the record's tenancy (as extraction events
-        // are) so the owner's history and revert guards see the mutation even
-        // when the request carried fewer isolation headers than the row.
-        ...(args.snapshot
-          ? { team_id: args.snapshot.team_id, user_id: args.snapshot.user_id, agent_id: args.snapshot.agent_id, task_id: args.snapshot.task_id || undefined }
-          : { team_id: args.iso?.teamId, user_id: args.iso?.userId, agent_id: args.iso?.agentId, task_id: args.iso?.taskId }),
-        op: args.action === "delete" ? "deleted" : "updated",
-        record_id: args.record_id,
-        content: args.content ?? "",
-        version: args.version,
-        ...(args.snapshot ? { snapshot_json: JSON.stringify(args.snapshot) } : {}),
-        ...(args.action === "delete" ? { scope: "record" as const } : {}),
-        layer: args.layer.toLowerCase() as "l1" | "l2" | "l3",
-        source: "api_mutation",
-        request_id: args.requestId,
-      } });
-    } catch (err) {
-      args.logger?.warn?.(
-        `${TAG} memory event mirror failed (${args.layer}/${args.action} record=${args.record_id}): ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
+async function mirrorMutationToLedger(store: IMemoryStore | undefined, args: MutationRecord, committedEvent?: MemoryEvent): Promise<void> {
+  await appendLedgerEvent({ store, storage: args.storage, logger: { warn: (m: string) => args.logger?.warn?.(m) },
+    event: committedEvent ?? mutationEvent(args), storeAlreadyCommitted: !!committedEvent });
 }
 
 // ============================
@@ -1277,84 +1269,58 @@ async function handleAtomicUpdate(body: unknown, _auth: V2AuthContext, requestId
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
 
-  // Read existing record by primary key — strict: a failed query returning []
-  // would misreport a degraded backend as "not found".
-  const existing = await store.queryL1Records({ recordIds: [id], visibility: "all" });
-  if (!existing || existing.length === 0) {
-    return errorEnvelope(404, `Atomic note not found: ${id}`, requestId);
-  }
-
-  const now = new Date().toISOString();
-  const record = existing[0];
-
-  // Build update: content is always overwritten; background (scene_name) only if provided.
-  // user_id / agent_id are preserved from the existing row — updates don't
-  // re-derive them. If the caller supplied an isolation triple that does NOT
-  // match the existing row, we treat it as a permission denial.
-  const iso = deps.requestIsolation;
-  if (iso?.teamId && record.team_id && record.team_id !== iso.teamId) {
-    return errorEnvelope(403, `Atomic note ${id} belongs to a different team`, requestId);
-  }
-  if (iso?.userId && record.user_id && record.user_id !== iso.userId) {
-    return errorEnvelope(403, `Atomic note ${id} belongs to a different user`, requestId);
-  }
-  if (iso?.agentId && record.agent_id && record.agent_id !== iso.agentId) {
-    return errorEnvelope(403, `Atomic note ${id} belongs to a different agent`, requestId);
-  }
-  if (iso?.taskId && record.task_id && record.task_id !== iso.taskId) {
-    return errorEnvelope(403, `Atomic note ${id} belongs to a different task`, requestId);
-  }
-  const updatedVersion = (record.version ?? 0) + 1;
-  const updated: MemoryRecord = {
-    id,
-    content,
-    type: record.type as any,
-    priority: record.priority ?? 50,
-    scene_name: background !== undefined ? background : (record.scene_name ?? ""),
-    source_message_ids: [],
-    metadata: parseMetadataJson(record.metadata_json),
-    timestamps: record.timestamp_str ? [record.timestamp_str] : [],
-    createdAt: record.created_time,
-    updatedAt: now,
-    version: updatedVersion,
-    expected_existing: true,
-    review_sources: JSON.parse(record.review_sources_json ?? "[]") as string[],
-    review_guard_at: record.review_guard_at,
-    review_epoch: record.review_epoch ?? undefined,
-    sessionKey: record.session_key ?? "",
-    sessionId: record.session_id ?? iso?.sessionId ?? "",
-    taskId: record.task_id ?? iso?.taskId,
-    teamId: record.team_id ?? iso?.teamId,
-    userId: record.user_id ?? iso?.userId,
-    agentId: record.agent_id ?? iso?.agentId,
-  };
-
-  const embedding = deps.getEmbedding();
+  if (!store.appendMemoryEvent) return errorEnvelope(501, "Atomic mutation requires a change ledger", requestId);
   let emb: Float32Array | undefined;
-  if (embedding) { try { emb = await embedding.embed(content); } catch (e) { console.warn(`[v2-router] L1 embedding failed:`, e); } }
+  try { emb = await deps.getEmbedding()?.embed(content); } catch { deps.logger.warn(`${TAG} L1 embedding failed; writing metadata only`); }
+  let committed: { args: MutationRecord; event: MemoryEvent } | undefined;
+  function* update(): Generator<MaybePromise<unknown>, ApiResponseEnvelope, unknown> {
+    // Read existing record by primary key — a failed query must not become "not found".
+    const existing = (yield store!.queryL1Records({ recordIds: [id], visibility: "all" })) as L1RecordRow[];
+    if (!existing.length) return errorEnvelope(404, `Atomic note not found: ${id}`, requestId);
+    const now = new Date().toISOString();
+    const record = existing[0];
 
-  // upsertL1 返回 false（不抛异常）表示后端拒绝/降级——不能把失败写成
-  // 事实：返回 503 且不写审计镜像事件，否则账本会记录一次从未落地的变更。
-  if (!(await store.upsertL1(updated, emb))) {
-    return errorEnvelope(503, `Atomic note ${id} update failed — store rejected the write (degraded?)`, requestId);
+    // Build update: content is always overwritten; background (scene_name) only if provided.
+    // user_id / agent_id are preserved from the existing row — updates don't
+    // re-derive them. If the caller supplied an isolation triple that does NOT
+    // match the existing row, we treat it as a permission denial.
+    const iso = deps.requestIsolation;
+    for (const [dimension, actual, expected] of [
+      ["team", record.team_id, iso?.teamId], ["user", record.user_id, iso?.userId],
+      ["agent", record.agent_id, iso?.agentId], ["task", record.task_id, iso?.taskId],
+    ]) if (expected && actual && actual !== expected) return errorEnvelope(403, `Atomic note ${id} belongs to a different ${dimension}`, requestId);
+    const updatedVersion = (record.version ?? 0) + 1;
+    const updated: MemoryRecord = {
+      id, content, type: record.type as MemoryRecord["type"], priority: record.priority ?? 50,
+      scene_name: background ?? record.scene_name ?? "", source_message_ids: [],
+      metadata: parseMetadataJson(record.metadata_json), timestamps: record.timestamp_str ? [record.timestamp_str] : [],
+      createdAt: record.created_time, updatedAt: now, version: updatedVersion, expected_existing: true,
+      review_sources: JSON.parse(record.review_sources_json ?? "[]") as string[],
+      review_guard_at: record.review_guard_at, review_epoch: record.review_epoch ?? undefined,
+      sessionKey: record.session_key ?? "", sessionId: record.session_id ?? iso?.sessionId ?? "",
+      taskId: record.task_id ?? iso?.taskId, teamId: record.team_id ?? iso?.teamId,
+      userId: record.user_id ?? iso?.userId, agentId: record.agent_id ?? iso?.agentId,
+    };
+
+    // upsertL1 返回 false 时中止事务，不能提交部分正文或虚假的变更事件。
+    if (!(yield store!.upsertL1(updated, emb))) throw new Error("Atomic update refused");
+
+    // 审计：L1 update — audit 行记请求方 IdFields（谁调的）；recordMutation 内的
+    // ledger 镜像事件则按记录自身租户归属（snapshot 里的 IdFields），两者语义不同层。
+    const args: MutationRecord = {
+      record_id: id, layer: "L1", action: "update", iso, version: updatedVersion,
+      requestId, logger: deps.logger, storage: deps.getStorage(), content, snapshot: record,
+    };
+    const event = mutationEvent(args);
+    yield store!.appendMemoryEvent!(event);
+    committed = { args, event };
+    return successEnvelope<AtomicUpdateData>({ id, version: `v${updatedVersion}`, updated_at: now }, requestId);
   }
-
-  // 审计：L1 update — audit 行记请求方 IdFields（谁调的）；recordMutation 内的
-  // ledger 镜像事件则按记录自身租户归属（snapshot 里的 IdFields），两者语义不同层。
-  await recordMutation(store, {
-    record_id: id,
-    layer: "L1",
-    action: "update",
-    iso,
-    version: updatedVersion,
-    requestId,
-    logger: deps.logger,
-    storage: deps.getStorage(),
-    content,
-    snapshot: record,
-  });
-
-  return successEnvelope<AtomicUpdateData>({ id, version: `v${updatedVersion}`, updated_at: now }, requestId);
+  let response: ApiResponseEnvelope;
+  try { response = store.executeMemoryTransaction ? await store.executeMemoryTransaction(update) : await runAsync(update()); }
+  catch { return errorEnvelope(503, "Atomic update could not be confirmed", requestId); }
+  if (committed) await recordMutation(store, committed.args, committed.event);
+  return response;
 }
 
 async function handleAtomicQuery(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1565,7 +1531,7 @@ async function revertMarkersFor(
  * op / since / until（session_key 不暴露——外部一律用 session_id 定位）。
  * 响应分页字段：count=本页变更组数、has_more、next_offset —— 分页以原始事件
  * 为单位；被页边界拆开的变更组由补查拼回写入事件所在的那一页。
- * 每张卡带 event_id（历史事件缺省）：同一 record 可有多次写入，撤销单条
+ * 每张卡带 event_id：同一 record 可有多次写入，撤销单条
  * 变更时回传它精确定位，record_id 不足以唯一标识一次操作。
  */
 async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: string, deps: V2RouterDeps): Promise<ApiResponseEnvelope> {
@@ -1617,19 +1583,13 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
       // reverted 事件同样有效——窗口过滤会让卡片显示未撤销 → UI 放按钮 → 409。
     },
   );
-  // 新版 reverted 事件用 target_event_id 精确指向被撤销的那次写入（同一
-  // record 的人工编辑可单独撤销）；旧版事件无此字段，按 record_id 命中。
   const revertedByEvent = new Map<string, string | undefined>();
-  const revertedByRecord = new Map<string, string | undefined>();
   for (const e of revertedEvents) {
-    if (e.target_event_id) revertedByEvent.set(e.target_event_id, e.reviewer_id);
-    else revertedByRecord.set(e.record_id, e.reviewer_id);
+    if (!e.target_event_id) throw new Error("Revert receipt target identity required");
+    revertedByEvent.set(e.target_event_id, e.reviewer_id);
   }
-  const revertOf = (e: MemoryEvent): { by?: string } | undefined => {
-    if (e.event_id && revertedByEvent.has(e.event_id)) return { by: revertedByEvent.get(e.event_id) };
-    if (revertedByRecord.has(e.record_id)) return { by: revertedByRecord.get(e.record_id) };
-    return undefined;
-  };
+  const revertOf = (e: MemoryEvent): { by?: string } | undefined =>
+    e.event_id && revertedByEvent.has(e.event_id) ? { by: revertedByEvent.get(e.event_id) } : undefined;
   // 变更组 = 一条写入事件 + 它 supersedes 的 superseded 行，整组共享同一个
   // event_ts（l1-writer 用同一个 now 写入）。分页切的是原始事件、op 过滤也在
   // 事件层，组的另一半可能不在本页——按未闭合事件的时间窗补查一次再 join。
@@ -1655,7 +1615,8 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   const writeById = new Map<string, MemoryEvent>();
   const seenEvents = new Set<string>();
   for (const e of [...events, ...partners]) {
-    const key = e.event_id || `${e.op}\u0000${e.record_id}\u0000${e.superseded_by ?? ""}\u0000${e.event_ts}`;
+    if (!e.event_id) throw new Error("Ledger event identity required");
+    const key = e.event_id;
     if (seenEvents.has(key)) continue;
     seenEvents.add(key);
     if (isWrite(e)) writeById.set(e.record_id, e);
@@ -1671,7 +1632,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     // 不暴露它，客户端只能按 record_id 撤销，Core 退化为"撤最后一次抽取写入"
     // （planRevert 的 `writes.filter(isExtraction).pop()`）——审阅者点的是旧卡
     // 片、撤掉的却是新写入。reverted 事件早已用 target_event_id 精确记账，
-    // 读侧契约必须对齐。老数据 event_id 为空 → 字段缺省，响应形状不变。
+    // 读侧契约必须对齐。
     ...(e.event_id ? { event_id: e.event_id } : {}),
     record_id: e.record_id,
     content: e.content,
@@ -1689,7 +1650,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
   const changes: Array<{
     op: string;
     record_id: string;
-    /** 本卡对应的账本事件——撤销单条变更时回传以精确定位（历史事件无 id 时缺省）。 */
+    /** 本卡对应的账本事件——撤销单条变更时回传以精确定位。 */
     event_id?: string;
     content: string;
     memory_type?: string;
@@ -1699,7 +1660,7 @@ async function handleMemoryDiff(body: unknown, _auth: V2AuthContext, requestId: 
     layer?: "l2" | "l3";
     origin_session_id?: string;
     origin_session_key?: string;
-    /** 该 change 已被 revert 撤销（reverted 事件按 target_event_id 命中；旧标记按 record_id）。 */
+    /** 该 change 已被 revert 撤销（reverted 事件按 target_event_id 命中）。 */
     reverted?: boolean;
     /** 驳回者身份（reverted 事件的 reviewer_id）。 */
     reverted_by?: string;
@@ -2073,7 +2034,7 @@ async function handleMemoryReviewList(body: unknown, _auth: V2AuthContext, reque
       // 列表必须带状态：visibility=all 时没有它就分不清哪条被撤回了。
       review_status: normalizeReviewStatus(r.review_status),
       exists: liveIds.has(r.record_id),
-      ...(r.review_invalid ? { invalid_legacy_status: true } : {}),
+      ...(r.review_invalid ? { invalid_status: true } : {}),
       ...(r.review_incomplete ? { lineage_incomplete: true } : {}),
       ...(r.review_tokens?.some((t) => t.startsWith("clear:")) ? { invalidated_by_clear: true } : {}),
       ...(r.review_tokens?.some((t) => t.startsWith("revert:")) ? { invalidated_by_revert: true } : {}),
@@ -2173,8 +2134,7 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
   if (adminFetched.length > limit) truncated = true;
   // 管理面操作按 scope="agent"（clear/archive）识别，不看 user_id：4-id 契约下
   // 无 user 头的记录级编辑同样落 user_id="default"，按 user 判定会把它泄露进
-  // 同 team/agent 下所有 user 的 inbox。无 scope 的旧 clear 事件仅在 user_id
-  // 仍为空（未归一化的旧行）时兼容。
+  // 同 team/agent 下所有 user 的 inbox；只收 scope=agent 的管理面清除事件。
   const adminEvents = adminFetched.slice(0, limit).filter(isManagementScopeDelete);
 
   // 按 session_id 聚合。superseded/reverted 事件不计入"变更数"（它们分别
@@ -2194,9 +2154,8 @@ async function handleMemoryReviewInbox(body: unknown, _auth: V2AuthContext, requ
     // retention 事件无租户身份，写入时被归一到 "default"——只按隔离 id 过滤
     // 挡不住它进 default 租户的 inbox，按来源显式排除。
     if (e.source === "retention" || e.scope === "retention") continue;
-    // 无 event_id 的历史行同样会双命中（主查按 user_id="default" 也能捞到
-    // 管理面行）——退化为与 diff 相同的合成键去重。
-    const dedupKey = e.event_id ?? `${e.op}\u0000${e.record_id}\u0000${e.superseded_by ?? ""}\u0000${e.event_ts}`;
+    if (!e.event_id) throw new Error("Ledger event identity required");
+    const dedupKey = e.event_id;
     if (seen.has(dedupKey)) continue;
     seen.add(dedupKey);
     const sid = e.session_id || "(unknown)";
@@ -2335,39 +2294,32 @@ async function handleAtomicDelete(body: unknown, auth: V2AuthContext, requestId:
     ...(iso.taskId ? { taskId: iso.taskId } : {}),
     // 不传 sessionId：按 id 删除不应被默认 sessionId 限制
   } : undefined;
-  let deletedCount = 0;
-  const deletedIds: string[] = [];
-  const snapshots = new Map<string, L1RecordRow>();
-  for (let i = 0; i < ids.length; i += 20) {
-    try {
-      const rows = await store.queryL1Records({ recordIds: ids.slice(i, i + 20), ...deleteFilter });
-      for (const r of rows) snapshots.set(r.record_id, r);
-    } catch (err) {
-      deps.logger.warn(`${TAG} atomic/delete snapshot read failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+  if (!store.appendMemoryEvent) return errorEnvelope(501, "Atomic mutation requires a change ledger", requestId);
+  function* remove(): Generator<MaybePromise<unknown>, Array<{ args: MutationRecord; event: MemoryEvent }>, unknown> {
+    const mutations: Array<{ args: MutationRecord; event: MemoryEvent }> = [];
+    const selected = [...new Set(ids)];
+    for (let i = 0; i < selected.length; i += 20) {
+      const rows = (yield store!.queryL1Records({ recordIds: selected.slice(i, i + 20), ...deleteFilter, visibility: "all" }, { review: false })) as L1RecordRow[];
+      for (const row of rows) {
+        if (!(yield store!.deleteL1(row.record_id, deleteFilter))) throw new Error("Atomic delete refused");
+        const args: MutationRecord = {
+          record_id: row.record_id, layer: "L1", action: "delete", iso, version: 0,
+          requestId, logger: deps.logger, storage: deps.getStorage(), snapshot: row,
+        };
+        const event = mutationEvent(args);
+        yield store!.appendMemoryEvent!(event);
+        mutations.push({ args, event });
+      }
     }
+    return mutations;
   }
-  for (const id of ids) {
-    const ok = await store.deleteL1(id, deleteFilter);
-    if (ok) {
-      deletedCount++;
-      deletedIds.push(id);
-    }
-  }
+  let mutations: Array<{ args: MutationRecord; event: MemoryEvent }>;
+  try { mutations = store.executeMemoryTransaction ? await store.executeMemoryTransaction(remove) : await runAsync(remove()); }
+  catch { return errorEnvelope(503, "Atomic delete could not be confirmed", requestId); }
+  const deletedCount = mutations.length;
 
   // 审计：L1 delete — 每条删除一行 audit
-  for (const id of deletedIds) {
-    await recordMutation(store, {
-      record_id: id,
-      layer: "L1",
-      action: "delete",
-      iso: deps.requestIsolation,
-      version: 0, // 已删除，无新版本
-      requestId,
-      logger: deps.logger,
-      storage: deps.getStorage(),
-      snapshot: snapshots.get(id),
-    });
-  }
+  for (const { args, event } of mutations) await recordMutation(store, args, event);
 
   // Report memory deletion (non-fatal)
   if (deps.quotaManager && deletedCount > 0) {

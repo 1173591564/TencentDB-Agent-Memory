@@ -23,8 +23,10 @@ export function parseSupersedesJson(json: string): string[] {
 }
 
 export function decodeMemoryEvent(f: MemoryEventFields, supersedes: string[]): MemoryEvent {
+  const eventId = opt(f.event_id);
+  if (!eventId) throw new Error("Ledger event has no valid identity");
   return {
-    event_id: opt(f.event_id),
+    event_id: eventId,
     ...(f.review !== undefined || f.review_json ? { review: decodeReview(f.review ?? f.review_json) } : {}),
     event_ts: str(f.event_ts),
     session_key: str(f.session_key),

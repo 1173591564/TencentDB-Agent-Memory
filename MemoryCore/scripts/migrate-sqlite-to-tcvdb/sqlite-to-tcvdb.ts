@@ -1,8 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual, parseArgs } from "node:util";
-import { createHash } from "node:crypto";
-import { tokenOf } from "../../src/core/store/review.js";
 import type { MemoryRecord } from "../../src/core/record/l1-writer.js";
 import { listLocalProfiles } from "../../src/core/profile/profile-sync.js";
 import { createBM25Encoder } from "../../src/core/store/bm25-local.js";
@@ -414,14 +412,9 @@ export async function migrateReviewLedger(sourceStore: VectorStore, targetStore:
     if (offset >= 500_000) throw new Error("Migration ledger budget exceeded; source must be partitioned offline");
     const events = sourceStore.queryMemoryEvents({ limit: 1000, offset });
     if (events.length && (!targetStore.appendMemoryEvent || !targetStore.queryMemoryEvents)) throw new Error("Target cannot preserve and verify the review ledger");
-    for (let index = 0; index < events.length; index++) {
-      const original = events[index];
-      if (original.review?.protocol === 2 && !original.event_id) throw new Error("Committed review receipt has no valid identity");
-      const event: MemoryEvent = original.event_id ? original : {
-        ...original, event_id: `evt-${createHash("sha256").update(JSON.stringify([offset + index, original])).digest("hex").slice(0, 32)}`,
-        review: { ...original.review, protocol: 1, ...(!original.review?.operation_id ? { legacy_token: tokenOf(original) } : {}) },
-      };
-      if ((event.review?.protocol === 2 || event.review?.guard_epoch !== undefined) && !targetStore.commitMemoryEvent) throw new Error("Target lacks an atomic immutable ledger for committed review state");
+    for (const event of events) {
+      if (!event.event_id) throw new Error("Ledger event has no valid identity");
+      if ((event.source === "review" || event.review?.guard_epoch !== undefined) && !targetStore.commitMemoryEvent) throw new Error("Target lacks an atomic immutable ledger for committed review state");
       await targetStore.appendMemoryEvent!(event);
       const copies = await targetStore.queryMemoryEvents!({ event_id: event.event_id, limit: 2 });
       if (copies.length !== 1 || !isDeepStrictEqual(copies[0], event)) throw new Error(`Ledger verification failed for event ${event.event_id}`);

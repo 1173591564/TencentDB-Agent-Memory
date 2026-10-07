@@ -21,11 +21,10 @@ type Node = { id: string; scope: { team_id: string; user_id: string; agent_id: s
 export function validReview(value: unknown): value is NonNullable<MemoryEvent["review"]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
-  return (v.protocol === 1 || v.protocol === 2) && Object.keys(v).every((k) => ["protocol", "observed", "sources", "operation_id", "request_hash", "no_op", "previous_status", "missing", "content_hash", "fence_hash", "guard_at", "guard_epoch", "legacy_token"].includes(k)) &&
-    (v.legacy_token === undefined || (v.protocol === 1 && typeof v.legacy_token === "string" && /^legacy-event-[a-f0-9]{64}$/.test(v.legacy_token))) &&
+  return v.protocol === 2 && Object.keys(v).every((k) => ["protocol", "observed", "sources", "operation_id", "request_hash", "no_op", "previous_status", "missing", "content_hash", "fence_hash", "guard_at", "guard_epoch"].includes(k)) &&
     (v.guard_epoch === undefined || (typeof v.guard_epoch === "number" && Number.isSafeInteger(v.guard_epoch) && v.guard_epoch >= 0)) &&
     (v.previous_status === undefined || v.previous_status === "active" || v.previous_status === "quarantined") &&
-    (v.protocol !== 2 || (typeof v.operation_id === "string" && typeof v.request_hash === "string")) &&
+    ((v.operation_id === undefined && v.request_hash === undefined) || (typeof v.operation_id === "string" && typeof v.request_hash === "string")) &&
     (v.guard_at === undefined || (typeof v.guard_at === "string" && canonIsoTs(v.guard_at) === v.guard_at)) &&
     (v.fence_hash === undefined || (typeof v.fence_hash === "string" && /^[a-f0-9]{64}$/.test(v.fence_hash))) &&
     (v.content_hash === undefined || (typeof v.content_hash === "string" && /^[a-f0-9]{64}$/.test(v.content_hash))) &&
@@ -48,7 +47,11 @@ const scopeOf = (r: { team_id?: string; user_id?: string; agent_id?: string }) =
   team_id: healIsoId(r.team_id ?? "")!, user_id: healIsoId(r.user_id ?? "")!, agent_id: healIsoId(r.agent_id ?? "")!,
 });
 const key = (scope: Node["scope"], id: string) => JSON.stringify([scope.team_id, scope.user_id, scope.agent_id, id]);
-export const tokenOf = (e: MemoryEvent) => e.review?.operation_id ?? e.review?.legacy_token ?? e.event_id ?? `legacy-event-${createHash("sha256").update(JSON.stringify([e.record_id, e.event_ts, e.op, e.session_key, e.session_id])).digest("hex")}`;
+export function tokenOf(e: MemoryEvent): string {
+  const token = e.review?.operation_id ?? e.event_id;
+  if (!token) throw new Error("Control event identity required");
+  return token;
+}
 
 class ReviewGraph {
   readonly nodes = new Map<string, Node>();
@@ -122,38 +125,17 @@ class ReviewGraph {
       const epoch = n.row?.review_epoch ?? n.events.find((event) => event.review?.guard_epoch !== undefined)?.review?.guard_epoch;
       if (epoch !== undefined && (!Number.isSafeInteger(epoch) || epoch < 0)) throw new Error("Invalid generation epoch");
       if (clear && (clear.review?.guard_epoch !== undefined ? epoch !== clear.review.guard_epoch : (!guard || guard <= clear.event_ts))) tokens.add(`clear:${tokenOf(clear)}`);
-      const hashes = new Map<string, Set<string>>();
-      for (const e of n.events) if ((e.layer ?? "l1") === "l1" && e.review?.protocol === 1 && e.review.operation_id) {
-        const group = hashes.get(e.review.operation_id) ?? new Set<string>();
-        group.add(e.review.request_hash ?? "");
-        hashes.set(e.review.operation_id, group);
-      }
-      const observations = new Map<string, Set<string>>();
-      for (const e of n.events) if ((e.layer ?? "l1") === "l1" && e.op === "restored" && e.review?.operation_id && e.review.protocol === 1) {
-        const observed = new Set(e.review.no_op ? [] : e.review.observed ?? []);
-        const prior = observations.get(e.review.operation_id);
-        observations.set(e.review.operation_id, prior ? new Set([...prior].filter((t) => observed.has(t))) : observed);
-      }
-      const conflicts = new Set([...hashes].filter(([, h]) => h.size > 1).map(([id]) => id));
-      for (const id of conflicts) tokens.add(`conflict:${createHash("sha256").update(JSON.stringify([id, [...hashes.get(id)!].sort()])).digest("hex")}`);
-      const legacy = `legacy-status:${createHash("sha256").update(k).digest("hex")}`;
-      if ((n.row?.review_tokens === undefined && normalizeReviewStatus(n.row?.review_status) === "quarantined") || (!n.row && !n.events.length)) tokens.add(legacy);
+      const baseline = `baseline:${createHash("sha256").update(k).digest("hex")}`;
+      if ((n.row?.review_tokens === undefined && normalizeReviewStatus(n.row?.review_status) === "quarantined") || (!n.row && !n.events.length)) tokens.add(baseline);
       for (const e of n.events) {
         if ((e.layer ?? "l1") !== "l1") continue;
-        if (e.review !== undefined && !validReview(e.review)) throw new Error("Invalid review event");
+        assertReviewEvent(e);
         if (e.review?.no_op) continue;
         if (e.op === "retracted") tokens.add(tokenOf(e));
         if (e.op === "reverted" && !e.supersedes?.includes(e.record_id) && !(e.target_event_id && n.events.some((write) => write.event_id === e.target_event_id && write.source === "api_mutation"))) tokens.add(`revert:${tokenOf(e)}`);
         if (e.op === "restored") {
-          if (e.review?.operation_id && conflicts.has(e.review.operation_id)) continue;
-          if (e.review?.protocol === 1 || e.review?.protocol === 2) {
-            if (!e.review.observed) throw new Error("Restore missing observed retractions");
-            const observed = e.review.protocol === 1 && e.review.operation_id ? observations.get(e.review.operation_id)! : e.review.observed;
-            for (const t of observed) cancelled.add(t);
-          } else {
-            for (const t of tokens) cancelled.add(t);
-            cancelled.add(legacy);
-          }
+          if (!e.review?.observed) throw new Error("Restore missing observed retractions");
+          for (const t of e.review.observed) cancelled.add(t);
         }
       }
       own.set(k, tokens);
@@ -327,14 +309,17 @@ export function reviewEventId(event: MemoryEvent): string {
 
 export function assertReviewEvent(event: MemoryEvent): void {
   if (event.review !== undefined && !validReview(event.review)) throw new Error("Invalid review protocol payload");
-  if (event.review?.protocol !== 2) return;
-  if (event.source !== "review" || event.event_id !== reviewEventId(event)) throw new Error("Invalid committed review identity");
+  if (event.source !== "review") {
+    if (event.review?.operation_id) throw new Error("Review operation identity belongs to review commands");
+    return;
+  }
+  if (!event.review?.operation_id || !event.review.request_hash || event.event_id !== reviewEventId(event)) throw new Error("Invalid committed review identity");
   if (event.op === "retracted" || event.op === "restored") {
     if (event.layer !== "l1" || event.review.previous_status === undefined) throw new Error("Review outcome required");
     if (event.op === "restored" && !event.review.observed) throw new Error("Restore observations required");
     if (event.op === "retracted" && event.review.no_op) throw new Error("A new retract operation cannot be a no-op");
   } else if (event.op === "reverted") {
-    if (event.layer !== "l1" || !Array.isArray(event.review.missing)) throw new Error("Revert receipt outcome required");
+    if (event.layer !== "l1" || !event.target_event_id || !Array.isArray(event.review.missing)) throw new Error("Revert receipt outcome required");
   } else if (event.op !== "updated" || !event.review.content_hash || !event.review.fence_hash) throw new Error("Invalid review command");
 }
 
@@ -352,7 +337,7 @@ const requestHash = (id: string, status: ReviewStatus, op: Operation) => createH
   .update(JSON.stringify([id, status, op.reason ?? "", op.reviewer_id ?? ""])).digest("hex");
 
 function previousResult(e: MemoryEvent, id: string, status: ReviewStatus, op: Operation) {
-  if (e.review?.protocol !== 2) throw new ReviewConflictError("Legacy review receipts cannot be retried; use a new operation identity");
+  if (!e.review?.operation_id) throw new Error("Review receipt identity required");
   assertReviewEvent(e);
   if (e.review.request_hash !== requestHash(id, status, op)) throw new ReviewConflictError("Review operation identity reused with different input");
   return { changed: !e.review.no_op, previous: e.review.previous_status!, event: e };
@@ -394,7 +379,7 @@ function* reviewCommand(store: IMemoryStore, id: string, status: ReviewStatus, f
   if (!store.queryMemoryEvents || !store.commitMemoryEvent) throw new ReviewCapabilityError("Review requires an atomic immutable event ledger");
   if (operation.operation_id) {
     const prior = (yield store.queryMemoryEvents({ ...historyFilter(id, filter), operation_id: operation.operation_id, limit: 2 })) as MemoryEvent[];
-    if (prior.length > 1) throw new ReviewConflictError("Legacy duplicate review receipts require reconciliation");
+    if (prior.length > 1) throw new ReviewConflictError("Duplicate review receipts violate immutable identity");
     if (prior[0]) return filter?.taskId !== undefined && (prior[0].task_id ?? "") !== filter.taskId ? undefined : previousResult(prior[0], id, status, operation);
   }
   const rows = (yield store.queryL1Records({ ...filter, recordIds: [id], visibility: "all" })) as L1RecordRow[];

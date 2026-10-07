@@ -147,7 +147,7 @@ describe("被撤回的记忆不得通过合并复活", () => {
     expect(store.queryMemoryEvents({ record_id: "next" })).toEqual([]);
   });
 
-  it("a retraction during successor commit survives even when extraction ledger writes fail", async () => {
+  it("an extraction ledger failure rolls back every change made inside its transaction", async () => {
     await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("prior"), decision: decision("prior", "store") });
     const upsert = store.upsertL1.bind(store);
     vi.spyOn(store, "upsertL1").mockImplementationOnce((record, embedding) => {
@@ -160,8 +160,9 @@ describe("被撤回的记忆不得通过合并复活", () => {
       return append(e);
     });
     await writeMemory({ ...WRITE_ISO, baseDir: dir, vectorStore: store, memory: memory("next"), decision: decision("next", "update", ["prior"]) });
-    expect(store.queryL1Records(ISO)).toEqual([]);
-    expect(store.queryL1Records({ ...ISO, visibility: "all" })[0]?.review_sources_json).toBe('["prior"]');
+    expect(store.queryL1Records(ISO).map((row) => row.record_id)).toEqual(["prior"]);
+    expect(store.queryL1Records({ ...ISO, visibility: "all" })[0]?.review_sources_json).toBe("[]");
+    expect(store.queryMemoryEvents({ source: "review" })).toEqual([]);
   });
 
   it("关闭审核写入口仍保留防复活守卫", async () => {

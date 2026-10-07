@@ -122,12 +122,6 @@ interface TenantHealth {
   pending: Map<string, string>;
   /** Store failures that cannot be cleared by replay (no outbox copy, or pending overflowed). */
   unrecoverable: number;
-  /**
-   * record_ids of the unrecoverable failures: only these records' reverts are
-   * gated. Bounded; once it overflows the whole tenant is gated (fail-closed).
-   */
-  unrecoverableRecords: Set<string>;
-  unrecoverableOverflow: boolean;
   rejected_redactions: number;
 }
 
@@ -171,8 +165,6 @@ export class LedgerState {
       if (cur) {
         cur.store_failures += v.store_failures; cur.jsonl_failures += v.jsonl_failures;
         cur.unrecoverable += v.unrecoverable;
-        for (const rid of v.unrecoverableRecords) cur.unrecoverableRecords.add(rid);
-        cur.unrecoverableOverflow ||= v.unrecoverableOverflow;
         cur.rejected_redactions += v.rejected_redactions;
         for (const [id, rid] of v.pending) cur.pending.set(id, rid);
         if (v.last_failure_at && (!cur.last_failure_at || v.last_failure_at > cur.last_failure_at)) cur.last_failure_at = v.last_failure_at;
@@ -372,7 +364,7 @@ function tenantHealth(store: LedgerStore | undefined, event: Pick<MemoryEvent, "
   const k = tenantKey(team, agent);
   let h = tenants.get(k);
   if (!h) {
-    h = { team_id: team, agent_id: agent, store_failures: 0, jsonl_failures: 0, pending: new Map(), unrecoverable: 0, unrecoverableRecords: new Set(), unrecoverableOverflow: false, rejected_redactions: 0 };
+    h = { team_id: team, agent_id: agent, store_failures: 0, jsonl_failures: 0, pending: new Map(), unrecoverable: 0, rejected_redactions: 0 };
     tenants.set(k, h);
   }
   return h;
@@ -409,11 +401,7 @@ function recordFailure(
   if (kind === "store") {
     h.store_failures += 1;
     if (recoverable && h.pending.size < MAX_PENDING_TRACKED) h.pending.set(event.event_id, event.record_id);
-    else {
-      h.unrecoverable += 1;
-      if (h.unrecoverableRecords.size < MAX_PENDING_TRACKED) h.unrecoverableRecords.add(event.record_id);
-      else h.unrecoverableOverflow = true;
-    }
+    else h.unrecoverable += 1;
   } else {
     h.jsonl_failures += 1;
   }
@@ -424,7 +412,7 @@ function recordFailure(
  * A redaction refused by the contract checks never ran: its plaintext stays
  * in place with nothing to retry. Count it on the tenant it named so the
  * ledger reports degraded instead of healthy (no event is missing, so it does
- * not gate reverts the way an unrecoverable store gap does).
+ * not establish whether an authoritative transaction committed).
  */
 function recordRejectedRedaction(store: LedgerStore | undefined, filter: MemoryEventRedactFilter): void {
   const h = tenantHealth(store, {
@@ -477,24 +465,6 @@ export function getLedgerHealth(
     rejected_redactions: rejectedRedactions,
     degraded: pending > 0 || unrecoverable > 0 || redactions > 0 || rejectedRedactions > 0,
   };
-}
-
-/**
- * Whether the store may be missing an event of `recordId` for this tenant
- * (pending replay, or an unrecoverable store failure). Review decisions that
- * depend on the full event history of the record must not proceed.
- * Unrecoverable gaps gate only their own record — one bad append must not
- * freeze every revert of the tenant — unless the per-record tracking
- * overflowed, in which case the whole tenant is gated (fail-closed).
- * Process-local: sees only failures this process recorded, and only until
- * restart — see docs/change-ledger.md “进程内状态与已知限制”.
- */
-export function hasPendingLedgerEvent(store: LedgerStore | undefined, recordId: string, scope?: LedgerScope): boolean {
-  for (const h of matchingTenants(store, healScope(scope))) {
-    if (h.unrecoverableOverflow || h.unrecoverableRecords.has(recordId)) return true;
-    for (const rid of h.pending.values()) if (rid === recordId) return true;
-  }
-  return false;
 }
 
 /**

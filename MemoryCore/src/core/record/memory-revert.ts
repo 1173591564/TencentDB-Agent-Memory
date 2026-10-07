@@ -5,7 +5,7 @@ import type { EmbeddingService } from "../store/embedding.js";
 import type { Logger } from "../types.js";
 import { confirmReviewCommit, queryReviewHistory, ReviewCapabilityError, ReviewConflictError, reviewEventId, runAsync } from "../store/review.js";
 import { healIsoId } from "../store/memory-event-id.js";
-import { appendLedgerEvent, hasPendingLedgerEvent } from "./event-ledger.js";
+import { appendLedgerEvent } from "./event-ledger.js";
 import { rowToMemoryRecord } from "./l1-reader.js";
 
 type RevertStore = IMemoryStore & Required<Pick<IMemoryStore, "queryMemoryEvents" | "commitMemoryEvent" | "executeMemoryTransaction">>;
@@ -42,9 +42,8 @@ function* liveRecordIds(store: RevertStore, ids: string[], filter: IsolationFilt
   return result;
 }
 
-/** agent 级管理面删除（clear/archive）；旧事件无 scope 时要求 user_id 为空。 */
 export function isManagementScopeDelete(event: MemoryEvent): boolean {
-  return event.source === "api_mutation" && event.op === "deleted" && (event.scope === "agent" || (event.scope === undefined && !event.user_id));
+  return event.source === "api_mutation" && event.op === "deleted" && event.scope === "agent";
 }
 
 /**
@@ -63,12 +62,8 @@ function* planRevert(store: RevertStore, recordId: string, opts: RevertOptions, 
   const writes = events.filter((event) => WRITE_OPS.has(event.op));
   const reverts = events.filter((event) => event.op === "reverted");
   const revertedIds = new Set(reverts.map((event) => event.target_event_id).filter((id): id is string => !!id));
-  // 旧格式标记没有 target_event_id，撤销粒度是整条记录：把标记时刻之前的
-  // 写入都视为已撤销（与 diff 按 record_id 命中同一语义），否则旧标记会
-  // 让"已撤销 → 409"幂等守卫失效、又把未撤销的后续写入误算成冲突。
-  const legacyCutoff = reverts.filter((event) => !event.target_event_id).map((event) => event.event_ts).sort().pop();
   const isExtraction = (event: MemoryEvent) => event.source !== "api_mutation";
-  const isReverted = (event: MemoryEvent) => (!!event.event_id && revertedIds.has(event.event_id)) || (legacyCutoff !== undefined && event.event_ts <= legacyCutoff);
+  const isReverted = (event: MemoryEvent) => !!event.event_id && revertedIds.has(event.event_id);
   const target = opts.eventId ? writes.find((event) => event.event_id === opts.eventId) : writes.filter(isExtraction).pop();
   if (!target) return fail(404, `No memory write event found for record ${recordId}`);
   // L2/L3 事件只记录"发生了什么操作"，不带可恢复的前像——撤销只对 L1 定义。
@@ -77,7 +72,6 @@ function* planRevert(store: RevertStore, recordId: string, opts: RevertOptions, 
   if (isReverted(target)) return fail(409, `Record ${recordId} has already been reverted`);
   if (events.some((event) => event.op === "deleted")) return fail(409, `Record ${recordId} was deleted; reverting would resurrect removed data`);
   // 范围删除守卫：clear/archive 按 team+agent 整体清空，事件挂在资产 id 上。
-  // 兼容旧事件：无 scope、无 user 归属、record_id 不是本记录的管理面 deleted。
   const deletions = (yield queryReviewHistory(store, { op: "deleted", source: "api_mutation", team_id: iso?.teamId, agent_id: iso?.agentId, since: target.event_ts, metadata_only: true })) as MemoryEvent[];
   const cleared = deletions.find((event) => isManagementScopeDelete(event) && event.record_id !== recordId && (!event.user_id || event.user_id === "default" || event.user_id === iso?.userId));
   if (cleared) return fail(409, `Memory was cleared after this write; reverting would resurrect cleared data`);
@@ -145,22 +139,17 @@ const receiptOutcome = (event: MemoryEvent, operationId: string): Extract<Revert
 
 function* commitRevert(store: RevertStore, recordId: string, opts: RevertOptions, identity: string, embeddings: Map<string, { content: string; vector?: Float32Array }>, iso?: IsolationFilter): Program<MemoryEvent> {
   const prior = (yield store.queryMemoryEvents({ ...eventScope(iso), record_id: recordId, source: "review", op: "reverted", operation_id: identity, limit: 2 })) as MemoryEvent[];
-  if (prior.length > 1) throw new ReviewConflictError("Duplicate legacy revert receipts require reconciliation");
+  if (prior.length > 1) throw new ReviewConflictError("Duplicate revert receipts violate immutable identity");
   if (prior[0]) {
-    if (prior[0].review?.protocol !== 2) throw new ReviewConflictError("Legacy revert receipts cannot be retried; use a new operation identity");
+    if (!prior[0].review?.operation_id) throw new Error("Revert receipt identity required");
     if (prior[0].review.request_hash !== requestHash(recordId, opts)) throw new ReviewConflictError("Revert operation identity reused with different input");
     return prior[0];
   }
-  // pending 守卫只提供额外的进程内告警保护；最终判断与动作仍由事务负责。
-  // 未完成的旧写入必须先补齐，不能把不可用历史当作没有冲突。
-  if (hasPendingLedgerEvent(store, recordId, { team_id: iso?.teamId, agent_id: iso?.agentId })) throw new RevertAbort(503, "The change ledger is missing events; run backfill before reverting");
   let plan: RevertPlan;
   try { plan = yield* planRevert(store, recordId, opts, iso); }
   catch { throw new RevertAbort(503, "Revert guard query failed; nothing was changed, retry later"); }
   if (!plan.ok) throw new RevertAbort(plan.status, plan.error);
   const { target, restores } = plan;
-  // 被恢复记录的旧事件也须补齐，避免遗漏删除控制而复活。
-  for (const restore of restores) if (hasPendingLedgerEvent(store, restore.targetId, { team_id: iso?.teamId, agent_id: iso?.agentId })) throw new RevertAbort(503, "The restore target ledger is missing events; run backfill first");
   const manual = target.source === "api_mutation" || target.supersedes?.includes(recordId) === true;
   const snapshots = target.source === "api_mutation" ? [{ targetId: recordId, snap: target }] : restores;
   const restored: string[] = [];

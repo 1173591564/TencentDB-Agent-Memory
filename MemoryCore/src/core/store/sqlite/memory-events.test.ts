@@ -191,126 +191,7 @@ describe("memory_events", () => {
   });
 });
 
-describe("memory_events migration", () => {
-  it("backfills reviewer_id onto a pre-existing table", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "mem-events-mig-"));
-    try {
-      const dbPath = path.join(dir, "vectors.db");
-      // Simulate an install from before the reviewer_id column existed.
-      const { DatabaseSync } = await import("node:sqlite");
-      const db = new DatabaseSync(dbPath);
-      db.exec(`CREATE TABLE memory_events (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, event_ts TEXT NOT NULL,
-        session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
-        origin_session_id TEXT NOT NULL DEFAULT '', origin_session_key TEXT NOT NULL DEFAULT '',
-        team_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '',
-        agent_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
-        op TEXT NOT NULL, record_id TEXT NOT NULL, content TEXT NOT NULL,
-        memory_type TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
-        supersedes TEXT NOT NULL DEFAULT '[]', superseded_by TEXT NOT NULL DEFAULT '',
-        snapshot_json TEXT NOT NULL DEFAULT '')`);
-      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-01T00:00:00Z','created','m_old','legacy')`);
-      db.close();
-
-      const store = new VectorStore(dbPath, 0);
-      store.init();
-      store.appendMemoryEvent({
-        event_ts: "2026-01-01T00:00:00Z", session_key: "sk", session_id: "ses",
-        op: "reverted", record_id: "m_old", content: "rejected", reviewer_id: "u-r",
-      });
-      const rows = store.queryMemoryEvents({ record_id: "m_old" });
-      expect(rows).toHaveLength(2);
-      expect(rows[0].reviewer_id).toBeUndefined(); // legacy row
-      expect(rows[1].reviewer_id).toBe("u-r");
-      store.close();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("rebuilds a legacy CHECK table so op='deleted' becomes writable, preserving rows", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "mem-events-check-"));
-    try {
-      const dbPath = path.join(dir, "vectors.db");
-      const { DatabaseSync } = await import("node:sqlite");
-      const db = new DatabaseSync(dbPath);
-      // Pre-ledger schema: op CHECK without 'deleted', no layer/source/request_id.
-      db.exec(`CREATE TABLE memory_events (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, event_ts TEXT NOT NULL,
-        session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
-        origin_session_id TEXT NOT NULL DEFAULT '', origin_session_key TEXT NOT NULL DEFAULT '',
-        team_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '',
-        agent_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
-        op TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded','reverted')),
-        record_id TEXT NOT NULL, content TEXT NOT NULL,
-        memory_type TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
-        supersedes TEXT NOT NULL DEFAULT '[]', superseded_by TEXT NOT NULL DEFAULT '',
-        snapshot_json TEXT NOT NULL DEFAULT '', reviewer_id TEXT NOT NULL DEFAULT '')`);
-      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-01T00:00:00Z','created','m_a','legacy-a')`);
-      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-02T00:00:00Z','reverted','m_b','legacy-b')`);
-      db.close();
-
-      const store = new VectorStore(dbPath, 0);
-      store.init();
-
-      // Legacy rows survive the rebuild with inferred source and layer='l1'.
-      const legacy = store.queryMemoryEvents({ limit: 10 });
-      expect(legacy).toHaveLength(2);
-      expect(legacy[0]).toMatchObject({ op: "created", source: "extraction", layer: "l1" });
-      expect(legacy[1]).toMatchObject({ op: "reverted", source: "review", layer: "l1" });
-
-      // The rebuilt CHECK accepts the new op.
-      store.appendMemoryEvent({
-        event_ts: "2026-01-01T00:00:00Z", session_key: "", session_id: "",
-        op: "deleted", record_id: "m_a", content: "",
-        layer: "l1", source: "api_mutation", request_id: "req-1",
-      });
-      const deleted = store.queryMemoryEvents({ op: "deleted" });
-      expect(deleted).toHaveLength(1);
-      expect(deleted[0]).toMatchObject({ record_id: "m_a", layer: "l1", source: "api_mutation", request_id: "req-1" });
-      store.close();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("migrates the ORIGINAL schema too (no snapshot_json / reviewer_id columns)", async () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "mem-events-orig-"));
-    try {
-      const dbPath = path.join(dir, "vectors.db");
-      const { DatabaseSync } = await import("node:sqlite");
-      const db = new DatabaseSync(dbPath);
-      // First shipped schema: no snapshot_json, no reviewer_id, CHECK without
-      // 'reverted'/'deleted'. The copy SELECT references snapshot_json — it
-      // only works because initSchema ALTER-backfills the column first.
-      db.exec(`CREATE TABLE memory_events (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT, event_ts TEXT NOT NULL,
-        session_key TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '',
-        origin_session_id TEXT NOT NULL DEFAULT '', origin_session_key TEXT NOT NULL DEFAULT '',
-        team_id TEXT NOT NULL DEFAULT '', user_id TEXT NOT NULL DEFAULT '',
-        agent_id TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
-        op TEXT NOT NULL CHECK (op IN ('created','updated','merged','superseded')),
-        record_id TEXT NOT NULL, content TEXT NOT NULL,
-        memory_type TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 0,
-        supersedes TEXT NOT NULL DEFAULT '[]', superseded_by TEXT NOT NULL DEFAULT '')`);
-      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content) VALUES ('2020-01-01T00:00:00Z','created','m_oldest','v1')`);
-      db.close();
-
-      const store = new VectorStore(dbPath, 0);
-      store.init();
-      const rows = store.queryMemoryEvents({ record_id: "m_oldest" });
-      expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ op: "created", layer: "l1", source: "extraction" });
-      store.appendMemoryEvent({
-        event_ts: "2026-01-01T00:00:00Z", session_key: "", session_id: "",
-        op: "deleted", record_id: "m_oldest", content: "", source: "api_mutation",
-      });
-      expect(store.queryMemoryEvents({ op: "deleted" })).toHaveLength(1);
-      store.close();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+describe("memory_events query contract", () => {
 
   it("order:'desc' returns newest events first", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "mem-events-desc-"));
@@ -597,8 +478,6 @@ describe("sqlite store-level instant/filter contract", () => {
       seed.close();
       const { DatabaseSync } = await import("node:sqlite");
       const db = new DatabaseSync(dbPath);
-      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content, team_id, user_id, agent_id)
-        VALUES ('2020-01-01T00:00:00.000Z', 'created', 'm_leg', 'x', '', '', '')`);
       db.exec(`INSERT INTO l1_records (record_id, content, updated_time) VALUES
         ('m_t', 'x', '2020-03-01T10:00:00+08:00'), ('m_k', 'x', '2030-01-01T00:00:00.000Z')`);
       db.exec(`INSERT INTO l0_conversations (record_id, session_key, message_text, recorded_at) VALUES
@@ -610,8 +489,6 @@ describe("sqlite store-level instant/filter contract", () => {
       const reopened = new VectorStore(dbPath, 0);
       try {
         reopened.init();
-        const row = reopened.queryMemoryEvents({ record_id: "m_leg" })[0]!;
-        expect(row).toMatchObject({ team_id: "default", user_id: "default", agent_id: "default" });
         // +08:00 → 02:00Z → cutoff 03:00Z 下过期（未归一化的字符串会漏删；
         // keeper 行把比例压到 50%，不触发 80% 护栏）
         expect(reopened.deleteL1Expired("2020-03-01T03:00:00.000Z")).toBe(1);
@@ -636,13 +513,13 @@ describe("sqlite store-level instant/filter contract", () => {
       expect(db.prepare("SELECT name FROM tdai_migrations").all()).toEqual([{ name: "ledger-canonical-instants-v1" }]);
       // A row written after the migration completed (impossible for current
       // writers) is no longer touched: the passes did not run again.
-      db.exec(`INSERT INTO memory_events (event_ts, op, record_id, content, team_id, user_id, agent_id)
-        VALUES ('2020-01-01T00:00:00.000Z', 'created', 'm_after', 'x', '', '', '')`);
+      db.exec(`INSERT INTO l1_records (record_id, content, updated_time)
+        VALUES ('m_after', 'x', '2020-01-01T10:00:00+08:00')`);
       db.close();
       const reopened = new VectorStore(dbPath, 0);
       try {
         reopened.init();
-        expect(reopened.queryMemoryEvents({ record_id: "m_after" })[0]!.team_id ?? "").not.toBe("default");
+        expect(reopened.queryL1Records({ recordIds: ["m_after"] })[0]!.updated_time).toBe("2020-01-01T10:00:00+08:00");
       } finally {
         reopened.close();
       }

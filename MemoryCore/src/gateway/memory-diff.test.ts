@@ -14,12 +14,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type http from "node:http";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VectorStore } from "../core/store/sqlite/memory-store.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "../core/record/l1-writer.js";
 import { handleV2Route } from "./v2-router.js";
 import { rowToMemoryRecord } from "../core/record/l1-reader.js";
-import type { L1RecordRow } from "../core/store/types.js";
+import { createHash } from "node:crypto";
+import { reviewEventId } from "../core/store/review.js";
+import type { L1RecordRow, MemoryEvent } from "../core/store/types.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 import { createLocalStorageBackend } from "../core/storage/factory.js";
 import { appendLedgerEvent, getLedgerHealth, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
@@ -31,6 +33,15 @@ const memory = (content: string): ExtractedMemory => ({
 const decision = (record_id: string, action: DedupDecision["action"], target_ids: string[] = [], merged_content?: string): DedupDecision => ({
   record_id, action, target_ids, merged_content,
 });
+
+function appendReviewFixture(store: VectorStore, event: MemoryEvent): void {
+  const receipt: MemoryEvent = { ...event, layer: "l1", review: {
+    protocol: 2, operation_id: `rop-${createHash("sha256").update(JSON.stringify(event)).digest("hex")}`,
+    request_hash: "a".repeat(64), missing: [],
+  } };
+  receipt.event_id = reviewEventId(receipt);
+  store.appendMemoryEvent(receipt);
+}
 
 const ISO_HEADERS = {
   authorization: "Bearer test-key",
@@ -151,7 +162,7 @@ describe("POST /memory/diff", () => {
     }
     // Markers land oldest-write-first, so m_r0's is the oldest of 1001 — outside any newest-1000 window.
     for (let i = 0; i < 1001; i++) {
-      store.appendMemoryEvent({ ...base, event_id: eid(10_000 + i), event_ts: new Date(t0 + 60_000 + i).toISOString(), op: "reverted", record_id: `m_r${i}`, content: "", target_event_id: eid(i), reviewer_id: "u1", source: "review" });
+      appendReviewFixture(store, { ...base, event_id: eid(10_000 + i), event_ts: new Date(t0 + 60_000 + i).toISOString(), op: "reverted", record_id: `m_r${i}`, content: "", target_event_id: eid(i), reviewer_id: "u1", source: "review" });
     }
     const { data } = await call("/v3/memory/diff", { session_id: "ses-big", op: "created", limit: 1 });
     expect(data!.changes).toHaveLength(1);
@@ -189,7 +200,7 @@ describe("POST /memory/diff", () => {
     store.appendMemoryEvent({ ...base, event_ts: "2026-03-02T00:00:00.000Z", op: "updated", record_id: "m_gap", content: "new", supersedes: ["m_lost"], source: "extraction" });
     store.appendMemoryEvent({ ...base, event_ts: "2026-03-02T00:00:01.000Z", op: "updated", record_id: "m_api", content: "edited", source: "api_mutation" });
     // reverted 的 supersedes 是"恢复了哪些"，不是组成员声明。
-    store.appendMemoryEvent({ ...base, event_ts: "2026-03-02T00:00:02.000Z", op: "reverted", record_id: "m_rev", content: "", supersedes: ["m_restored"], source: "review" });
+    appendReviewFixture(store, { ...base, event_ts: "2026-03-02T00:00:02.000Z", op: "reverted", record_id: "m_rev", content: "", supersedes: ["m_restored"], target_event_id: "evt-" + "e".repeat(32), source: "review" });
     const { data } = await call("/v3/memory/diff", { session_id: "ses-g" });
     const byId = new Map(data!.changes.map((c) => [c.record_id, c]));
     expect(byId.get("m_gap")).toMatchObject({ incomplete_group: true, replaced: [] });
@@ -643,20 +654,13 @@ describe("POST /memory/diff/revert", () => {
     expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
   });
 
-  it("a legacy reverted marker without target_event_id still blocks a second revert", async () => {
-    // 旧格式标记按 record_id 归属整条记录、不指向某次写入：diff 按 record_id
-    // 命中显示已撤销，幂等守卫也必须同样挡住重复撤销——两侧语义一致。
-    store.appendMemoryEvent({
+  it("an unreceipted whole-record revert marker is rejected", () => {
+    expect(() => appendReviewFixture(store, {
       event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-y",
       team_id: "t1", user_id: "u1", agent_id: "a1",
       op: "reverted", record_id: "m_b", content: "", reviewer_id: "u1", source: "review",
-    });
-    const res = await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    expect(res.status).toBe(409);
-    // diff 侧同样按 record_id 命中显示已撤销（原有兜底不变）。
-    const diff = await call("/v3/memory/diff", { session_id: "ses-y" });
-    const card = (diff.data?.changes as Array<Record<string, unknown>>).find((c) => c.record_id === "m_b");
-    expect(card).toMatchObject({ reverted: true });
+    })).toThrow("Revert receipt outcome required");
+    expect(store.queryMemoryEvents({ op: "reverted" })).toEqual([]);
   });
 
   it("a reverted marker written under another task still gates the revert", async () => {
@@ -664,7 +668,7 @@ describe("POST /memory/diff/revert", () => {
     // 可能挂在不同 task_id 下（跨 task dedup / 管理面编辑）。按 task 过滤会让
     // 撤销标记对守卫隐身——标记必须跨 task 可见。
     const [write] = store.queryMemoryEvents({ record_id: "m_b", op: "updated" });
-    store.appendMemoryEvent({
+    appendReviewFixture(store, {
       event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-y",
       team_id: "t1", user_id: "u1", agent_id: "a1", task_id: "task-a",
       op: "reverted", record_id: "m_b", content: "", reviewer_id: "u1",
@@ -703,7 +707,7 @@ describe("POST /memory/diff/revert", () => {
         event_id: `evt-${i.toString(16).padStart(32, "0")}`,
       });
     }
-    store.appendMemoryEvent({
+    appendReviewFixture(store, {
       event_ts: "2026-03-01T10:00:01.000Z", session_key: "", session_id: "",
       ...iso, op: "reverted", record_id: "m_p", content: "", reviewer_id: "u1",
       source: "review", target_event_id: targetId,
@@ -929,11 +933,11 @@ describe("POST /memory/diff/revert", () => {
     }
   });
 
-  it("an unrecoverable gap on the record a revert would restore blocks it", async () => {
+  it("process-local failed mirror telemetry is not an authoritative revert guard", async () => {
     await unrecoverableGap("m_a");
     try {
-      expect((await call("/v3/memory/diff/revert", { record_id: "m_b" })).status).toBe(503);
-      expect((await store.queryL1Records({ recordIds: ["m_b"] })).map((r) => r.record_id)).toEqual(["m_b"]);
+      expect((await call("/v3/memory/diff/revert", { record_id: "m_b" })).status).toBe(200);
+      expect((await store.queryL1Records({ recordIds: ["m_a", "m_b"] })).map((r) => r.record_id)).toEqual(["m_a"]);
     } finally {
       resetLedgerHealth(store);
     }
@@ -1141,7 +1145,7 @@ describe("POST /memory/review/inbox", () => {
     store.appendMemoryEvent({
       event_ts: new Date().toISOString(), session_key: "", session_id: "",
       team_id: "t1", agent_id: "a1",
-      op: "deleted", record_id: "chat_memory-t1-a1", content: "",
+      op: "deleted", record_id: "chat_memory-t1-a1", content: "", scope: "agent",
       layer: "l1", source: "api_mutation",
     });
     // 另一个 user 的 mutation 镜像：带 user_id，补充查询必须排除它。
@@ -1296,6 +1300,27 @@ describe("mutation → memory_events mirror (unified change ledger)", () => {
     expect(extractionOnly.map((e) => e.op)).toEqual(["created"]);
     const l2Only = store.queryMemoryEvents({ layer: "l2" });
     expect(l2Only).toHaveLength(0);
+  });
+
+  it.each(["update", "delete"])("atomic/%s rolls back content when its ledger write fails", async (action) => {
+    const append = store.appendMemoryEvent.bind(store);
+    vi.spyOn(store, "appendMemoryEvent").mockImplementation((event) => {
+      if (event.source === "api_mutation") throw new Error("ledger down");
+      return append(event);
+    });
+    const result = await call(`/v3/atomic/${action}`, action === "update" ? { id: "m_a", content: "uncommitted" } : { ids: ["m_a"] });
+    expect(result.status).toBe(503);
+    expect(store.queryL1Records({ recordIds: ["m_a"] })[0]?.content).toBe("salary 5000");
+    expect(store.queryMemoryEvents({ source: "api_mutation" })).toEqual([]);
+    expect(store.queryAudit({})).toEqual([]);
+  });
+
+  it("atomic/delete audits quarantined rows using their actual owner and pre-image", async () => {
+    store.setL1ReviewStatus("m_a", "quarantined", { teamId: "t1", userId: "u1", agentId: "a1" });
+    expect((await call("/v3/atomic/delete", { ids: ["m_a"] })).status).toBe(200);
+    const event = store.queryMemoryEvents({ op: "deleted", record_id: "m_a" })[0]!;
+    expect(event).toMatchObject({ team_id: "t1", user_id: "u1", agent_id: "a1" });
+    expect(JSON.parse(event.snapshot_json!).record_id).toBe("m_a");
   });
 
   it("atomic/update returning false → 503 and no phantom updated event", async () => {
@@ -1468,7 +1493,7 @@ describe("change-ledger outbox endpoints", () => {
 
     const realAppend = store.appendMemoryEvent.bind(store);
     store.appendMemoryEvent = () => { throw new Error("disk full"); };
-    await writeMemory({ sessionKey: "sk-x", sessionId: "ses-x", teamId: "t1", userId: "u1", agentId: "a1", baseDir: dir, vectorStore: store, storage, memory: memory("salary 7000"), decision: decision("m_c", "store") });
+    await appendLedgerEvent({ store, storage, event: { event_ts: new Date().toISOString(), session_key: "sk-x", session_id: "ses-x", team_id: "t1", user_id: "u1", agent_id: "a1", op: "created", source: "extraction", record_id: "m_c", content: "mirror recovery fixture" } });
     store.appendMemoryEvent = realAppend;
 
     const status = await call("/v3/memory/ledger/status", {});

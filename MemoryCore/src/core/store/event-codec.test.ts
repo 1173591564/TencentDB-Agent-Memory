@@ -4,15 +4,20 @@ import { canonRecordInstants } from "./memory-event-id.js";
 
 describe("decodeMemoryEvent", () => {
   it("decodes empty/missing optional fields to undefined and defaults layer/version", () => {
-    const e = decodeMemoryEvent({ event_ts: "2026-03-01T10:00:00.000Z", op: "created", record_id: "m", content: "c", team_id: "", layer: "" }, []);
+    const e = decodeMemoryEvent({ event_id: "evt-1", event_ts: "2026-03-01T10:00:00.000Z", op: "created", record_id: "m", content: "c", team_id: "", layer: "" }, []);
     expect(e).toEqual({
-      event_id: undefined, event_ts: "2026-03-01T10:00:00.000Z", session_key: "", session_id: "",
+      event_id: "evt-1", event_ts: "2026-03-01T10:00:00.000Z", session_key: "", session_id: "",
       origin_session_id: undefined, origin_session_key: undefined, team_id: undefined, user_id: undefined,
       agent_id: undefined, task_id: undefined, op: "created", record_id: "m", content: "c", memory_type: undefined,
       version: 0, supersedes: undefined, superseded_by: undefined, snapshot_json: undefined, reviewer_id: undefined,
       layer: "l1", source: undefined, request_id: undefined, reason: undefined, target_event_id: undefined,
       scope: undefined, until: undefined,
     });
+  });
+
+  it("rejects missing persisted identity", () => {
+    expect(() => decodeMemoryEvent({ event_id: "" }, [])).toThrow("Ledger event has no valid identity");
+    expect(() => decodeMemoryEvent({}, [])).toThrow("Ledger event has no valid identity");
   });
 
   it("passes populated fields through and keeps non-empty supersedes", () => {

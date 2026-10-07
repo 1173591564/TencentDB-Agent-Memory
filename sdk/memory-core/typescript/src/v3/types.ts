@@ -282,7 +282,7 @@ export interface V3MemoryReviewListData {
   next_offset?: number;
   items: Array<{
     record_id: string; type: string; content: string; review_status: "active" | "quarantined";
-    exists: boolean; invalid_legacy_status?: true; invalidated_by_clear?: true; invalidated_by_revert?: true; lineage_incomplete?: true;
+    exists: boolean; invalid_status?: true; invalidated_by_clear?: true; invalidated_by_revert?: true; lineage_incomplete?: true;
     session_id: string; version: number; created_at: string; updated_at: string;
   }>;
 }

@@ -6,6 +6,8 @@ import type { TcvdbClient } from "./client.js";
 import { __setMemoryReviewEnabledForTests } from "../visibility.js";
 import type { MemoryRecord } from "../../record/l1-writer.js";
 import type { MemoryEvent } from "../types.js";
+import { newMemoryEventId } from "../memory-event-id.js";
+import { ReviewCapabilityError, reviewEventId } from "../review.js";
 
 function matches(doc: Record<string, unknown>, expression?: string): boolean {
   if (!expression) return true;
@@ -60,6 +62,16 @@ describe("TCVDB review through the HTTP client contract", () => {
     if (!collections.has(name)) collections.set(name, new Map());
     return collections.get(name)!;
   };
+
+  async function legacyRetract(id: string, ownership = iso): Promise<MemoryEvent> {
+    const event: MemoryEvent = {
+      event_id: newMemoryEventId(), event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses",
+      team_id: ownership.teamId, user_id: ownership.userId, agent_id: ownership.agentId, record_id: id,
+      content: "", op: "retracted", source: "review", layer: "l1", review: { protocol: 1 },
+    };
+    await store.appendMemoryEvent(event);
+    return event;
+  }
 
   beforeEach(async () => {
     __setMemoryReviewEnabledForTests(true);
@@ -126,15 +138,26 @@ describe("TCVDB review through the HTTP client contract", () => {
     __setMemoryReviewEnabledForTests(undefined);
   });
 
-  it("retraction reaches full reads, pagination, count and texts on another instance", async () => {
-    await store.setL1ReviewStatus("root", "quarantined", iso);
+  it("native TCVDB refuses new immutable commands before any event or L1 write", async () => {
+    const before = calls.length;
+    await expect(store.setL1ReviewStatus("root", "quarantined", iso)).rejects.toBeInstanceOf(ReviewCapabilityError);
+    expect(calls).toHaveLength(before);
+    const event: MemoryEvent = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", layer: "l1", content: "", op: "retracted", source: "review", review: { protocol: 2, operation_id: `rop-${"a".repeat(64)}`, request_hash: "b".repeat(64), previous_status: "active" } };
+    event.event_id = reviewEventId(event);
+    await expect(store.appendMemoryEvent(event)).rejects.toBeInstanceOf(ReviewCapabilityError);
+    expect(calls).toHaveLength(before);
+    expect((await peer.queryL1Records(iso)).map((r) => r.record_id)).toEqual(["clean", "root"]);
+  });
+
+  it("committed legacy retraction reaches reads, pagination, count and texts on another instance", async () => {
+    const retract = await legacyRetract("root");
     expect((await peer.queryL1Records(iso)).map((r) => r.record_id)).toEqual(["clean"]);
     expect(await peer.countL1(iso)).toBe(1);
     expect((await peer.searchL1Hybrid({ query: "kubernetes", topK: 2, filter: iso })).map((r) => r.record_id)).toEqual(["clean"]);
     expect((await peer.queryL1Paginated({ ...iso, visibility: "quarantined", limit: 10, offset: 0 })).rows[0]?.record_id).toBe("root");
     expect((await peer.getAllL1Texts()).map((r) => r.record_id)).toEqual(["clean"]);
-    expect(await peer.setL1ReviewStatus("root", "active", { ...iso, userId: "other" })).toBeUndefined();
-    await peer.setL1ReviewStatus("root", "active", iso);
+    await expect(peer.setL1ReviewStatus("root", "active", { ...iso, userId: "other" })).rejects.toBeInstanceOf(ReviewCapabilityError);
+    await peer.appendMemoryEvent({ ...retract, event_id: newMemoryEventId(), op: "restored", review: { protocol: 1, observed: [retract.event_id!] } });
     expect(await store.countL1(iso)).toBe(2);
   });
 
@@ -142,7 +165,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     const defaults = { teamId: "default", userId: "default", agentId: "default" };
     expect(await store.upsertL1({ ...rec("default-root"), teamId: undefined, userId: undefined, agentId: undefined })).toBe(true);
     expect((await peer.queryL1Records(defaults)).map((r) => r.record_id)).toEqual(["default-root"]);
-    await peer.setL1ReviewStatus("default-root", "quarantined", defaults);
+    await legacyRetract("default-root", defaults);
     expect(await store.queryL1Records(defaults)).toEqual([]);
   });
 
@@ -150,7 +173,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     const l1 = [...collections.values()].find((c) => c.has("root"))!;
     l1.set("root", { ...l1.get("root"), vector: [7, 9], private_extra: "preserved" });
     const before = JSON.stringify(l1.get("root"));
-    await store.setL1ReviewStatus("root", "quarantined", iso);
+    await legacyRetract("root");
     expect(JSON.stringify(l1.get("root"))).toBe(before);
     expect(await peer.upsertL1({ ...rec("root"), content: "new bytes" })).toBe(true);
     expect(l1.get("root")?.vector).toEqual(["new bytes".length]);
@@ -164,7 +187,7 @@ describe("TCVDB review through the HTTP client contract", () => {
     expect(await store.upsertL1Batch(batch)).toBe(25);
     expect((await store.queryL1Records({ ...iso, recordIds: batch.map((r) => r.id), visibility: "all" })).length).toBe(25);
     await store.upsertL1(rec("child", ["root"]));
-    await peer.setL1ReviewStatus("root", "quarantined", iso);
+    await legacyRetract("root");
     expect(await store.queryL1Records({ ...iso, recordIds: ["child"] })).toEqual([]);
     const l1 = [...collections.values()].find((c) => c.has("clean"))!;
     const old = { ...l1.get("clean") }; delete old.review_status; delete old.review_sources_json;
@@ -210,6 +233,20 @@ describe("TCVDB review through the HTTP client contract", () => {
     expect(calls.filter((c) => c.path === "/index/add")).toHaveLength(added);
     indexStatus = "building";
     await expect(client.ensureFilterIndexes("events", required)).rejects.toThrow("not ready");
+  });
+
+  it("review resolution scans a multi-page event window only once", async () => {
+    const event = await legacyRetract("root");
+    const collection = (store as unknown as { eventsCollection: string }).eventsCollection;
+    const data = docs(collection);
+    const original = data.get(event.event_id!)!;
+    for (let i = 0; i < 1201; i++) {
+      const id = newMemoryEventId();
+      data.set(id, { ...original, id, event_id: id, op: "created", source: "extraction", review_json: "" });
+    }
+    calls.length = 0;
+    expect(await peer.queryL1Records({ ...iso, recordIds: ["root"] })).toEqual([]);
+    expect(calls.filter((call) => call.path === "/document/count" && call.body.collection === collection && String((call.body.query as Record<string, unknown>).filter).includes("record_id in"))).toHaveLength(1);
   });
 
   it("a server-side paging tie omission is rejected, not reported as complete history", async () => {

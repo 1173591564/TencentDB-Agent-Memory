@@ -17,8 +17,11 @@
  * path) rather than silently mis-scoring.
  */
 
-import type { Collection, Db, Document } from "mongodb";
-import { assertClearGuard, resolveReviewRows, setReviewStatus, ReviewConflictError, validReview } from "../review.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
+import type { ClientSession, Collection, Db, Document } from "mongodb";
+import { assertClearGuard, resolveReviewRows, setReviewStatus, ReviewCapabilityError, ReviewConflictError, assertReviewEvent, confirmReviewCommit, clearFilter, runAsync } from "../review.js";
+import { MEMORY_EVENT_HISTORY_LIMIT } from "../types.js";
 import {
   DEFAULT_REVIEW_STATUS,
   normalizeReviewStatus,
@@ -115,6 +118,7 @@ export class MongoMemoryStore implements IMemoryStore {
   private db: Db | null = null;
   private initPromise: Promise<void> | null = null;
   private degraded = false;
+  private readonly memorySession = new AsyncLocalStorage<ClientSession>();
   /** Whether the `$search` (mongot) indexes are queryable. Drives ftsSearch cap. */
   private searchIndexReady = false;
 
@@ -237,6 +241,8 @@ export class MongoMemoryStore implements IMemoryStore {
           partialFilterExpression: { event_id: { $type: "string", $gt: "" } },
         },
         { key: { record_id: 1 } },
+        { key: { "review.operation_id": 1, record_id: 1, team_id: 1, agent_id: 1, user_id: 1 } },
+        { key: { team_id: 1, agent_id: 1, scope: 1, source: 1, layer: 1, "review.guard_epoch": -1 } },
         { key: { session_id: 1 } },
         { key: { team_id: 1, agent_id: 1, user_id: 1 } },
       ]),
@@ -322,7 +328,7 @@ export class MongoMemoryStore implements IMemoryStore {
   // L1 write
   // ════════════════════════════════════════════════════════
 
-  async upsertL1(record: MemoryRecord, _embedding?: Float32Array): Promise<boolean> {
+  async upsertL1(record: MemoryRecord, _embedding?: Float32Array, options?: { import?: boolean }): Promise<boolean> {
     // created_time/updated_time feed the _ms TTL/cursor compares — canonical
     // instants or the "" sentinel only (same contract as sqlite).
     const ts = canonRecordInstants(record, ["createdAt", "updatedAt"]);
@@ -334,7 +340,7 @@ export class MongoMemoryStore implements IMemoryStore {
       return false;
     }
     const coll = await this.coll(COLLECTIONS.L1);
-    await assertClearGuard(this, record);
+    if (!options?.import) await assertClearGuard(this, record);
     const doc = l1RecordToDoc({ ...record, ...ts });
     // Filter carries the designated shard key prefix (team_id, agent_id) so the
     // upsert stays legal if the collection is ever sharded — on a sharded
@@ -344,15 +350,15 @@ export class MongoMemoryStore implements IMemoryStore {
     // 一起抹掉，于是任何一次合并更新都让被撤回的记忆复活。sqlite 靠 ON CONFLICT
     // 的显式列清单天然躲过，mongo 必须显式处理：业务字段走 $set，
     // 审核态只在**插入时**赋默认值。
-    const { _id: docId, review_sources_json: _sources, review_guard_at: guard, created_time: created, ...rest } = doc as unknown as Record<string, unknown> & { _id: unknown };
+    const { _id: docId, review_sources_json: _sources, review_guard_at: guard, review_epoch: epoch, created_time: created, ...rest } = doc as unknown as Record<string, unknown> & { _id: unknown };
     const result = await coll.updateOne(
-      { _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id } as never,
-      { $set: rest, $setOnInsert: { review_status: record.review_status ?? DEFAULT_REVIEW_STATUS, review_sources_json: "[]", review_guard_at: guard ?? "", created_time: created },
+      { _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id, review_epoch: (epoch ?? 0) === 0 ? { $in: [null, 0] } : epoch } as never,
+      { $set: rest, $setOnInsert: { review_status: record.review_status ?? DEFAULT_REVIEW_STATUS, review_sources_json: "[]", review_guard_at: guard ?? "", review_epoch: epoch ?? null, created_time: created },
         $addToSet: { review_sources: { $each: record.review_sources ?? [] } } } as never,
-      { upsert: !record.expected_existing },
+      { upsert: !record.expected_existing, session: this.memorySession.getStore() },
     );
     try {
-      await assertClearGuard(this, record);
+      if (!options?.import) await assertClearGuard(this, record);
     } catch (err) {
       if (err instanceof ReviewConflictError && record.review_guard_at) await coll.deleteOne({ _id: docId, team_id: doc.team_id, user_id: doc.user_id, agent_id: doc.agent_id, review_guard_at: record.review_guard_at } as never);
       throw err;
@@ -362,7 +368,7 @@ export class MongoMemoryStore implements IMemoryStore {
 
   async deleteL1(recordId: string, filter?: IsolationFilter): Promise<boolean> {
     const coll = await this.coll(COLLECTIONS.L1);
-    const res = await coll.deleteOne({ _id: recordId, ...isolationToMatch(filter) } as never);
+    const res = await coll.deleteOne({ _id: recordId, ...isolationToMatch(filter) } as never, { session: this.memorySession.getStore() });
     return res.deletedCount > 0;
   }
 
@@ -431,7 +437,7 @@ export class MongoMemoryStore implements IMemoryStore {
     Object.assign(q, isolationToMatch({ teamId: filter?.teamId, userId: filter?.userId, agentId: filter?.agentId }));
     if (filter?.updatedAfter !== undefined) q.updated_time = { $gt: filter.updatedAfter };
     if (opts?.review === false && filter?.visibility === "quarantined") q.review_status = { $nin: [null, "", "active"] };
-    const docs = await coll.find(q as never, opts?.metadataOnly ? { projection: { content: 0, metadata_json: 0, tokens: 0 } } : {}).limit(50001).toArray();
+    const docs = await coll.find(q as never, { session: this.memorySession.getStore(), ...(opts?.metadataOnly ? { projection: { content: 0, metadata_json: 0, tokens: 0 } } : {}) }).limit(50001).toArray();
     if (docs.length > 50_000) throw new Error("Review row budget exceeded; narrow scope");
     let rows = docs.map((d) => docToL1RecordRow(d as unknown as L1Doc));
     const scope = resolveVisibilityScope(filter);
@@ -967,8 +973,49 @@ export class MongoMemoryStore implements IMemoryStore {
   // Memory events（统一变更账：extraction / api_mutation / review）
   // ════════════════════════════════════════════════════════
 
+  async getClearEpoch(scope: { teamId?: string; agentId?: string }): Promise<number> {
+    return (await this.queryMemoryEvents(clearFilter({ team_id: scope.teamId || "default", agent_id: scope.agentId || "default" })))[0]?.review?.guard_epoch ?? 0;
+  }
+
+  async commitClearFence(event: MemoryEvent): Promise<MemoryEvent> {
+    if (event.op !== "deleted" || event.source !== "api_mutation" || event.scope !== "agent" || event.layer !== "l1" || !event.team_id || !event.agent_id || !event.event_id) throw new Error("Invalid agent clear fence");
+    const store = this;
+    return this.executeMemoryTransaction(function* () {
+      const existing = ((yield store.queryMemoryEvents({ event_id: event.event_id, limit: 1 })) as MemoryEvent[])[0];
+      if (existing) return existing;
+      const floor = (yield store.getClearEpoch({ teamId: event.team_id, agentId: event.agent_id })) as number;
+      const scopes = (yield store.coll(COLLECTIONS.MEMORY_CLEAR_SCOPES)) as Collection;
+      const id = createHash("sha256").update(JSON.stringify([healIsoId(event.team_id), healIsoId(event.agent_id)])).digest("hex");
+      const scope = (yield scopes.findOneAndUpdate({ _id: id } as never,
+        [{ $set: { epoch: { $add: [{ $max: ["$epoch", floor] }, 1] }, team_id: { $literal: event.team_id }, agent_id: { $literal: event.agent_id } } }],
+        { upsert: true, returnDocument: "after", session: store.memorySession.getStore() })) as Document | null;
+      const epoch = scope?.epoch as number;
+      if (!Number.isSafeInteger(epoch) || epoch <= 0) throw new Error("Generation epoch exhausted");
+      yield store.appendMemoryEvent({ ...event, review: { protocol: 1, guard_epoch: epoch } });
+      return ((yield store.queryMemoryEvents({ event_id: event.event_id, limit: 1 })) as MemoryEvent[])[0]!;
+    });
+  }
+
+  async executeMemoryTransaction<T>(program: () => Generator<unknown, T, unknown>): Promise<T> {
+    await this._ensureInit();
+    if (this.memorySession.getStore()) return runAsync(program());
+    if ((await this.pool.getClusterProfile(this.mongoConfig)).topology === "standalone") throw new ReviewCapabilityError("Atomic memory workflows require a MongoDB replica set or sharded cluster");
+    const client = await this.pool.getClient(this.mongoConfig);
+    const session = client.startSession();
+    try {
+      return await session.withTransaction(() => this.memorySession.run(session, () => runAsync(program())), { readConcern: { level: "snapshot" }, writeConcern: { w: "majority", j: true }, readPreference: "primary" });
+    } finally {
+      await session.endSession();
+    }
+  }
+
+  async commitMemoryEvent(event: MemoryEvent): Promise<MemoryEvent> {
+    await this.appendMemoryEvent(event);
+    return confirmReviewCommit(event, (await this.queryMemoryEvents({ event_id: event.event_id, limit: 1 }))[0]);
+  }
+
   async appendMemoryEvent(event: MemoryEvent): Promise<void> {
-    if (event.review !== undefined && !validReview(event.review)) throw new Error("Invalid review protocol payload");
+    assertReviewEvent(event);
     const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
     // _id 由 Mongo 自动生成（ObjectId 自带时间序，作同 event_ts 内的稳定次序键）。
     // Normalize the optional fields to the same defaults sqlite/TCVDB persist:
@@ -984,6 +1031,7 @@ export class MongoMemoryStore implements IMemoryStore {
     try {
       await coll.insertOne({
         ...event,
+        ...(event.review ? { review: Object.fromEntries(Object.entries(event.review).filter(([, value]) => value !== undefined)) } : {}),
         event_ts: eventTs,
         event_id: event.event_id || newMemoryEventId(),
         origin_session_id: event.origin_session_id ?? "",
@@ -1005,7 +1053,7 @@ export class MongoMemoryStore implements IMemoryStore {
         target_event_id: event.target_event_id ?? "",
         scope: event.scope ?? "",
         until: event.until ?? "",
-      } as never);
+      } as never, { session: this.memorySession.getStore() });
     } catch (err) {
       // Duplicate event_id: the event already landed (outbox replay / retry).
       // Only the event_id unique index means "already written"; any other
@@ -1041,7 +1089,7 @@ export class MongoMemoryStore implements IMemoryStore {
     return res.modifiedCount;
   }
 
-  async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
+  async queryMemoryEvents(filter: MemoryEventFilter, options?: { complete?: boolean }): Promise<MemoryEvent[]> {
     if (filter.record_ids?.length === 0) return [];
     const coll = await this.coll(COLLECTIONS.MEMORY_EVENTS);
     const q: Record<string, unknown> = {};
@@ -1061,6 +1109,7 @@ export class MongoMemoryStore implements IMemoryStore {
     if (filter.source !== undefined) q.source = filter.source;
     if (filter.request_id !== undefined) q.request_id = filter.request_id;
     if (filter.event_id !== undefined) q.event_id = filter.event_id;
+    if (filter.operation_id !== undefined) q["review.operation_id"] = filter.operation_id;
     const teamId = isoMatch(filter.team_id);
     const agentId = isoMatch(filter.agent_id);
     const userId = isoMatch(filter.user_id);
@@ -1076,15 +1125,16 @@ export class MongoMemoryStore implements IMemoryStore {
       q.event_ts = range;
     }
 
-    const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);
-    const offset = Math.max(filter.offset ?? 0, 0);
+    const limit = options?.complete ? MEMORY_EVENT_HISTORY_LIMIT + 1 : Math.min(Math.max(filter.limit ?? 100, 1), 1000);
+    const offset = options?.complete ? 0 : Math.max(filter.offset ?? 0, 0);
     const dir = filter.order === "desc" ? -1 : 1;
     const docs = await coll
-      .find(q as never, filter.metadata_only ? { projection: { content: 0, snapshot_json: 0, reason: 0 } } : {})
-      .sort({ event_ts: dir, _id: dir })
+      .find(q as never, { session: this.memorySession.getStore(), ...(filter.metadata_only ? { projection: { content: 0, snapshot_json: 0, reason: 0 } } : {}) })
+      .sort(filter.order_by === "clear_epoch" ? { "review.guard_epoch": dir, event_ts: dir, _id: dir } : { event_ts: dir, _id: dir })
       .skip(offset)
       .limit(limit)
       .toArray();
+    if (options?.complete && docs.length > MEMORY_EVENT_HISTORY_LIMIT) throw new Error("Complete review history budget exceeded; narrow scope");
     return docs.map((d) => this.docToMemoryEvent(d));
   }
 

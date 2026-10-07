@@ -364,13 +364,15 @@ export async function recordClearAudit(
 ): Promise<void> {
   const now = Date.now();
   const until = new Date(now).toISOString();
+  if (!args.teamId?.trim() || !args.agentId?.trim()) throw new Error("Clear requires non-empty teamId and agentId");
   if (!store.appendMemoryEvent) throw new Error("Clear requires a durable ledger fence");
-  const fence: MemoryEvent = {
+  let fence: MemoryEvent = {
     event_id: newMemoryEventId(), event_ts: until, session_key: "", session_id: "",
     team_id: args.teamId, agent_id: args.agentId, op: "deleted", record_id: args.memoryId,
     content: "", version: 0, scope: "agent", until, layer: "l1", source: "api_mutation", request_id: args.requestId,
   };
-  await store.appendMemoryEvent(fence);
+  if (store.commitClearFence) fence = await store.commitClearFence(fence);
+  else await store.appendMemoryEvent(fence);
   await appendLedgerEvent({ store, storage: args.storage, logger: args.logger, event: fence, storeAlreadyCommitted: true });
   for (const layer of ["L1", "L2", "L3"] as const) {
     if (store.appendAudit) {

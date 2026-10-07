@@ -15,6 +15,7 @@ export const COLLECTIONS = {
   PROFILES: "profiles",
   AUDIT: "memory_audit",
   MEMORY_EVENTS: "memory_events",
+  MEMORY_CLEAR_SCOPES: "memory_clear_scopes",
   KNOWLEDGE: "knowledge",
   MEMORY_PROMPTS: "memory_prompts",
   MEMORY_PROMPT_SETTINGS: "memory_prompt_settings",

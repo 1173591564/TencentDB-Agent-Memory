@@ -13,7 +13,8 @@
  */
 
 import type { MemoryRecord } from "../../record/l1-writer.js";
-import { assertClearGuard, resolveReviewRows, setReviewStatus, ReviewConflictError, validReview } from "../review.js";
+import { assertClearGuard, resolveReviewRows, setReviewStatus, ReviewConflictError, ReviewCapabilityError, assertReviewEvent, decodeReview } from "../review.js";
+import { MEMORY_EVENT_HISTORY_LIMIT } from "../types.js";
 import {
   DEFAULT_REVIEW_STATUS,
   resolveVisibilityScope,
@@ -150,7 +151,7 @@ const L1_OUTPUT_FIELDS = [
   "team_id", "user_id", "agent_id", "session_key", "session_id", "task_id", "version", "timestamp_str", "timestamp_start",
   "timestamp_end", "metadata_json", "created_time_ms", "updated_time_ms",
   // 事后审核可见性：客户端后过滤需要它（见 buildIsolationConditions 说明）
-  "review_status", "review_sources_json", "review_guard_at",
+  "review_status", "review_sources_json", "review_guard_at", "review_epoch",
 ];
 
 /** All L0 output fields returned by query/search. */
@@ -801,6 +802,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
       review_status: record.review_status ?? DEFAULT_REVIEW_STATUS,
       review_sources_json: JSON.stringify(record.review_sources ?? []),
       review_guard_at: record.review_guard_at ?? "",
+      ...(record.review_epoch !== undefined ? { review_epoch: record.review_epoch } : {}),
     };
     if (!this.embeddingEnabled) doc.vector = [1];
 
@@ -816,7 +818,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
     if (existing) {
       for (const name of ["team_id", "user_id", "agent_id"] as const) if (healIsoId(String(existing[name] ?? "")) !== healIsoId(String(doc[name] ?? ""))) throw new Error("L1 record belongs to another tenant");
       doc.review_sources_json = JSON.stringify([...new Set([...(JSON.parse(String(existing.review_sources_json ?? "[]")) as string[]), ...(record.review_sources ?? [])])]);
-      const { id: _id, review_status: _status, review_guard_at: _guard, created_time_ms: _created, vector: _vector, ...fields } = doc;
+      const { id: _id, review_status: _status, review_guard_at: _guard, review_epoch: _epoch, created_time_ms: _created, vector: _vector, ...fields } = doc;
       const version = existing.version;
       if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0) throw new Error("L1 update requires a valid stored version");
       fields.version = Math.max(Number(fields.version ?? 0), version + 1);
@@ -1015,6 +1017,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
           review_status: doc.review_status as L1RecordRow["review_status"],
           review_sources_json: doc.review_sources_json as string | undefined,
           review_guard_at: doc.review_guard_at as string | undefined,
+          review_epoch: doc.review_epoch as number | undefined,
         }));
         return this.reviewRows(rows, filter, opts);
       }
@@ -1052,6 +1055,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         review_status: doc.review_status as L1RecordRow["review_status"],
         review_sources_json: doc.review_sources_json as string | undefined,
         review_guard_at: doc.review_guard_at as string | undefined,
+        review_epoch: doc.review_epoch as number | undefined,
       }));
       return this.reviewRows(rows, filter, opts);
     } catch (err) {
@@ -2089,6 +2093,7 @@ export class TcvdbMemoryStore implements IMemoryStore {
         review_status: d.review_status as L1RecordRow["review_status"],
         review_sources_json: d.review_sources_json as string | undefined,
         review_guard_at: d.review_guard_at as string | undefined,
+        review_epoch: d.review_epoch as number | undefined,
       })) as L1RecordRow[];
       if (reviewing) {
         rows = await this.reviewRows(rows, filter);
@@ -2690,7 +2695,8 @@ export class TcvdbMemoryStore implements IMemoryStore {
   // ─────────────────────────────────────────────────────────
 
   async appendMemoryEvent(event: MemoryEvent): Promise<void> {
-    if (event.review !== undefined && !validReview(event.review)) throw new Error("Invalid review protocol payload");
+    assertReviewEvent(event);
+    if (event.review?.protocol === 2 || (event.scope === "agent" && event.review?.guard_epoch !== undefined)) throw new ReviewCapabilityError("TCVDB native upsert cannot commit immutable review receipts or epochs; a shared atomic ledger is required");
     await this._ensureInit();
     if (this.degraded) throw new Error("memory_events append rejected: tcvdb store is degraded");
 
@@ -2763,10 +2769,11 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
-  async queryMemoryEvents(filter: MemoryEventFilter): Promise<MemoryEvent[]> {
+  async queryMemoryEvents(filter: MemoryEventFilter, options?: { complete?: boolean }): Promise<MemoryEvent[]> {
     await this._ensureInit();
     if (this.degraded) throw new Error("memory_events query rejected: tcvdb store is degraded");
     if (filter.record_ids?.length === 0) return [];
+    if (filter.operation_id !== undefined) throw new ReviewCapabilityError("TCVDB native ledger cannot look up immutable operation receipts");
 
     const conds: string[] = [];
     if (filter.session_id !== undefined) conds.push(eqFilter("session_id", filter.session_id));
@@ -2800,19 +2807,22 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
     try {
       const total = await this.client.count(this.eventsCollection, filterExpr);
-      if (total > 50_000) throw new Error("TCVDB ledger window exceeds stable paging budget; narrow record/session/time scope");
+      if (total > MEMORY_EVENT_HISTORY_LIMIT) throw new Error("TCVDB ledger window exceeds stable paging budget; narrow record/session/time scope");
       const fields = filter.metadata_only ? MEMORY_EVENTS_OUTPUT_FIELDS.filter((k) => !["content", "snapshot_json", "reason"].includes(k)) : MEMORY_EVENTS_OUTPUT_FIELDS;
       const docs = await this._queryAllDocs(this.eventsCollection, filterExpr, fields, Math.max(total, 1), [{ fieldName: "event_ts", direction: filter.order === "desc" ? "desc" : "asc" }]);
       if (docs.length !== total) throw new Error("TCVDB ledger window incomplete or concurrently changed; retry");
       // TCVDB sort has no tiebreaker for equal event_ts; re-sort by the
       // unique document id so page contents are at least deterministic.
+      const epochs = filter.order_by === "clear_epoch" ? new Map(docs.map((doc) => [doc.id, decodeReview(doc.review_json)?.guard_epoch ?? 0])) : undefined;
       docs.sort((a, b) => {
+        const epoch = epochs ? epochs.get(a.id)! - epochs.get(b.id)! : 0;
+        if (epoch !== 0) return filter.order === "desc" ? -epoch : epoch;
         const t = String(a.event_ts ?? "").localeCompare(String(b.event_ts ?? ""));
         if (t !== 0) return filter.order === "desc" ? -t : t;
         const i = String(a.id ?? "").localeCompare(String(b.id ?? ""));
         return filter.order === "desc" ? -i : i;
       });
-      const page = docs.slice(offset, offset + limit);
+      const page = options?.complete ? docs : docs.slice(offset, offset + limit);
 
       return page.map((doc) =>
         decodeMemoryEvent(

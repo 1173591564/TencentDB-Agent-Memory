@@ -142,16 +142,18 @@ describe("POST /memory/review/retract|restore", () => {
     expect(store.queryMemoryEvents({ record_id: "task_empty", op: "retracted" })).toHaveLength(1);
   });
 
-  it("DP-18 幂等：重复撤回进 no_op，且不写第二条账本事件", async () => {
+  it("DP-18 同身份重试返回原结果，不同身份产生独立撤回", async () => {
     store.upsertL1(rec({ id: "m_3", content: "幂等" }), undefined);
-    await call("/v3/memory/review/retract", { record_id: "m_3", reason: "r1" });
-    const again = await call("/v3/memory/review/retract", { record_id: "m_3", reason: "r1" });
-
+    const body = { record_id: "m_3", reason: "r1", operation_id: "stable-retraction" };
+    const first = await call("/v3/memory/review/retract", body);
+    const again = await call("/v3/memory/review/retract", body);
     expect(again.status).toBe(200);
-    expect(again.data).toMatchObject({ changed: [], no_op: ["m_3"] });
-
-    const events = store.queryMemoryEvents!({ record_id: "m_3" }) as unknown as Array<Record<string, unknown>>;
-    expect(events.filter((e) => e.op === "retracted")).toHaveLength(1);
+    expect(again.data).toMatchObject({ changed: ["m_3"], no_op: [] });
+    expect(again.data?.event_ids).toEqual(first.data?.event_ids);
+    expect(store.queryMemoryEvents({ record_id: "m_3", op: "retracted" })).toHaveLength(1);
+    const independent = await call("/v3/memory/review/retract", { ...body, operation_id: "independent-retraction" });
+    expect(independent.data).toMatchObject({ changed: ["m_3"], no_op: [] });
+    expect(store.queryMemoryEvents({ record_id: "m_3", op: "retracted" })).toHaveLength(2);
   });
 
   it("幂等空操作与查无此记录必须分开报，调用方才能分清自己撤错了 id", async () => {
@@ -367,14 +369,16 @@ describe("POST /memory/review/retract|restore", () => {
     expect(store.queryL1Records({ recordIds: ["m_revert_hidden"], visibility: "all" })).toEqual([]);
   });
 
-  it("downstream scan failure is disclosed even on no-op and never changes committed review success", async () => {
+  it("downstream scan failure is disclosed on receipt replay without changing committed success", async () => {
     store.upsertL1(rec({ id: "scan", content: "fact" }), undefined);
-    const result = await call("/v3/memory/review/retract", { record_id: "scan", reason: "r" });
+    const body = { record_id: "scan", reason: "r", operation_id: "scan-review" };
+    const result = await call("/v3/memory/review/retract", body);
     expect(result.status).toBe(200);
     expect(result.data?.downstream).toMatchObject({ scan: "failed", lineage_analyzed: false });
-    const repeat = await call("/v3/memory/review/retract", { record_id: "scan", reason: "r" }, ISO_HEADERS, { getStorage: () => undefined });
+    const repeat = await call("/v3/memory/review/retract", body, ISO_HEADERS, { getStorage: () => undefined });
     expect(repeat.data?.downstream).toMatchObject({ scan: "unavailable", artifacts: [] });
-    expect(repeat.data?.no_op).toEqual(["scan"]);
+    expect(repeat.data?.event_ids).toEqual(result.data?.event_ids);
+    expect(store.queryMemoryEvents({ record_id: "scan", op: "retracted" })).toHaveLength(1);
   });
 
   it("derived review verifies current bytes without restoring the wrong L1 fact", async () => {

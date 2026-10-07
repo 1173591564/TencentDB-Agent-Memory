@@ -479,6 +479,7 @@ export const memoryDiffRevertRequestSchema = z.object({
   force: z.boolean().optional(),
   /** 可选：要撤销的写入事件 event_id（逐层回退人工编辑）。仅可与单个 record_id 同用。 */
   event_id: z.string().min(1).optional(),
+  operation_id: z.string().trim().min(1).max(256).optional(),
 }).refine((d) => d.record_id || (d.record_ids?.length ?? 0) > 0, {
   message: "record_id or non-empty record_ids is required",
 });

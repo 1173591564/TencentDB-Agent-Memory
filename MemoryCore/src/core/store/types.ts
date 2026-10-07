@@ -116,8 +116,10 @@ export interface L1QueryFilter extends VisibilityAware {
 export interface L1RecordRow {
   /** 审核状态；后端映射须覆盖。历史行可缺省，所以类型本身不能防止漏映射，需契约测试。 */
   review_status?: ReviewStatus;
+  review_baseline?: ReviewStatus;
   review_sources_json?: string;
   review_guard_at?: string;
+  review_epoch?: number;
   review_tokens?: string[];
   review_invalid?: boolean;
   review_incomplete?: boolean;
@@ -652,7 +654,7 @@ export interface MemoryEvent {
   user_id?: string;
   agent_id?: string;
   task_id?: string;
-  review?: { protocol: 1; observed?: string[]; sources?: string[]; request_hash?: string; operation_id?: string; no_op?: boolean; content_hash?: string; fence_hash?: string; guard_at?: string };
+  review?: { protocol: 1 | 2; observed?: string[]; sources?: string[]; request_hash?: string; operation_id?: string; no_op?: boolean; previous_status?: ReviewStatus; missing?: string[]; content_hash?: string; fence_hash?: string; guard_at?: string; guard_epoch?: number; legacy_token?: string };
   /** 变更类型。 */
   op: "created" | "updated" | "merged" | "superseded" | "reverted" | "deleted" | "retracted" | "restored";
   /** 本事件对应的 record id（superseded 时为旧 record id）。 */
@@ -705,6 +707,8 @@ export interface MemoryEventRedactFilter {
 }
 
 /** queryMemoryEvents 过滤条件，全部可选。 */
+export const MEMORY_EVENT_HISTORY_LIMIT = 50_000;
+
 export interface MemoryEventFilter {
   session_id?: string;
   session_key?: string;
@@ -718,6 +722,7 @@ export interface MemoryEventFilter {
   source?: MemoryEvent["source"];
   request_id?: string;
   event_id?: string;
+  operation_id?: string;
   team_id?: string;
   agent_id?: string;
   user_id?: string;
@@ -732,6 +737,7 @@ export interface MemoryEventFilter {
   scope?: MemoryEvent["scope"];
   /** 排序方向：默认 "asc"（按追加序）。inbox 等"看最新"场景用 "desc"。 */
   order?: "asc" | "desc";
+  order_by?: "event_ts" | "clear_epoch";
 }
 
 export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStore {
@@ -755,12 +761,12 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
 
   // ── L1 Write ─────────────────────────────────────────────
 
-  upsertL1(record: MemoryRecord, embedding?: Float32Array): MaybePromise<boolean>;
+  upsertL1(record: MemoryRecord, embedding?: Float32Array, options?: { import?: boolean }): MaybePromise<boolean>;
   deleteL1(recordId: string, filter?: IsolationFilter): MaybePromise<boolean>;
   deleteL1Batch(recordIds: string[], filter?: IsolationFilter): MaybePromise<boolean>;
   deleteL1Expired(cutoffIso: string): MaybePromise<number>;
   /**
-   * 事后审核：设置一条 L1 的可见性状态（DP-01 retract/restore）。
+   * 事后审核：提交独立撤回或观察集合恢复命令（DP-01 retract/restore）。
    *
    * 可选能力 —— 未实现的后端由网关返回 501，沿用 appendMemoryEvent 的惯例。
    * 返回 undefined = 记录不存在或不属于该租户；`changed:false` = 幂等空操作（DP-18）。
@@ -770,7 +776,7 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
     recordId: string,
     status: ReviewStatus,
     filter?: IsolationFilter,
-    operation?: { operation_id?: string; request_id?: string; reviewer_id?: string; reason?: string; persist_no_op?: boolean },
+    operation?: { operation_id?: string; request_id?: string; reviewer_id?: string; reason?: string },
   ): MaybePromise<{ changed: boolean; previous: ReviewStatus; event?: MemoryEvent } | undefined>;
 
   // ── L1 Read ──────────────────────────────────────────────
@@ -926,7 +932,11 @@ export interface IMemoryStore extends MemoryPromptStore, MemoryGenerationRefStor
 
   // ── Memory Events（统一变更账；optional，同上）─────────────
   appendMemoryEvent?(event: MemoryEvent): MaybePromise<void>;
-  queryMemoryEvents?(filter: MemoryEventFilter): MaybePromise<MemoryEvent[]>;
+  commitMemoryEvent?(event: MemoryEvent): MaybePromise<MemoryEvent>;
+  executeMemoryTransaction?<T>(program: () => Generator<MaybePromise<unknown>, T, unknown>): MaybePromise<T>;
+  getClearEpoch?(scope: { teamId?: string; agentId?: string }): MaybePromise<number>;
+  commitClearFence?(event: MemoryEvent): MaybePromise<MemoryEvent>;
+  queryMemoryEvents?(filter: MemoryEventFilter, options?: { complete?: boolean }): MaybePromise<MemoryEvent[]>;
   /**
    * 擦除匹配事件的 content / snapshot_json（保留 op/时间/id 等元数据骨架）。
    * clear/archive/TTL 调用，使变更账不再保留已清空记忆的原文。返回受影响行数。

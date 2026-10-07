@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { parseArgs } from "node:util";
+import { isDeepStrictEqual, parseArgs } from "node:util";
+import { createHash } from "node:crypto";
+import { tokenOf } from "../../src/core/store/review.js";
 import type { MemoryRecord } from "../../src/core/record/l1-writer.js";
 import { listLocalProfiles } from "../../src/core/profile/profile-sync.js";
 import { createBM25Encoder } from "../../src/core/store/bm25-local.js";
 import { VectorStore, type L0RecordRow } from "../../src/core/store/sqlite/memory-store.js";
 import { TcvdbMemoryStore } from "../../src/core/store/tcvdb/memory-store.js";
-import type { L0Record, L1RecordRow, L1CountFilter, MemoryEvent, ProfileRecord, ProfileSyncRecord, StoreInitResult } from "../../src/core/store/types.js";
+import type { L0Record, L1RecordRow, L1CountFilter, MemoryEvent, MemoryEventFilter, ProfileRecord, ProfileSyncRecord, StoreInitResult } from "../../src/core/store/types.js";
 import { readManifest } from "../../src/utils/manifest.js";
 import {
   rewriteMigrationManifest as rewriteMigrationManifestDefault,
@@ -116,12 +118,14 @@ export interface MigrationTargetStore {
   init(providerInfo?: unknown): Promise<StoreInitResult> | StoreInitResult;
   isDegraded(): boolean;
   close(): void;
-  upsertL1(record: MemoryRecord, embedding?: Float32Array): Promise<boolean> | boolean;
+  upsertL1(record: MemoryRecord, embedding?: Float32Array, options?: { import?: boolean }): Promise<boolean> | boolean;
   upsertL0(record: L0Record, embedding?: Float32Array): Promise<boolean> | boolean;
   upsertL1Batch?(records: MemoryRecord[]): Promise<number>;
   upsertL0Batch?(records: L0Record[]): Promise<number>;
   countL1(filter?: L1CountFilter): Promise<number> | number;
   appendMemoryEvent?(event: MemoryEvent): Promise<void> | void;
+  commitMemoryEvent?(event: MemoryEvent): Promise<MemoryEvent> | MemoryEvent;
+  queryMemoryEvents?(filter: MemoryEventFilter): Promise<MemoryEvent[]> | MemoryEvent[];
   countL0(): Promise<number> | number;
   pullProfiles?(): Promise<ProfileRecord[]>;
   syncProfiles?(records: ProfileSyncRecord[]): Promise<void>;
@@ -318,6 +322,7 @@ function mapL1RowToMemoryRecord(row: L1RecordRow): MemoryRecord {
     version: row.version, review_status: row.review_status,
     review_sources: JSON.parse(row.review_sources_json || "[]") as string[],
     review_guard_at: row.review_guard_at,
+    review_epoch: row.review_epoch ?? undefined,
   };
 }
 
@@ -366,9 +371,11 @@ async function ensureTargetIsEmpty(
     targetStore.pullProfiles ? targetStore.pullProfiles().then((records) => records.length) : Promise.resolve(0),
   ]);
 
-  if (existingL1 > 0 || existingL0 > 0 || existingProfiles > 0) {
+  if (!targetStore.queryMemoryEvents) throw new Error("Target cannot verify that its ledger is empty");
+  const existingEvents = (await targetStore.queryMemoryEvents({ limit: 1 })).length;
+  if (existingL1 > 0 || existingL0 > 0 || existingProfiles > 0 || existingEvents > 0) {
     throw new Error(
-      `Target store is not empty (L1=${existingL1}, L0=${existingL0}, profiles=${existingProfiles})`,
+      `Target store is not empty (L1=${existingL1}, L0=${existingL0}, profiles=${existingProfiles}, ledgerPresent=${existingEvents > 0})`,
     );
   }
 }
@@ -392,7 +399,7 @@ async function migrateL1Records(sourceStore: VectorStore, targetStore: Migration
       }
     } else {
       for (const record of records) {
-        const ok = await Promise.resolve(targetStore.upsertL1(record));
+        const ok = await Promise.resolve(targetStore.upsertL1(record, undefined, { import: true }));
         if (!ok) throw new Error(`Failed to migrate L1 record ${record.id}`);
       }
     }
@@ -413,9 +420,18 @@ export async function migrateReviewLedger(sourceStore: VectorStore, targetStore:
   for (let offset = 0; ; offset += 1000) {
     if (offset >= 500_000) throw new Error("Migration ledger budget exceeded; source must be partitioned offline");
     const events = sourceStore.queryMemoryEvents({ limit: 1000, offset });
-    if (events.length && !targetStore.appendMemoryEvent) throw new Error("Target cannot preserve the review ledger");
-    for (const event of events) {
+    if (events.length && (!targetStore.appendMemoryEvent || !targetStore.queryMemoryEvents)) throw new Error("Target cannot preserve and verify the review ledger");
+    for (let index = 0; index < events.length; index++) {
+      const original = events[index];
+      if (original.review?.protocol === 2 && !original.event_id) throw new Error("Committed review receipt has no valid identity");
+      const event: MemoryEvent = original.event_id ? original : {
+        ...original, event_id: `evt-${createHash("sha256").update(JSON.stringify([offset + index, original])).digest("hex").slice(0, 32)}`,
+        review: { ...original.review, protocol: 1, ...(!original.review?.operation_id ? { legacy_token: tokenOf(original) } : {}) },
+      };
+      if ((event.review?.protocol === 2 || event.review?.guard_epoch !== undefined) && !targetStore.commitMemoryEvent) throw new Error("Target lacks an atomic immutable ledger for committed review state");
       await targetStore.appendMemoryEvent!(event);
+      const copies = await targetStore.queryMemoryEvents!({ event_id: event.event_id, limit: 2 });
+      if (copies.length !== 1 || !isDeepStrictEqual(copies[0], event)) throw new Error(`Ledger verification failed for event ${event.event_id}`);
       migrated++;
     }
     if (events.length < 1000) return migrated;
@@ -795,8 +811,8 @@ export async function runMigrationCli(
       const pageSize = DEFAULT_MIGRATION_PAGE_SIZE;
       log(`分页大小: ${pageSize} 条/批`);
 
-      migration.l1Migrated = options.layers.includes("l1") ? await migrateL1Records(sourceStore, targetStore, pageSize) : 0;
       migration.eventsMigrated = await migrateReviewLedger(sourceStore, targetStore);
+      migration.l1Migrated = options.layers.includes("l1") ? await migrateL1Records(sourceStore, targetStore, pageSize) : 0;
       migration.l0Migrated = options.layers.includes("l0") ? await migrateL0Records(sourceStore, targetStore, pageSize) : 0;
       migration.profileMigrated = options.layers.includes("l2") || options.layers.includes("l3")
         ? await migrateProfiles(options.pluginDataDir, targetStore)

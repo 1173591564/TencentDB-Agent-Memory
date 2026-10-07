@@ -294,10 +294,14 @@ describe("memory review visibility", () => {
 
   // ───────────── DP-18 / DP-09 写入侧语义 ─────────────
 
-  it("DP-18 幂等：重复撤回返回 changed:false，调用方据此不写第二条账本事件", () => {
+  it("DP-18 同身份重试不重复提交，独立撤回不被当前状态吞掉", () => {
     store.upsertL1(rec({ id: "m_i", content: "幂等测试" }), undefined);
-    expect(store.setL1ReviewStatus("m_i", "quarantined", ISO)).toMatchObject({ changed: true, previous: "active" });
-    expect(store.setL1ReviewStatus("m_i", "quarantined", ISO)).toEqual({ changed: false, previous: "quarantined" });
+    const operation = { operation_id: `rop-${"a".repeat(64)}` };
+    const first = store.setL1ReviewStatus("m_i", "quarantined", ISO, operation);
+    expect(first).toMatchObject({ changed: true, previous: "active" });
+    expect(store.setL1ReviewStatus("m_i", "quarantined", ISO, operation)).toEqual(first);
+    expect(store.setL1ReviewStatus("m_i", "quarantined", ISO, { operation_id: `rop-${"b".repeat(64)}` })).toMatchObject({ changed: true, previous: "quarantined" });
+    expect(store.queryMemoryEvents({ record_id: "m_i", op: "retracted" })).toHaveLength(2);
   });
 
   it("DP-09 跨租户不得撤回：租户不匹配返回 undefined，记忆保持可见", () => {

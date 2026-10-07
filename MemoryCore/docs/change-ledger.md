@@ -12,10 +12,10 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
   - SQLite：`memory_events.event_id` 上的 partial unique index（`event_id != ''`），
     `INSERT ... ON CONFLICT DO NOTHING`。
   - MongoDB：`event_id` 上的 unique partial index，重复键（11000）视为已写入。
-  - TCVDB：文档主键 `id = event_id`。TCVDB 只有 upsert（整行替换），因此追加前先按主键
-    探测，已存在即 no-op——与 SQLite/Mongo 同为“先写为准”，重放的明文行不会覆盖已被擦成骨架的行。
-    不再拼 `record_id` 等业务字段，因此主键长度恒为 36，远低于 TCVDB 128 字符上限，
-    也不会因同毫秒同记录的不同事件而互相覆盖。
+  - TCVDB：文档主键 `id = event_id`，追加前探测、已存在即 no-op，仅提供顺序重放去重。
+    查后 upsert 不是原子创建；并发追加/擦除不能保证首次内容不可变，不能等同于 SQLite/Mongo。
+    原生模式拒绝 protocol 2 收据与新代次栅栏，旧事实仍可读取；新审核/事务撤销需要共享原子账本。
+    主键不拼业务字段，长度恒为 36，低于 TCVDB 128 字符上限。
 - 历史数据的 `event_id` 为空（SQLite `''`、Mongo/TCVDB 缺字段），查询返回 `undefined`；
   调用方未传 `event_id` 时由 store 自动补生成。
 
@@ -60,8 +60,8 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
   可能落明文，fail-open）：集合达到软上限（1000）时只清理 `until` 早于 1 小时前、且无 pending
   擦除的标记——实时追加的 `event_ts` 都取写入时刻，这类标记已不可能覆盖它们；回放直接使用 outbox
   中的标记，不依赖该集合。
-  被任一标记覆盖的追加永不携带明文——无论 append 与 redact 的相对时序如何，
-  outbox 与 store 两条腿上都不会复活明文（跨进程时依赖对方节点回放后收敛）。
+  本进程已知标记覆盖的追加写骨架；跨进程仍依赖对方节点回放收敛。
+  TCVDB 查后 upsert 的并发覆盖不提供不可变/原子擦除保证，不能承诺两条腿无条件不复活明文。
 - 接入点：L1 writer（created / superseded / updated / merged）、管理面 `recordMutation`（审计 + ledger 镜像）、
   chat_memory clear 的 L1/L2/L3 deleted、`/memory/diff/revert` 的 reverted。
 - 未配置 storage 时只写 store（行为与之前一致，但无法回放）。
@@ -122,16 +122,17 @@ review（revert）三类事件都写入这里，供 `/memory/diff`、`/memory/hi
 Core 只撤该事件或显式拒绝，不会改撤同记录的其它写入；不传时缺省为该记录最后一次提取写入。
 卡片的撤销状态按本页卡片的 `record_id` 反查 `reverted` 标记，不受 session 内标记总数影响。
 
-恢复或删除失败返回 500、不追加 `reverted`，并回滚本次写入的恢复行后按实际行状态作答：
-回滚干净即未改动；否则 `data.partial = { restored, verified }` 列出仍存活（`verified:false` 时为可能存活）
-的恢复行，重试即续完。回滚只删本次从 absent→live 的行——先前部分撤销已恢复的行保持原状，
-重试不会因回滚丢掉自己没写的数据。删除报错但新记录实际已删时按成功记账（回滚会让新旧全部消失）。
-回滚只覆盖后端报错，不覆盖进程在恢复与删除之间崩溃。
+`core/record/memory-revert.ts` 拥有领域工作流；路由只校验请求并映射结果。
+SQLite/Mongo 将最终守卫、快照恢复、目标删除、protocol 2 收据放入同一数据库事务。
+失败由数据库回滚，不再逐行手工删回；embedding 预计算与 outbox 发布在事务外。
+已有恢复行不盲覆盖，快照身份/租户/task 必须吻合；已被 clear 或管理删除的来源不恢复。
+Mongo 物理撤销要求副本集/分片集群事务；无事务能力的后端返回 501，不降级成部分写入。
 
-撤销响应在 `reverted`/`restored`/`missing` 之外另带两个诚实标记（单条与批量 `results[]`
-每项一致）：`ledger_pending: true` —— `reverted` 事件只进了 outbox 未落 store，待
-backfill 补齐；`tombstone_pending: true` —— JSONL 墓碑未写成，回放可能复活该记录，
-需要重试撤销或人工补写墓碑。
+请求可带 `operation_id`；相同身份返回原收据，换理由/目标事件/操作者返回冲突。
+省略身份仍兼容旧接口，但丢失整个响应后无法保证逻辑幂等。响应始终提供身份。
+提交结果不能确认时返回 `commit_unknown`；提交后 outbox 失败标 `outbox_pending`，不再返回假成功的 `ledger_pending`。
+兼容正文 JSONL 墓碑失败标 `tombstone_pending`；完整恢复必须携带权威账本，不能只回放正文。
+撤销新身份写入形成不可由 visibility restore 取消的消费栅栏，防止同 ID 再写复活；就地编辑撤销保留恢复行。
 
 ## 事后审核：撤回 / 恢复 / 清单（retract / restore / list）
 
@@ -155,14 +156,16 @@ POST /v3/memory/review/derived
 
 ### 唯一审核协议与提交点
 
-- 三后端的 `setL1ReviewStatus` 只委托 `store/review.ts`，不再修改状态列后补账。
-  store 成功接受审核事件即提交；失败/超时返回 503、`commit_unknown`，不会先把未提交审核写进 outbox。
-  已提交事件再镜像 outbox，镜像失败返回 `outbox_pending`，不撤销已提交事实。
-  outbox 不保证包含所有审核：崩溃于提交与镜像之间时，store 仍是权威数据，必须保留 store 备份。
-- retract 增加逻辑撤回 token；restore 仅取消实际观察到的 token，不按本机时钟或随机 event_id 选胜者。
-  并发/晚到的新撤回不会被旧 restore 消掉。同一逻辑操作的多个物理事件共用 token；相同身份的
-  并发 restore 按各副本 observed 集合的交集取消，no-op 观察为空，不允许重试扩大恢复范围。
-  不同请求体冲突形成保守抑制 token，审计后用新操作身份恢复。旧无协议事件兼容按历史顺序解析。
+- 新审核使用 protocol 2：规范化审核事件同时就是不可变操作收据，不新增平行事件系统。
+  `commitMemoryEvent` 必须按确定性 `event_id` 原子创建或读回已有收据，校验请求 hash，并返回实际胜出的结果。
+  SQLite/Mongo 使用数据库唯一约束；TCVDB 原生查询后 upsert 不满足此能力，当前审核写入口拒绝该配置。
+  TCVDB 的共享权威账本接入与真实服务验收是本轮尚未解除的外部阻塞，不能据此宣称三后端交付。
+  提交失败/超时返回 `commit_unknown`，不预写未提交 outbox；提交后镜像失败返回 `outbox_pending`。
+  outbox 不保证包含全部审核：崩溃于提交与镜像之间时必须通过权威 store 备份恢复。
+- 每个新 retract 身份增加独立 token，即使记录已经隔离；相同身份重试只返回原收据。
+  restore 仅取消该收据固定观察的 token，不按时钟选胜者；新撤回不会被旧恢复消掉。
+  同身份副本不得产生第二份效果，different-input 在提交边界返回冲突，不新增正常业务冲突 token。
+  protocol 1 的交集/冲突解释仅供存量读取兼容；新写入不使用它。多份旧收据的重试拒绝，需离线核对，不能猜选胜者。
 - `operation_id` 作用域是 service 的 store + team/user/agent/task + record。相同身份的重试返回原收据，
   不重新执行；修改动作、理由或操作者返回 409。提供身份的 no-op 也持久留收据，不取消未来撤回。
   调用方应在发请求前保存身份；省略时服务端生成，但丢失整个响应后无法保证逻辑请求幂等。
@@ -179,11 +182,13 @@ POST /v3/memory/review/derived
   LLM 判重失败不会无条件退化为“全部新写”。这不是事实级永久黑名单。
 - 新后继先持久写入、再删除源行；后继写入失败不删除源行、不留虚假 supersession。
   clear 先提交 L1 消费栅栏，再物理清理和重试；失败如实披露 fence/计数不确定性。
-  抽取与快照恢复带生成起点，写前检查；Mongo/TCVDB 写后复查并条件清理失效生成，读取也按栅栏隔离。
-  clear 失效 token 不能被 restore 取消；无法证明生成年代的存量/导入行在 clear 后也保守隔离。
-  生成/clear 时间守卫仍要求实例时钟同步；不是无时钟的分布式事务。
+  SQLite/Mongo 的新 clear 在事务中提交单调 `guard_epoch`；L1 写入携带开始抽取前捕获的 `review_epoch`。
+  代次由已提交 clear 事实查询；Mongo 的 scope 文档只用于串行分配，并以账本最大代次修复计数下界，不作为消费事实源。
+  时间字段只保留存量兼容；新代次不依赖实例时钟。旧代次/未知代次在 clear 后隔离，不能 visibility restore。
+  普通更新不能改记录出生代次；迁移的显式导入绕过写前拒收，但消费读仍验证栅栏。TCVDB 原生仍只有旧兼容守卫。
 - 普通消费、召回、分页、count、文本重嵌入共用解析器；审计/去重显式 all。完整清单包含历史控制，
-  不宣称截断数据完整。图预算为 50k 节点、500k 事件、64MiB 元数据，超限拒绝而非放行。
+  不宣称截断数据完整。每批完整历史最多 50k 事件；图总预算 50k 节点、500k 事件、64MiB 元数据，超限拒绝而非放行。
+  同步/异步解析共用一份执行计划；批量完整历史只读取一次，不在 TCVDB 每页重复全扫。
   精确分页/计数最多解析 50k 候选行，需按租户/类型/时间收窄；召回有界超取，欠数记截断告警。
   单次读取不是跨多个请求的可串行化快照，也不能召回已交给模型的在途 prompt。
 - Mongo `$search` 不依赖审核索引字段：以 local readConcern 获取候选，再用 primary/majority 记录及账本复核。
@@ -193,17 +198,21 @@ POST /v3/memory/review/derived
   TCVDB 不稳定分页通过去重+count 完整性核查拒绝欠数，不能用最终一致索引或桩测试代替真实服务保证。
 - SQLite 保留一份事件 DDL、一次 CHECK 重建，保留 seq/高水位/字段/索引/触发器；未知列或残骸事务回滚，
   迁移失败进入 degraded，不继续接受审核。导出游标全量；迁移复制原始兼容状态、来源/守卫和完整事件账本，
-  任一批部分写入中止，校验物理 all 数量。迁移需停写、目标不对外服务，成功前不切配置。
+  任一批部分写入中止，校验物理 all 数量及每个事件的完整规范化内容；目标空检查包括账本。
+  先复制控制账本，再导入记录。缺 event_id 的旧行按位置/内容赋稳定迁移身份，并保留旧逻辑 token。
+  迁移需停写、目标不对外服务，成功前不切配置；protocol 2/代次事实不能迁入原生 TCVDB，能力不足中止。
+  原始导出查询失败/数量不符退出失败，不把残缺文件标成功。
 
 ### 派生内容与交付范围
 
-- L2/L3 不自动改写/删除、不自动调用 LLM 重生成。profile 作用域内尚有未解除的撤回或 clear 栅栏时，
+- `store/derived-review.ts` 拥有派生消费策略与确认命令，复用同一不可变收据。L2/L3 不自动改写/删除、不自动调用 LLM 重生成。
+  profile 作用域内尚有未解除的撤回、revert 或 clear 栅栏时，
   persona、scene_blocks、scene_index 默认停止消费；人工只可确认当前正文 hash + 当前审核 fence，
   正文变更/新撤回使确认失效，确认不会恢复 L1。作用域沿用 team/agent profile 存储，刻意保守覆盖所有 user。
 - downstream 始终披露 `scan=complete|failed|unavailable`、截断、`lineage_analyzed:false`；最多返回一页文件，
   local 后端已有 10k 文件扫描硬预算。它不是逐记忆影响面；不存在/失败/截断不能互相冒充。
   精确 DAG 影响面和排除错误输入的重生成是 A 类延后，需要消费现有 generation DAG，不能再建平行血缘系统。
-- API 实际 schema 在 `v2-schemas.ts`；TypeScript SDK 提供 retract/restore/list/derived 方法和显式 reviewerId。
+- API 实际 schema 在 `v2-schemas.ts`；TypeScript SDK 提供 revert/retract/restore/list/derived 方法和显式 reviewerId。
   仓库 Kubb 配置引用的 `docs/team-api-仅memory.yaml` 不存在，未伪造全量 codegen 或改无关生成 schema。
   配套 Panel 操作闭环在 #1539，本 PR 不吞入 UI。MongoDB 8.3 + mongot 有本机集成证据；
   TCVDB 只有 HTTP 合约验证，真实腾讯云实例及其索引/更新保证仍是部署验收项。
@@ -260,7 +269,9 @@ store 擦除成功，且所有含匹配行的分片都已改写之后：
 
 ## 回放 / 补齐（runbook）
 
-适用：store 故障恢复后、节点重建、后端迁移（如 SQLite → TCVDB）。
+适用：store 故障恢复后的 outbox 补齐，不替代完整备份。节点重建/迁移先停写，同一备份点携带 L0/L1、profiles
+及完整 memory_events（含已擦除骨架、来源、收据、代次）；恢复到隔离目标后核验内容与控制事实，再切流。
+只有 outbox/正文 JSONL 不能证明账本完整；目标缺原子能力时拒绝导入新收据。
 
 ```bash
 curl -X POST "$GATEWAY/v3/memory/ledger/backfill" \

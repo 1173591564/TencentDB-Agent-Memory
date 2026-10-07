@@ -79,6 +79,7 @@ export interface MemoryRecord {
   version?: number;
   review_sources?: string[];
   review_guard_at?: string;
+  review_epoch?: number;
   expected_existing?: boolean;
   review_status?: import("../store/visibility.js").ReviewStatus;
   /** Source session key (conversation channel identifier) */
@@ -252,6 +253,7 @@ export async function writeMemory(params: {
   /** StorageAdapter for file operations (COS/local). Falls back to fs when absent. */
   storage?: StorageAdapter;
   startedAt?: string;
+  reviewEpoch?: number;
 }): Promise<MemoryRecord | null> {
   const { memory, decision, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, vectorStore, embeddingService, storage } = params;
 
@@ -261,6 +263,8 @@ export async function writeMemory(params: {
   }
 
   const now = new Date().toISOString();
+  const reviewEpoch = params.reviewEpoch ?? (vectorStore?.getClearEpoch ? await vectorStore.getClearEpoch({ teamId, agentId }) : undefined);
+  if (params.startedAt && params.reviewEpoch === undefined && (reviewEpoch ?? 0) > 0) throw new Error("A generation started before its epoch was captured; retry extraction");
 
   let nextVersion = 0;
   // Superseded targets snapshot — reused for memory_events `superseded` rows so
@@ -351,6 +355,7 @@ export async function writeMemory(params: {
     version: nextVersion,
     review_sources: [...new Set(supersededTargets.map((r) => r.record_id))],
     review_guard_at: params.startedAt ?? now,
+    review_epoch: reviewEpoch,
     sessionKey,
     sessionId: sessionId || DEFAULT_ISOLATION_ID,
     taskId,
@@ -489,7 +494,7 @@ export async function writeMemory(params: {
       // Isolation ids are normalized by appendLedgerEvent ("" → "default").
       const base = {
         event_ts: now,
-        review: { protocol: 1 as const, sources: record.review_sources, guard_at: record.review_guard_at },
+        review: { protocol: 1 as const, sources: record.review_sources, guard_at: record.review_guard_at, guard_epoch: record.review_epoch },
         session_key: sessionKey,
         session_id: record.sessionId,
         team_id: record.teamId ?? "",

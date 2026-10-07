@@ -157,6 +157,7 @@ export async function extractL1Memories(params: {
   }
 
   const l1StartMs = Date.now();
+  const reviewEpoch = options.vectorStore?.getClearEpoch ? await options.vectorStore.getClearEpoch({ teamId, agentId }) : undefined;
 
   // Quality gate: filter messages through L1 extraction rules (length, symbols,
   // prompt injection, etc.) before sending to the LLM. L0 deliberately captures
@@ -367,6 +368,7 @@ export async function extractL1Memories(params: {
         embeddingService: options.embeddingService,
         storage,
         startedAt: new Date(l1StartMs).toISOString(),
+        reviewEpoch,
       });
 
     } catch (err) {
@@ -374,7 +376,7 @@ export async function extractL1Memories(params: {
       throw err;
     }
   } else {
-    storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage, new Date(l1StartMs).toISOString());
+    storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, options.vectorStore, options.embeddingService, storage, new Date(l1StartMs).toISOString(), reviewEpoch);
   }
 
   const logStorage = storage ?? new StorageAdapter(new LocalStorageBackend(baseDir));
@@ -715,6 +717,7 @@ async function applyDecisions(params: {
   embeddingService?: EmbeddingService;
   storage?: StorageAdapter;
   startedAt?: string;
+  reviewEpoch?: number;
 }): Promise<MemoryRecord[]> {
   const { memoriesWithIds, decisions, baseDir, sessionKey, sessionId, taskId, teamId, userId, agentId, logger, vectorStore, embeddingService, storage } = params;
   const storedRecords: MemoryRecord[] = [];
@@ -737,6 +740,7 @@ async function applyDecisions(params: {
         memory: memoryWithId,
         decision,
         startedAt: params.startedAt,
+        reviewEpoch: params.reviewEpoch,
         baseDir,
         sessionKey,
         sessionId,
@@ -780,6 +784,7 @@ async function storeAllDirectly(
   embeddingService?: EmbeddingService,
   storage?: StorageAdapter,
   startedAt?: string,
+  reviewEpoch?: number,
 ): Promise<MemoryRecord[]> {
   const storedRecords: MemoryRecord[] = [];
 
@@ -788,6 +793,7 @@ async function storeAllDirectly(
       const record = await writeMemory({
         memory: memoryWithId,
         startedAt,
+        reviewEpoch,
         decision: {
           record_id: memoryWithId.record_id,
           action: "store",

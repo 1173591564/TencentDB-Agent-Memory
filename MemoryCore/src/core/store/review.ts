@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { IMemoryStore, L1RecordRow, MemoryEvent, MemoryEventFilter, MaybePromise } from "./types.js";
+import { MEMORY_EVENT_HISTORY_LIMIT, type IMemoryStore, type L1RecordRow, type MemoryEvent, type MemoryEventFilter, type MaybePromise } from "./types.js";
 import type { IsolationFilter } from "./isolation.js";
 import { newMemoryEventId, healIsoId, canonIsoTs } from "./memory-event-id.js";
 import { normalizeReviewStatus, type ReviewStatus } from "./visibility.js";
@@ -15,20 +15,24 @@ function appendPage(target: MemoryEvent[], page: MemoryEvent[]): void {
   bytes.set(target, size);
   target.push(...page);
 }
-type Operation = { operation_id?: string; request_id?: string; reviewer_id?: string; reason?: string; persist_no_op?: boolean };
+type Operation = { operation_id?: string; request_id?: string; reviewer_id?: string; reason?: string };
 type Node = { id: string; scope: { team_id: string; user_id: string; agent_id: string }; row?: L1RecordRow; events: MemoryEvent[]; loaded: boolean };
 
 export function validReview(value: unknown): value is NonNullable<MemoryEvent["review"]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
-  return v.protocol === 1 && Object.keys(v).every((k) => ["protocol", "observed", "sources", "operation_id", "request_hash", "no_op", "content_hash", "fence_hash", "guard_at"].includes(k)) &&
+  return (v.protocol === 1 || v.protocol === 2) && Object.keys(v).every((k) => ["protocol", "observed", "sources", "operation_id", "request_hash", "no_op", "previous_status", "missing", "content_hash", "fence_hash", "guard_at", "guard_epoch", "legacy_token"].includes(k)) &&
+    (v.legacy_token === undefined || (v.protocol === 1 && typeof v.legacy_token === "string" && /^legacy-event-[a-f0-9]{64}$/.test(v.legacy_token))) &&
+    (v.guard_epoch === undefined || (typeof v.guard_epoch === "number" && Number.isSafeInteger(v.guard_epoch) && v.guard_epoch >= 0)) &&
+    (v.previous_status === undefined || v.previous_status === "active" || v.previous_status === "quarantined") &&
+    (v.protocol !== 2 || (typeof v.operation_id === "string" && typeof v.request_hash === "string")) &&
     (v.guard_at === undefined || (typeof v.guard_at === "string" && canonIsoTs(v.guard_at) === v.guard_at)) &&
     (v.fence_hash === undefined || (typeof v.fence_hash === "string" && /^[a-f0-9]{64}$/.test(v.fence_hash))) &&
     (v.content_hash === undefined || (typeof v.content_hash === "string" && /^[a-f0-9]{64}$/.test(v.content_hash))) &&
     (v.no_op === undefined || typeof v.no_op === "boolean") &&
     (v.operation_id === undefined || (typeof v.operation_id === "string" && /^rop-[a-f0-9]{64}$/.test(v.operation_id))) &&
     (v.request_hash === undefined || (typeof v.request_hash === "string" && /^[a-f0-9]{64}$/.test(v.request_hash))) &&
-    [v.observed, v.sources].every((a) => a === undefined || (Array.isArray(a) && a.length <= MAX_NODES && a.every((s) => typeof s === "string" && s.length > 0 && s.length <= 1024)));
+    [v.observed, v.sources, v.missing].every((a) => a === undefined || (Array.isArray(a) && a.length <= MAX_NODES && a.every((s) => typeof s === "string" && s.length > 0 && s.length <= 1024)));
 }
 
 export function decodeReview(json: unknown): MemoryEvent["review"] {
@@ -44,7 +48,7 @@ const scopeOf = (r: { team_id?: string; user_id?: string; agent_id?: string }) =
   team_id: healIsoId(r.team_id ?? "")!, user_id: healIsoId(r.user_id ?? "")!, agent_id: healIsoId(r.agent_id ?? "")!,
 });
 const key = (scope: Node["scope"], id: string) => JSON.stringify([scope.team_id, scope.user_id, scope.agent_id, id]);
-const tokenOf = (e: MemoryEvent) => e.review?.operation_id ?? e.event_id ?? `legacy-event-${createHash("sha256").update(JSON.stringify([e.record_id, e.event_ts, e.op, e.session_key, e.session_id])).digest("hex")}`;
+export const tokenOf = (e: MemoryEvent) => e.review?.operation_id ?? e.review?.legacy_token ?? e.event_id ?? `legacy-event-${createHash("sha256").update(JSON.stringify([e.record_id, e.event_ts, e.op, e.session_key, e.session_id])).digest("hex")}`;
 
 class ReviewGraph {
   readonly nodes = new Map<string, Node>();
@@ -115,9 +119,11 @@ class ReviewGraph {
       const clear = this.clears.get(JSON.stringify([n.scope.team_id, n.scope.agent_id]));
       const guard = n.row?.review_guard_at || n.row?.created_time || n.events.filter((e) => ["created", "updated", "merged"].includes(e.op)).map((e) => e.review?.guard_at ?? e.event_ts).sort()[0];
       if (guard && canonIsoTs(guard) !== guard) throw new Error("Invalid generation guard");
-      if (clear && (!guard || guard <= clear.event_ts)) tokens.add(`clear:${tokenOf(clear)}`);
+      const epoch = n.row?.review_epoch ?? n.events.find((event) => event.review?.guard_epoch !== undefined)?.review?.guard_epoch;
+      if (epoch !== undefined && (!Number.isSafeInteger(epoch) || epoch < 0)) throw new Error("Invalid generation epoch");
+      if (clear && (clear.review?.guard_epoch !== undefined ? epoch !== clear.review.guard_epoch : (!guard || guard <= clear.event_ts))) tokens.add(`clear:${tokenOf(clear)}`);
       const hashes = new Map<string, Set<string>>();
-      for (const e of n.events) if ((e.layer ?? "l1") === "l1" && e.review?.operation_id) {
+      for (const e of n.events) if ((e.layer ?? "l1") === "l1" && e.review?.protocol === 1 && e.review.operation_id) {
         const group = hashes.get(e.review.operation_id) ?? new Set<string>();
         group.add(e.review.request_hash ?? "");
         hashes.set(e.review.operation_id, group);
@@ -137,11 +143,13 @@ class ReviewGraph {
         if (e.review !== undefined && !validReview(e.review)) throw new Error("Invalid review event");
         if (e.review?.no_op) continue;
         if (e.op === "retracted") tokens.add(tokenOf(e));
+        if (e.op === "reverted" && !e.supersedes?.includes(e.record_id) && !(e.target_event_id && n.events.some((write) => write.event_id === e.target_event_id && write.source === "api_mutation"))) tokens.add(`revert:${tokenOf(e)}`);
         if (e.op === "restored") {
           if (e.review?.operation_id && conflicts.has(e.review.operation_id)) continue;
-          if (e.review?.protocol === 1) {
+          if (e.review?.protocol === 1 || e.review?.protocol === 2) {
             if (!e.review.observed) throw new Error("Restore missing observed retractions");
-            for (const t of e.review.operation_id ? observations.get(e.review.operation_id)! : e.review.observed) cancelled.add(t);
+            const observed = e.review.protocol === 1 && e.review.operation_id ? observations.get(e.review.operation_id)! : e.review.observed;
+            for (const t of observed) cancelled.add(t);
           } else {
             for (const t of tokens) cancelled.add(t);
             cancelled.add(legacy);
@@ -168,7 +176,7 @@ class ReviewGraph {
       queued.delete(k);
       const tokens = new Set(own.get(k));
       for (const p of parents.get(k)!) for (const t of values.get(p) ?? []) tokens.add(t);
-      for (const t of removed.get(k)!) if (!t.startsWith("clear:")) tokens.delete(t);
+      for (const t of removed.get(k)!) if (!t.startsWith("clear:") && !t.startsWith("revert:")) tokens.delete(t);
       const before = values.get(k)!;
       const missing = incomplete.get(k)! || parents.get(k)!.some((p) => incomplete.get(p));
       const missingChanged = missing !== incomplete.get(k);
@@ -182,26 +190,36 @@ class ReviewGraph {
     return this.roots.map((row) => {
       const tokens = [...values.get(key(scopeOf(row), row.record_id))!].sort();
       const invalid = row.review_status !== undefined && !["", "active", "quarantined"].includes(row.review_status);
-      return { ...row, review_status: tokens.length ? "quarantined" : "active", review_tokens: tokens, ...(incomplete.get(key(scopeOf(row), row.record_id)) ? { review_incomplete: true } : {}), ...(invalid ? { review_invalid: true } : {}) };
+      return { ...row, review_baseline: normalizeReviewStatus(this.nodes.get(key(scopeOf(row), row.record_id))?.row?.review_status), review_status: tokens.length ? "quarantined" : "active", review_tokens: tokens, ...(incomplete.get(key(scopeOf(row), row.record_id)) ? { review_incomplete: true } : {}), ...(invalid ? { review_invalid: true } : {}) };
     });
   }
 }
 
 const clearKey = (scope: { team_id?: string; agent_id?: string }) => JSON.stringify([healIsoId(scope.team_id ?? ""), healIsoId(scope.agent_id ?? "")]);
-const clearFilter = (scope: { team_id?: string; agent_id?: string }): MemoryEventFilter => ({ ...scope, op: "deleted", source: "api_mutation", scope: "agent", layer: "l1", order: "desc", limit: 1, metadata_only: true });
+export const clearFilter = (scope: { team_id?: string; agent_id?: string }): MemoryEventFilter => ({ ...scope, op: "deleted", source: "api_mutation", scope: "agent", layer: "l1", order: "desc", order_by: "clear_epoch", limit: 1, metadata_only: true });
 
-export function assertClearGuardSync(store: IMemoryStore, record: { teamId?: string; agentId?: string; review_guard_at?: string }): void {
-  if (!record.review_guard_at) return;
-  if (canonIsoTs(record.review_guard_at) !== record.review_guard_at || !store.queryMemoryEvents) throw new Error("Unverifiable generation guard");
-  const marker = sync(store.queryMemoryEvents(clearFilter({ team_id: record.teamId || "default", agent_id: record.agentId || "default" })))[0];
-  if (marker && marker.event_ts >= record.review_guard_at) throw new ReviewConflictError("Generation invalidated by agent clear");
+type GenerationGuard = { teamId?: string; agentId?: string; review_guard_at?: string; review_epoch?: number };
+
+function validateGeneration(record: GenerationGuard, marker: MemoryEvent | undefined): void {
+  const epoch = record.review_epoch;
+  if (epoch !== undefined && (!Number.isSafeInteger(epoch) || epoch < 0)) throw new Error("Unverifiable generation epoch");
+  if (marker?.review?.guard_epoch !== undefined) {
+    if (epoch !== marker.review.guard_epoch) throw new ReviewConflictError("Generation invalidated by agent clear");
+    return;
+  }
+  if (epoch !== undefined && epoch !== 0) throw new Error("Generation epoch has no committed clear fence");
+  if (record.review_guard_at && canonIsoTs(record.review_guard_at) !== record.review_guard_at) throw new Error("Unverifiable generation guard");
+  if (marker && record.review_guard_at && marker.event_ts >= record.review_guard_at) throw new ReviewConflictError("Generation invalidated by agent clear");
 }
 
-export async function assertClearGuard(store: IMemoryStore, record: { teamId?: string; agentId?: string; review_guard_at?: string }): Promise<void> {
-  if (!record.review_guard_at) return;
-  if (canonIsoTs(record.review_guard_at) !== record.review_guard_at || !store.queryMemoryEvents) throw new Error("Unverifiable generation guard");
-  const marker = (await store.queryMemoryEvents(clearFilter({ team_id: record.teamId || "default", agent_id: record.agentId || "default" })))[0];
-  if (marker && marker.event_ts >= record.review_guard_at) throw new ReviewConflictError("Generation invalidated by agent clear");
+export function assertClearGuardSync(store: IMemoryStore, record: GenerationGuard): void {
+  if (!store.queryMemoryEvents) throw new Error("Unverifiable generation guard");
+  validateGeneration(record, sync(store.queryMemoryEvents(clearFilter({ team_id: record.teamId || "default", agent_id: record.agentId || "default" })))[0]);
+}
+
+export async function assertClearGuard(store: IMemoryStore, record: GenerationGuard): Promise<void> {
+  if (!store.queryMemoryEvents) throw new Error("Unverifiable generation guard");
+  validateGeneration(record, (await store.queryMemoryEvents(clearFilter({ team_id: record.teamId || "default", agent_id: record.agentId || "default" })))[0]);
 }
 
 function filters(nodes: Node[]): { rows: Parameters<IMemoryStore["queryL1Records"]>[0]; events: MemoryEventFilter } {
@@ -214,123 +232,134 @@ function filters(nodes: Node[]): { rows: Parameters<IMemoryStore["queryL1Records
 }
 
 const sync = <T>(value: MaybePromise<T>): T => {
-  if (value instanceof Promise) throw new Error("Async store used in synchronous review resolver");
+  if (value instanceof Promise) {
+    void value.catch(() => undefined);
+    throw new Error("Async store used in synchronous review resolver");
+  }
   return value;
 };
 
+type ReviewProgram<T> = Generator<MaybePromise<unknown>, T, unknown>;
+
+export function runSync<T>(program: ReviewProgram<T>): T {
+  let step = program.next();
+  while (!step.done) {
+    let value: unknown;
+    try { value = sync(step.value); }
+    catch (err) { step = program.throw(err); continue; }
+    step = program.next(value);
+  }
+  return step.value;
+}
+
+export async function runAsync<T>(program: ReviewProgram<T>): Promise<T> {
+  let step = program.next();
+  while (!step.done) {
+    let value: unknown;
+    try { value = await step.value; }
+    catch (err) { step = program.throw(err); continue; }
+    step = program.next(value);
+  }
+  return step.value;
+}
+
+export function queryReviewHistory(store: Pick<IMemoryStore, "queryMemoryEvents">, filter: MemoryEventFilter): MaybePromise<MemoryEvent[]> {
+  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
+  const checked = (events: MemoryEvent[]): MemoryEvent[] => {
+    if (events.length > MEMORY_EVENT_HISTORY_LIMIT) throw new Error("Complete review history budget exceeded; narrow scope");
+    const result: MemoryEvent[] = [];
+    appendPage(result, events);
+    return result;
+  };
+  const result = store.queryMemoryEvents({ ...filter, limit: MEMORY_EVENT_HISTORY_LIMIT + 1, offset: 0 }, { complete: true });
+  return result instanceof Promise ? result.then(checked) : checked(result);
+}
+
+function* reviewResolution(store: IMemoryStore, rows: L1RecordRow[]): ReviewProgram<L1RecordRow[]> {
+  if (!rows.length) return rows;
+  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
+  const graph = new ReviewGraph(rows);
+  for (let nodes = graph.next(); nodes.length; nodes = graph.next()) {
+    const f = filters(nodes);
+    const raw = (yield store.queryL1Records(f.rows, { strict: true, review: false, metadataOnly: true })) as L1RecordRow[];
+    const events = (yield queryReviewHistory(store, f.events)) as MemoryEvent[];
+    const ck = clearKey(nodes[0]!.scope);
+    if (!graph.clears.has(ck)) graph.clears.set(ck, ((yield store.queryMemoryEvents(clearFilter({ team_id: nodes[0]!.scope.team_id, agent_id: nodes[0]!.scope.agent_id }))) as MemoryEvent[])[0]);
+    graph.accept(nodes, raw, events);
+  }
+  return graph.result();
+}
+
 export function resolveReviewRowsSync(store: IMemoryStore, rows: L1RecordRow[]): L1RecordRow[] {
-  if (!rows.length) return rows;
-  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
-  const graph = new ReviewGraph(rows);
-  for (let nodes = graph.next(); nodes.length; nodes = graph.next()) {
-    const f = filters(nodes);
-    const raw = sync(store.queryL1Records(f.rows, { strict: true, review: false, metadataOnly: true }));
-    const events: MemoryEvent[] = [];
-    for (let offset = 0; ; offset += PAGE) {
-      if (offset >= MAX_EVENTS) throw new Error("Review history scan budget exceeded");
-      const page = sync(store.queryMemoryEvents({ ...f.events, offset }));
-      appendPage(events, page);
-      if (page.length < PAGE) break;
-    }
-    const ck = clearKey(nodes[0]!.scope);
-    if (!graph.clears.has(ck)) graph.clears.set(ck, sync(store.queryMemoryEvents(clearFilter({ team_id: nodes[0]!.scope.team_id, agent_id: nodes[0]!.scope.agent_id })))[0]);
-    graph.accept(nodes, raw, events);
-  }
-  return graph.result();
+  return runSync(reviewResolution(store, rows));
 }
 
-export async function resolveReviewRows(store: IMemoryStore, rows: L1RecordRow[]): Promise<L1RecordRow[]> {
-  if (!rows.length) return rows;
-  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
-  const graph = new ReviewGraph(rows);
-  for (let nodes = graph.next(); nodes.length; nodes = graph.next()) {
-    const f = filters(nodes);
-    const raw = await store.queryL1Records(f.rows, { strict: true, review: false, metadataOnly: true });
-    const events: MemoryEvent[] = [];
-    for (let offset = 0; ; offset += PAGE) {
-      if (offset >= MAX_EVENTS) throw new Error("Review history scan budget exceeded");
-      const page = await store.queryMemoryEvents({ ...f.events, offset });
-      appendPage(events, page);
-      if (page.length < PAGE) break;
-    }
-    const ck = clearKey(nodes[0]!.scope);
-    if (!graph.clears.has(ck)) graph.clears.set(ck, (await store.queryMemoryEvents(clearFilter({ team_id: nodes[0]!.scope.team_id, agent_id: nodes[0]!.scope.agent_id })))[0]);
-    graph.accept(nodes, raw, events);
-  }
-  return graph.result();
+export function resolveReviewRows(store: IMemoryStore, rows: L1RecordRow[]): Promise<L1RecordRow[]> {
+  return runAsync(reviewResolution(store, rows));
 }
 
-function change(row: L1RecordRow, status: ReviewStatus, operation: Operation): { changed: boolean; previous: ReviewStatus; event?: MemoryEvent } {
+function change(row: L1RecordRow, status: ReviewStatus, operation: Operation): MemoryEvent {
   const previous = normalizeReviewStatus(row.review_status);
-  if (status === "active" && row.review_tokens?.some((t) => t.startsWith("clear:"))) throw new ReviewConflictError("Generation invalidated by clear cannot be restored");
-  if (previous === status && !operation.persist_no_op) return { changed: false, previous };
+  if (status === "active" && row.review_tokens?.some((t) => t.startsWith("clear:") || t.startsWith("revert:"))) throw new ReviewConflictError("Generation invalidated by clear or revert cannot be restored through visibility");
+  const identity = operation.operation_id ?? `rop-${createHash("sha256").update(newMemoryEventId()).digest("hex")}`;
   const event: MemoryEvent = {
-    event_id: newMemoryEventId(), event_ts: new Date().toISOString(),
+    event_ts: new Date().toISOString(),
     ...scopeOf(row), task_id: row.task_id || undefined, session_id: row.session_id, session_key: row.session_key,
     record_id: row.record_id, content: "", memory_type: row.type, version: row.version, source: "review", layer: "l1",
     op: status === "active" ? "restored" : "retracted", reason: operation.reason,
     reviewer_id: operation.reviewer_id, request_id: operation.request_id,
-    review: { protocol: 1, request_hash: requestHash(row.record_id, status, operation),
-      ...(operation.operation_id ? { operation_id: operation.operation_id } : {}),
-      ...(previous === status ? { no_op: true } : {}),
+    review: { protocol: 2, operation_id: identity, request_hash: requestHash(row.record_id, status, operation), previous_status: previous, guard_epoch: row.review_epoch ?? undefined,
+      ...(status === "active" && previous === "active" ? { no_op: true } : {}),
       ...(status === "active" ? { observed: row.review_tokens ?? [] } : {}) },
   };
+  event.event_id = reviewEventId(event);
   if (!validReview(event.review)) throw new Error("Review operation exceeds protocol payload budget");
-  return { changed: previous !== status, previous, event };
+  return event;
 }
 
 export class ReviewConflictError extends Error {}
+export class ReviewCapabilityError extends Error {}
+
+export function reviewEventId(event: MemoryEvent): string {
+  if (!event.review?.operation_id) throw new Error("Review operation identity required");
+  return `evt-${createHash("sha256").update(JSON.stringify([scopeOf(event), event.layer ?? "l1", event.record_id, event.review.operation_id])).digest("hex").slice(0, 32)}`;
+}
+
+export function assertReviewEvent(event: MemoryEvent): void {
+  if (event.review !== undefined && !validReview(event.review)) throw new Error("Invalid review protocol payload");
+  if (event.review?.protocol !== 2) return;
+  if (event.source !== "review" || event.event_id !== reviewEventId(event)) throw new Error("Invalid committed review identity");
+  if (event.op === "retracted" || event.op === "restored") {
+    if (event.layer !== "l1" || event.review.previous_status === undefined) throw new Error("Review outcome required");
+    if (event.op === "restored" && !event.review.observed) throw new Error("Restore observations required");
+    if (event.op === "retracted" && event.review.no_op) throw new Error("A new retract operation cannot be a no-op");
+  } else if (event.op === "reverted") {
+    if (event.layer !== "l1" || !Array.isArray(event.review.missing)) throw new Error("Revert receipt outcome required");
+  } else if (event.op !== "updated" || !event.review.content_hash || !event.review.fence_hash) throw new Error("Invalid review command");
+}
+
+export function confirmReviewCommit(candidate: MemoryEvent, stored: MemoryEvent | undefined): MemoryEvent {
+  assertReviewEvent(candidate);
+  if (!stored) throw new Error("Committed review receipt unavailable");
+  assertReviewEvent(stored);
+  if (stored.review?.protocol !== 2 || stored.review.request_hash !== candidate.review?.request_hash ||
+      stored.op !== candidate.op || stored.record_id !== candidate.record_id || stored.event_id !== candidate.event_id ||
+      key(scopeOf(stored), "") !== key(scopeOf(candidate), "")) throw new ReviewConflictError("Review operation identity reused with different input");
+  return stored;
+}
 
 const requestHash = (id: string, status: ReviewStatus, op: Operation) => createHash("sha256")
   .update(JSON.stringify([id, status, op.reason ?? "", op.reviewer_id ?? ""])).digest("hex");
 
 function previousResult(e: MemoryEvent, id: string, status: ReviewStatus, op: Operation) {
   if (e.review?.request_hash !== requestHash(id, status, op)) throw new ReviewConflictError("Review operation identity reused with different input");
-  return { changed: !e.review.no_op, previous: (e.review.no_op ? status : status === "active" ? "quarantined" : "active") as ReviewStatus, event: e };
+  return { changed: !e.review.no_op, previous: e.review.previous_status ?? (e.review.no_op ? status : status === "active" ? "quarantined" : "active") as ReviewStatus, event: e };
 }
 
-export const isDerivedReviewPath = (path: string): boolean => path === "persona.md" || path === ".metadata/scene_index.json" || (path.startsWith("scene_blocks/") && path.endsWith(".md"));
-
-export async function profileReviewFence(store: IMemoryStore, isolation?: { teamId?: string; userId?: string; agentId?: string }): Promise<string[]> {
-  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
-  const scope: { team_id?: string; agent_id?: string; user_id?: string } = isolation ? { team_id: isolation.teamId || "default", agent_id: isolation.agentId || "default", ...(isolation.teamId ? {} : { user_id: isolation.userId || "default" }) } : {};
-  const events: MemoryEvent[] = [];
-  for (let offset = 0; ; offset += PAGE) {
-    if (offset >= MAX_EVENTS) throw new Error("Profile review event budget exceeded");
-    const page = await store.queryMemoryEvents({ ...scope, layer: "l1", source: "review", limit: PAGE, offset, metadata_only: true });
-    appendPage(events, page);
-    if (page.length < PAGE) break;
-  }
-  const current = await store.queryL1Records({ teamId: scope.team_id, userId: scope.user_id, agentId: scope.agent_id, visibility: "quarantined" }, { strict: true, review: false, metadataOnly: true });
-  const roots = new Map(historicalReviewRows(events).map((r) => [key(scopeOf(r), r.record_id), r]));
-  for (const r of current) roots.set(key(scopeOf(r), r.record_id), { ...r, review_sources_json: "[]" });
-  const graph = new ReviewGraph([...roots.values()]);
-  graph.accept([...graph.nodes.values()], current.map((r) => ({ ...r, review_sources_json: "[]" })), events);
-  const tokens = new Set(graph.result().flatMap((r) => r.review_tokens ?? []));
-  const clear = (await store.queryMemoryEvents(clearFilter({ team_id: scope.team_id, agent_id: scope.agent_id })))[0];
-  if (clear) tokens.add(`clear:${tokenOf(clear)}`);
-  return [...tokens].sort();
-}
-
-export async function derivedProfileAllowed(store: IMemoryStore, path: string, content: string, fence: readonly string[], isolation?: { teamId?: string; userId?: string; agentId?: string }): Promise<boolean> {
-  if (!fence.length) return true;
-  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
-  const hash = createHash("sha256").update(content).digest("hex");
-  const events: MemoryEvent[] = [];
-  for (let offset = 0; offset < MAX_EVENTS; offset += PAGE) {
-    const page = await store.queryMemoryEvents({ record_id: path, layer: path === "persona.md" ? "l3" : "l2", source: "review", op: "updated", team_id: isolation?.teamId || "default", agent_id: isolation?.agentId || "default", limit: PAGE, offset });
-    appendPage(events, page);
-    if (page.length < PAGE) {
-      const hashes = new Map<string, Set<string>>();
-      for (const e of events) if (e.review?.operation_id) {
-        const values = hashes.get(e.review.operation_id) ?? new Set<string>();
-        values.add(e.review.request_hash ?? "");
-        hashes.set(e.review.operation_id, values);
-      }
-      return events.some((e) => e.review?.content_hash === hash && (!e.review.operation_id || hashes.get(e.review.operation_id)!.size === 1) && e.review?.fence_hash === createHash("sha256").update(JSON.stringify([...fence].sort())).digest("hex"));
-    }
-  }
-  throw new Error("Derived acknowledgement history budget exceeded");
+export function resolveReviewFacts(rows: L1RecordRow[], events: MemoryEvent[]): L1RecordRow[] {
+  const graph = new ReviewGraph(rows);
+  graph.accept([...graph.nodes.values()], rows, events);
+  return graph.result();
 }
 
 function historyFilter(id: string, filter?: IsolationFilter): MemoryEventFilter {
@@ -340,82 +369,44 @@ function historyFilter(id: string, filter?: IsolationFilter): MemoryEventFilter 
 export function historicalReviewRows(events: MemoryEvent[]): L1RecordRow[] {
   const records = new Map<string, L1RecordRow>();
   for (const e of events) {
-    if ((e.layer ?? "l1") !== "l1" || !["created", "updated", "merged", "superseded", "retracted", "restored"].includes(e.op)) continue;
+    if ((e.layer ?? "l1") !== "l1" || !["created", "updated", "merged", "superseded", "retracted", "restored", "reverted"].includes(e.op)) continue;
     const scope = scopeOf(e);
     records.set(key(scope, e.record_id), {
       record_id: e.record_id, content: "", type: e.memory_type ?? "work_fact", priority: 0, scene_name: "",
       ...scope, task_id: e.task_id ?? "", session_key: e.origin_session_key ?? e.session_key,
       session_id: e.origin_session_id ?? e.session_id, version: e.version ?? 0, timestamp_str: "", timestamp_start: "", timestamp_end: "",
-      created_time: "", updated_time: e.event_ts, metadata_json: "{}", review_status: "active",
+      created_time: "", updated_time: e.event_ts, metadata_json: "{}", review_status: "active", review_epoch: e.review?.guard_epoch,
     });
   }
   return [...records.values()];
 }
 
-async function historicalReviewRow(store: IMemoryStore, id: string, filter?: IsolationFilter): Promise<L1RecordRow | undefined> {
-  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
-  const events: MemoryEvent[] = [];
-  for (let offset = 0; offset < MAX_EVENTS; offset += PAGE) {
-    const page = await store.queryMemoryEvents({ ...historyFilter(id, filter), offset });
-    appendPage(events, page);
-    if (page.length < PAGE) {
-      const row = historicalReviewRows(events)[0];
-      return row && (filter?.taskId === undefined || row.task_id === filter.taskId) ? (await resolveReviewRows(store, [row]))[0] : undefined;
-    }
-  }
-  throw new Error("Review history scan budget exceeded");
+function* historicalReviewRow(store: IMemoryStore, id: string, filter?: IsolationFilter): ReviewProgram<L1RecordRow | undefined> {
+  const events = (yield queryReviewHistory(store, historyFilter(id, filter))) as MemoryEvent[];
+  const row = historicalReviewRows(events)[0];
+  if (!row || (filter?.taskId !== undefined && row.task_id !== filter.taskId)) return undefined;
+  return (yield* reviewResolution(store, [row]))[0];
 }
 
-function historicalReviewRowSync(store: IMemoryStore, id: string, filter?: IsolationFilter): L1RecordRow | undefined {
-  if (!store.queryMemoryEvents) throw new Error("Review ledger unavailable");
-  const events: MemoryEvent[] = [];
-  for (let offset = 0; offset < MAX_EVENTS; offset += PAGE) {
-    const page = sync(store.queryMemoryEvents({ ...historyFilter(id, filter), offset }));
-    appendPage(events, page);
-    if (page.length < PAGE) {
-      const row = historicalReviewRows(events)[0];
-      return row && (filter?.taskId === undefined || row.task_id === filter.taskId) ? resolveReviewRowsSync(store, [row])[0] : undefined;
-    }
+function* reviewCommand(store: IMemoryStore, id: string, status: ReviewStatus, filter: IsolationFilter | undefined, operation: Operation): ReviewProgram<ReturnType<typeof previousResult> | undefined> {
+  if (!store.queryMemoryEvents || !store.commitMemoryEvent) throw new ReviewCapabilityError("Review requires an atomic immutable event ledger");
+  if (operation.operation_id) {
+    const prior = (yield store.queryMemoryEvents({ ...historyFilter(id, filter), operation_id: operation.operation_id, limit: 2 })) as MemoryEvent[];
+    if (prior.length > 1) throw new ReviewConflictError("Legacy duplicate review receipts require reconciliation");
+    if (prior[0]) return filter?.taskId !== undefined && (prior[0].task_id ?? "") !== filter.taskId ? undefined : previousResult(prior[0], id, status, operation);
   }
-  throw new Error("Review history scan budget exceeded");
+  const rows = (yield store.queryL1Records({ ...filter, recordIds: [id], visibility: "all" }, { strict: true })) as L1RecordRow[];
+  const row = rows[0] ?? (yield* historicalReviewRow(store, id, filter));
+  if (!row) return undefined;
+  const candidate = change(row, status, operation);
+  const committed = (yield store.commitMemoryEvent(candidate)) as MemoryEvent;
+  return previousResult(confirmReviewCommit(candidate, committed), id, status, operation);
 }
 
 export function setReviewStatusSync(store: IMemoryStore, id: string, status: ReviewStatus, filter?: IsolationFilter, operation: Operation = {}) {
-  if (operation.operation_id && store.queryMemoryEvents) {
-    for (let offset = 0; offset < MAX_EVENTS; offset += PAGE) {
-      const page = sync(store.queryMemoryEvents({ ...historyFilter(id, filter), offset }));
-      const found = page.find((e) => e.review?.operation_id === operation.operation_id);
-      if (found) return filter?.taskId !== undefined && (found.task_id ?? "") !== filter.taskId ? undefined : previousResult(found, id, status, operation);
-      if (page.length < PAGE) break;
-      if (offset + PAGE >= MAX_EVENTS) throw new Error("Review operation lookup budget exceeded");
-    }
-  }
-  const row = sync(store.queryL1Records({ ...filter, recordIds: [id], visibility: "all" }, { strict: true }))[0] ?? historicalReviewRowSync(store, id, filter);
-  if (!row) return undefined;
-  const result = change(row, status, operation);
-  if (result.event) {
-    if (!store.appendMemoryEvent) throw new Error("Review ledger unavailable");
-    sync(store.appendMemoryEvent(result.event));
-  }
-  return result;
+  return runSync(reviewCommand(store, id, status, filter, operation));
 }
 
 export async function setReviewStatus(store: IMemoryStore, id: string, status: ReviewStatus, filter?: IsolationFilter, operation: Operation = {}) {
-  if (operation.operation_id && store.queryMemoryEvents) {
-    for (let offset = 0; offset < MAX_EVENTS; offset += PAGE) {
-      const page = await store.queryMemoryEvents({ ...historyFilter(id, filter), offset });
-      const found = page.find((e) => e.review?.operation_id === operation.operation_id);
-      if (found) return filter?.taskId !== undefined && (found.task_id ?? "") !== filter.taskId ? undefined : previousResult(found, id, status, operation);
-      if (page.length < PAGE) break;
-      if (offset + PAGE >= MAX_EVENTS) throw new Error("Review operation lookup budget exceeded");
-    }
-  }
-  const row = (await store.queryL1Records({ ...filter, recordIds: [id], visibility: "all" }, { strict: true }))[0] ?? await historicalReviewRow(store, id, filter);
-  if (!row) return undefined;
-  const result = change(row, status, operation);
-  if (result.event) {
-    if (!store.appendMemoryEvent) throw new Error("Review ledger unavailable");
-    await store.appendMemoryEvent(result.event);
-  }
-  return result;
+  return runAsync(reviewCommand(store, id, status, filter, operation));
 }

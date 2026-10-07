@@ -18,6 +18,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { VectorStore } from "../core/store/sqlite/memory-store.js";
 import { writeMemory, type DedupDecision, type ExtractedMemory } from "../core/record/l1-writer.js";
 import { handleV2Route } from "./v2-router.js";
+import { rowToMemoryRecord } from "../core/record/l1-reader.js";
+import type { L1RecordRow } from "../core/store/types.js";
 import { StorageAdapter } from "../core/storage/adapter.js";
 import { createLocalStorageBackend } from "../core/storage/factory.js";
 import { appendLedgerEvent, getLedgerHealth, redactLedgerEvents, replayLedgerEvents, resetLedgerHealth } from "../core/record/event-ledger.js";
@@ -547,7 +549,7 @@ describe("POST /memory/diff/revert", () => {
     const real = store;
     store = new Proxy(real, {
       get(t, p) {
-        if (p === "upsertL1") return async () => false;
+        if (p === "upsertL1") return () => false;
         const v = Reflect.get(t, p);
         return typeof v === "function" ? v.bind(t) : v;
       },
@@ -607,7 +609,8 @@ describe("POST /memory/diff/revert", () => {
     const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     restore();
     expect(r.status).toBe(500);
-    expect(r.data).toBeUndefined();
+    expect(typeof r.data?.operation_id).toBe("string");
+    expect(r.data?.partial).toBeUndefined();
     expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_m"]);
     expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(0);
 
@@ -616,7 +619,7 @@ describe("POST /memory/diff/revert", () => {
     expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
   });
 
-  it("an incomplete rollback reports the still-live restores; retry finishes the revert", async () => {
+  it("database rollback does not depend on cleanup deletes succeeding", async () => {
     await mergeTwo();
     const { real, restore } = withStore({
       upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_c" ? false : real.upsertL1(...a)),
@@ -628,8 +631,8 @@ describe("POST /memory/diff/revert", () => {
     const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     restore();
     expect(r.status).toBe(500);
-    expect(r.data).toMatchObject({ partial: { restored: ["m_b"], verified: true } });
-    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_m"]);
+    expect(r.data?.partial).toBeUndefined();
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_m"]);
 
     const retry = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     expect(retry.status).toBe(200);
@@ -708,8 +711,8 @@ describe("POST /memory/diff/revert", () => {
 
   it("a retry after a partial revert never deletes restore rows that were already live", async () => {
     await mergeTwo();
-    // Attempt 1: m_c's restore fails and rollback can't remove m_b → partial
-    // state m_b+m_m left live (same injection as the previous test).
+    // Attempt 1: m_c's restore fails; database rollback leaves m_m alone.
+    // Seed an exact legacy partial restore before the next attempt.
     const { real: real1, restore: restore1 } = withStore({
       upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_c" ? false : real1.upsertL1(...a)),
       deleteL1: (...a: Parameters<VectorStore["deleteL1"]>) => {
@@ -720,18 +723,20 @@ describe("POST /memory/diff/revert", () => {
     const r1 = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     restore1();
     expect(r1.status).toBe(500);
-    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_m"]);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_m"]);
+    const snapshot = store.queryMemoryEvents({ record_id: "m_b", op: "superseded" }).find((event) => event.superseded_by === "m_m")!.snapshot_json!;
+    store.upsertL1(rowToMemoryRecord(JSON.parse(snapshot) as L1RecordRow), undefined);
 
-    // Attempt 2: m_b is already live from attempt 1. Its upsert now fails — a
-    // rollback that treated it as this attempt's write would delete a row that
-    // predates the attempt, then report "nothing was changed".
+    // Attempt 2: m_b predates this attempt; do not overwrite or delete it.
+    // Inject failure restoring m_c while rejecting any accidental m_b upsert.
+    // The transaction must preserve the existing legacy restore untouched.
     const { real: real2, restore: restore2 } = withStore({
-      upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (a[0].id === "m_b" ? false : real2.upsertL1(...a)),
+      upsertL1: (...a: Parameters<VectorStore["upsertL1"]>) => (["m_b", "m_c"].includes(a[0].id) ? false : real2.upsertL1(...a)),
     });
     const r2 = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     restore2();
     expect(r2.status).toBe(500);
-    expect(r2.data).toMatchObject({ partial: { restored: ["m_b"], verified: true } });
+    expect(r2.data?.partial).toBeUndefined();
     expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_m"]);
 
     const retry = await call("/v3/memory/diff/revert", { record_id: "m_m" });
@@ -751,7 +756,7 @@ describe("POST /memory/diff/revert", () => {
     expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(0);
   });
 
-  it("a delete that errors after committing completes the revert instead of rolling back into data loss", async () => {
+  it("a delete that errors after its statement still rolls back the whole uncommitted transaction", async () => {
     await mergeTwo();
     const { real, restore } = withStore({
       deleteL1: (...a: Parameters<VectorStore["deleteL1"]>) => {
@@ -762,9 +767,10 @@ describe("POST /memory/diff/revert", () => {
     });
     const r = await call("/v3/memory/diff/revert", { record_id: "m_m" });
     restore();
-    expect(r.status).toBe(200);
-    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_b", "m_c"]);
-    expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(1);
+    expect(r.status).toBe(503);
+    expect(r.data?.commit_unknown).toBe(true);
+    expect(await liveIds(["m_b", "m_c", "m_m"])).toEqual(["m_m"]);
+    expect(store.queryMemoryEvents({ record_id: "m_m", op: "reverted" })).toHaveLength(0);
   });
 
   it("clear of the agent after the write blocks the revert (no resurrection of cleared data)", async () => {
@@ -869,15 +875,22 @@ describe("POST /memory/diff/revert", () => {
     expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })[0].reviewer_id).toBe("panel-op");
   });
 
-  it("a pending reverted marker blocks a second revert until backfill", async () => {
+  it("receipt failure aborts the physical revert instead of returning a pending success", async () => {
     const realAppend = store.appendMemoryEvent.bind(store);
     store.appendMemoryEvent = () => { throw new Error("disk full"); };
-    const first = await call("/v3/memory/diff/revert", { record_id: "m_b" });
+    const body = { record_id: "m_b", operation_id: "revert-retry" };
+    const first = await call("/v3/memory/diff/revert", body);
     store.appendMemoryEvent = realAppend;
-    expect(first.status).toBe(200);
-    expect(first.data).toMatchObject({ ledger_pending: true });
-    const second = await call("/v3/memory/diff/revert", { record_id: "m_b" });
-    expect(second.status).toBe(503);
+    expect(first.status).toBe(503);
+    expect(first.data?.commit_unknown).toBe(true);
+    expect(first.data?.ledger_pending).toBeUndefined();
+    expect(await liveIds(["m_a", "m_b"])).toEqual(["m_b"]);
+    expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })).toEqual([]);
+    const second = await call("/v3/memory/diff/revert", body);
+    expect(second.status).toBe(200);
+    expect(await liveIds(["m_a", "m_b"])).toEqual(["m_a"]);
+    expect((await call("/v3/memory/diff/revert", body)).status).toBe(200);
+    expect(store.queryMemoryEvents({ record_id: "m_b", op: "reverted" })).toHaveLength(1);
   });
 
   const unrecoverableGap = (record_id: string) => appendLedgerEvent({ store, event: {

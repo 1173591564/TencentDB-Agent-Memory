@@ -16,7 +16,7 @@ import type { ProfileIsolation } from "../profile/profile-scope.js";
 import { isProfileIsolationRebindable } from "./composite-backend.js";
 import type { IMemoryStore } from "../store/types.js";
 import { isMemoryReviewEnabled } from "../store/visibility.js";
-import { derivedProfileAllowed, isDerivedReviewPath, profileReviewFence } from "../store/review.js";
+import { derivedProfileAllowed, isDerivedReviewPath, profileReviewFence } from "../store/derived-review.js";
 import { parseProfileIsolationScope } from "../profile/profile-scope.js";
 
 class ScopedStorageBackend implements IStorageBackend {

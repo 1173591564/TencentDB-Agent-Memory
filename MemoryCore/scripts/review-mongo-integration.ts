@@ -4,6 +4,7 @@ import { MongoClientPool, buildMongoClientOptions } from "../src/core/store/mong
 import { MongoMemoryStore } from "../src/core/store/mongodb/memory-store.js";
 import { __setMemoryReviewEnabledForTests } from "../src/core/store/visibility.js";
 import type { MemoryRecord } from "../src/core/record/l1-writer.js";
+import { revertMemory } from "../src/core/record/memory-revert.js";
 
 const config = {
   endpoint: "mongodb://127.0.0.1:27139/?directConnection=true",
@@ -43,8 +44,13 @@ try {
   assert.equal(await second.countL1(iso), 1);
   assert.equal((await second.queryL1Paginated({ ...iso, visibility: "quarantined", limit: 10, offset: 0 })).rows[0]?.record_id, "root");
   assert.equal((await second.setL1ReviewStatus("root", "active", { ...iso, userId: "other" })), undefined);
-  await second.setL1ReviewStatus("root", "active", iso);
+  const restoreIdentity = `rop-${"a".repeat(64)}`;
+  const receipts = await Promise.all(Array.from({ length: 16 }, (_, i) =>
+    (i % 2 ? first : second).setL1ReviewStatus("root", "active", iso, { operation_id: restoreIdentity })));
+  for (const receipt of receipts) assert.deepEqual(receipt, receipts[0]);
+  assert.equal((await first.queryMemoryEvents({ record_id: "root", operation_id: restoreIdentity })).length, 1);
   assert.equal(await first.countL1(iso), 2);
+  await assert.rejects(second.setL1ReviewStatus("root", "quarantined", iso, { operation_id: restoreIdentity }), /different input/);
   await first.upsertL1(rec("child", ["root"]));
   await second.setL1ReviewStatus("root", "quarantined", iso);
   assert.equal((await first.queryL1Records({ ...iso, recordIds: ["child"] })).length, 0, "lineage retraction did not propagate across instances");
@@ -55,6 +61,35 @@ try {
   assert.equal((await second.queryL1Records(defaults)).length, 1);
   await second.setL1ReviewStatus("default-bucket", "quarantined", defaults);
   assert.equal((await first.queryL1Records(defaults)).length, 0);
+  await first.upsertL1(rec("revert-parent"));
+  const preimage = (await first.queryL1Records({ ...iso, recordIds: ["revert-parent"], visibility: "all" }))[0]!;
+  await second.upsertL1(rec("revert-child", ["revert-parent"]));
+  await first.deleteL1("revert-parent", iso);
+  const origin = { event_ts: new Date().toISOString(), session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", source: "extraction" as const, layer: "l1" as const };
+  await first.appendMemoryEvent({ ...origin, record_id: "revert-parent", content: preimage.content, op: "superseded", superseded_by: "revert-child", snapshot_json: JSON.stringify(preimage) });
+  await first.appendMemoryEvent({ ...origin, record_id: "revert-child", content: "kubernetes deployment revert-child", op: "updated", supersedes: ["revert-parent"] });
+  const realCommit = first.commitMemoryEvent.bind(first);
+  first.commitMemoryEvent = async (event) => { await realCommit(event); throw new Error("injected pre-COMMIT failure"); };
+  const reverting = { recordId: "revert-child", options: { operationId: "mongo-atomic-revert" }, isolation: iso, logger: silent };
+  const failed = await revertMemory({ ...reverting, store: first });
+  assert.equal(failed.ok, false);
+  assert.equal((await second.queryL1Records({ ...iso, recordIds: ["revert-parent", "revert-child"], visibility: "all" })).length, 1);
+  assert.equal((await second.queryMemoryEvents({ record_id: "revert-child", op: "reverted" })).length, 0);
+  first.commitMemoryEvent = realCommit;
+  const reverted = await Promise.all([revertMemory({ ...reverting, store: first }), revertMemory({ ...reverting, store: second })]);
+  for (const receipt of reverted) assert.equal(receipt.ok, true);
+  assert.deepEqual(reverted[0], reverted[1]);
+  assert.equal((await first.queryMemoryEvents({ record_id: "revert-child", op: "reverted" })).length, 1);
+  assert.equal((await second.queryL1Records({ ...iso, recordIds: ["revert-parent", "revert-child"], visibility: "all" }))[0]?.record_id, "revert-parent");
+  const epoch = await first.getClearEpoch(iso);
+  const fence = { event_id: "evt-" + "c".repeat(32), event_ts: "2000-01-01T00:00:00.000Z", session_key: "", session_id: "", team_id: "t1", agent_id: "a1", record_id: "clear", content: "", op: "deleted" as const, source: "api_mutation" as const, scope: "agent" as const, layer: "l1" as const };
+  await first.commitClearFence(fence);
+  assert.equal(await second.getClearEpoch(iso), epoch + 1);
+  await first.commitClearFence(fence);
+  assert.equal(await second.getClearEpoch(iso), epoch + 1);
+  await assert.rejects(second.upsertL1({ ...rec("skewed"), review_epoch: epoch, review_guard_at: "2099-01-01T00:00:00.000Z" }), /invalidated/);
+  assert.equal(await second.upsertL1({ ...rec("fresh-epoch"), review_epoch: epoch + 1 }), true);
+  assert.equal((await first.queryL1Records({ ...iso, recordIds: ["fresh-epoch"] })).length, 1);
   __setMemoryReviewEnabledForTests(false);
   assert.equal((await first.queryL1Records({ ...iso, recordIds: ["root"] })).length, 0, "disabled writes resurrected reviewed data");
   console.log("MongoDB 8.3 + mongot: primary/majority durability, cross-instance review, search-index lag protection, count/pagination, isolation and lineage checks passed.");

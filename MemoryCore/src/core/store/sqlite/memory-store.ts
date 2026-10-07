@@ -59,7 +59,8 @@ import type {
 } from "../types.js";
 import { DEFAULT_ISOLATION_ID, rowMatchesIsolation } from "../types.js";
 import type { ReviewStatus, VisibilityScope } from "../visibility.js";
-import { assertClearGuardSync, resolveReviewRowsSync, setReviewStatusSync, validReview } from "../review.js";
+import { assertClearGuardSync, resolveReviewRowsSync, setReviewStatusSync, assertReviewEvent, confirmReviewCommit, clearFilter, runSync } from "../review.js";
+import { MEMORY_EVENT_HISTORY_LIMIT } from "../types.js";
 import {
   resolveVisibilityScope,
   visibilityNeedsFilter,
@@ -228,7 +229,7 @@ const MEMORY_EVENTS_DDL_BODY = `
 const L1_QUERY_COLS = `record_id, content, type, priority, scene_name, session_key, session_id,
   team_id, task_id, user_id, agent_id, version,
   timestamp_str, timestamp_start, timestamp_end,
-  created_time, updated_time, metadata_json, review_status, review_sources_json, review_guard_at`;
+  created_time, updated_time, metadata_json, review_status, review_sources_json, review_guard_at, review_epoch`;
 
 // ============================
 // FTS5 / keyword helpers
@@ -309,6 +310,7 @@ export class VectorStore implements IMemoryStore {
 
   /** Tracks whether close() has been called to prevent double-close errors. */
   private closed = false;
+  private memoryTransaction = false;
 
   /**
    * `true` when vec0 virtual tables (l1_vec / l0_vec) have been created and
@@ -603,6 +605,7 @@ export class VectorStore implements IMemoryStore {
     try { this.db.exec("ALTER TABLE l1_records ADD COLUMN review_status TEXT NOT NULL DEFAULT 'active'"); } catch { /* exists */ }
     if (!(this.db.prepare("PRAGMA table_info(l1_records)").all() as Array<{ name: string }>).some((c) => c.name === "review_sources_json")) this.db.exec("ALTER TABLE l1_records ADD COLUMN review_sources_json TEXT NOT NULL DEFAULT '[]'");
     if (!(this.db.prepare("PRAGMA table_info(l1_records)").all() as Array<{ name: string }>).some((c) => c.name === "review_guard_at")) this.db.exec("ALTER TABLE l1_records ADD COLUMN review_guard_at TEXT NOT NULL DEFAULT ''");
+    if (!(this.db.prepare("PRAGMA table_info(l1_records)").all() as Array<{ name: string }>).some((c) => c.name === "review_epoch")) this.db.exec("ALTER TABLE l1_records ADD COLUMN review_epoch INTEGER");
     try { this.db.exec("UPDATE l1_records SET review_status = 'active' WHERE review_status IS NULL OR review_status = ''"); } catch { /* very old schema */ }
     try { this.db.exec("CREATE INDEX IF NOT EXISTS idx_l1_review_status ON l1_records(review_status)"); } catch { /* best effort */ }
     this.db.prepare("UPDATE l1_records SET team_id = ? WHERE team_id = '' OR team_id IS NULL").run(DEFAULT_ISOLATION_ID);
@@ -651,8 +654,8 @@ export class VectorStore implements IMemoryStore {
         record_id, content, type, priority, scene_name, session_key, session_id,
         team_id, task_id, version, timestamp_str, timestamp_start, timestamp_end,
         created_time, updated_time, metadata_json,
-        user_id, agent_id, review_sources_json, review_status, review_guard_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        user_id, agent_id, review_sources_json, review_status, review_guard_at, review_epoch
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(record_id) DO UPDATE SET
         content=excluded.content,
         type=excluded.type,
@@ -678,8 +681,7 @@ export class VectorStore implements IMemoryStore {
     this.stmtDeleteMeta = this.db.prepare("DELETE FROM l1_records WHERE record_id = ?");
 
     this.stmtGetMeta = this.db.prepare(`
-      SELECT content, type, priority, scene_name, session_key, session_id, team_id, task_id, user_id, agent_id,
-             version, timestamp_str, timestamp_start, timestamp_end, metadata_json, review_status, review_sources_json
+      SELECT ${L1_QUERY_COLS}
       FROM l1_records WHERE record_id = ?
     `);
 
@@ -981,6 +983,7 @@ export class VectorStore implements IMemoryStore {
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_ts ON memory_events(event_ts, seq)");
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_events_event_id ON memory_events(event_id) WHERE event_id != ''");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_review_operation ON memory_events(json_extract(NULLIF(review_json, ''), '$.operation_id'))");
 
     try {
       const evT = this.db.prepare(
@@ -1017,6 +1020,7 @@ export class VectorStore implements IMemoryStore {
       this.logger?.warn?.(`[memory-tdai][sqlite] memory_events op CHECK (retracted) migration failed: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_memory_events_clear_epoch ON memory_events(team_id, agent_id, scope, source, layer, json_extract(NULLIF(review_json, ''), '$.guard_epoch'))");
 
     // One-shot legacy normalization (below): each pass is a full scan of
     // memory_events / l1_records / l0_conversations, so it must not run on
@@ -1449,7 +1453,7 @@ export class VectorStore implements IMemoryStore {
    * failure never propagates to the caller / main OpenClaw flow.
    * Returns `true` on success, `false` on failure (logged as warning).
    */
-  upsertL1(record: MemoryRecord, embedding: Float32Array | undefined): boolean {
+  upsertL1(record: MemoryRecord, embedding: Float32Array | undefined, options?: { import?: boolean }): boolean {
     if (this.degraded) {
       this.logger?.warn(`${TAG} [L1-upsert] SKIPPED (degraded mode) id=${record.id}`);
       return false;
@@ -1491,7 +1495,7 @@ export class VectorStore implements IMemoryStore {
           : " (no embedding — metadata-only write)"),
       );
 
-      this.db.exec("BEGIN");
+      if (!this.memoryTransaction) this.db.exec("BEGIN");
       try {
         // Upsert metadata (INSERT OR UPDATE).
         // user_id / agent_id appended at the end to match the prepared statement
@@ -1499,8 +1503,9 @@ export class VectorStore implements IMemoryStore {
         // for legacy callers (e.g. older tests or pre-isolation seed scripts):
         // empty string preserves the historic "no-isolation" semantics until the
         // migration backfills.
-        assertClearGuardSync(this, record);
-        const existing = this.db.prepare("SELECT review_sources_json, team_id, user_id, agent_id FROM l1_records WHERE record_id = ?").get(recordId) as { review_sources_json: string; team_id: string; user_id: string; agent_id: string } | undefined;
+        if (!options?.import) assertClearGuardSync(this, record);
+        const existing = this.db.prepare("SELECT review_sources_json, review_epoch, team_id, user_id, agent_id FROM l1_records WHERE record_id = ?").get(recordId) as { review_sources_json: string; review_epoch?: number; team_id: string; user_id: string; agent_id: string } | undefined;
+        if (existing && (existing.review_epoch ?? 0) !== (record.review_epoch ?? 0)) throw new Error("L1 update cannot change a record generation");
         if (record.expected_existing && !existing) throw new Error("L1 update lost a concurrent delete");
         if (existing && !rowMatchesIsolation(existing, { teamId: record.teamId || "default", userId: record.userId || "default", agentId: record.agentId || "default" })) throw new Error("L1 record belongs to another tenant");
         const oldSources = existing?.review_sources_json;
@@ -1527,6 +1532,7 @@ export class VectorStore implements IMemoryStore {
           JSON.stringify(sources),
           record.review_status ?? "active",
           record.review_guard_at ?? "",
+          record.review_epoch ?? null,
         );
 
         if (!skipVec) {
@@ -1572,10 +1578,10 @@ export class VectorStore implements IMemoryStore {
           }
         }
 
-        this.db.exec("COMMIT");
+        if (!this.memoryTransaction) this.db.exec("COMMIT");
       } catch (err) {
         try {
-          this.db.exec("ROLLBACK");
+          if (!this.memoryTransaction) this.db.exec("ROLLBACK");
         } catch { /* ignore rollback errors */ }
         throw err;
       }
@@ -1739,7 +1745,7 @@ export class VectorStore implements IMemoryStore {
         const meta = this.stmtGetMeta.get(recordId) as { user_id?: string; agent_id?: string; session_id?: string; session_key?: string } | undefined;
         if (!meta || !rowMatchesIsolation(meta, filter)) return false;
       }
-      this.db.exec("BEGIN");
+      if (!this.memoryTransaction) this.db.exec("BEGIN");
       try {
         const result = this.stmtDeleteMeta.run(recordId);
         const deleted = (result as any)?.changes > 0;
@@ -1747,11 +1753,11 @@ export class VectorStore implements IMemoryStore {
         if (this.ftsAvailable) {
           try { this.stmtL1FtsDelete.run(recordId); } catch { /* non-fatal */ }
         }
-        this.db.exec("COMMIT");
+        if (!this.memoryTransaction) this.db.exec("COMMIT");
         return deleted;
       } catch (err) {
         try {
-          this.db.exec("ROLLBACK");
+          if (!this.memoryTransaction) this.db.exec("ROLLBACK");
         } catch { /* ignore rollback errors */ }
         throw err;
       }
@@ -3764,8 +3770,48 @@ export class VectorStore implements IMemoryStore {
   // Memory Events (统一变更账)
   // ─────────────────────────────────────────────────────────
 
+  getClearEpoch(scope: { teamId?: string; agentId?: string }): number {
+    return this.queryMemoryEvents(clearFilter({ team_id: scope.teamId || "default", agent_id: scope.agentId || "default" }))[0]?.review?.guard_epoch ?? 0;
+  }
+
+  commitClearFence(event: MemoryEvent): MemoryEvent {
+    if (event.op !== "deleted" || event.source !== "api_mutation" || event.scope !== "agent" || event.layer !== "l1" || !event.team_id || !event.agent_id || !event.event_id) throw new Error("Invalid agent clear fence");
+    const store = this;
+    return this.executeMemoryTransaction(function* () {
+      const existing = store.queryMemoryEvents({ event_id: event.event_id, limit: 1 })[0];
+      if (existing) return existing;
+      const epoch = store.getClearEpoch({ teamId: event.team_id, agentId: event.agent_id }) + 1;
+      if (!Number.isSafeInteger(epoch)) throw new Error("Generation epoch exhausted");
+      const committed = { ...event, review: { protocol: 1 as const, guard_epoch: epoch } };
+      yield store.appendMemoryEvent(committed);
+      return store.queryMemoryEvents({ event_id: event.event_id, limit: 1 })[0]!;
+    });
+  }
+
+  executeMemoryTransaction<T>(program: () => Generator<unknown, T, unknown>): T {
+    if (this.degraded) throw new Error("Memory transaction rejected: sqlite store is degraded");
+    if (this.memoryTransaction) return runSync(program());
+    this.db.exec("BEGIN IMMEDIATE");
+    this.memoryTransaction = true;
+    try {
+      const result = runSync(program());
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    } finally {
+      this.memoryTransaction = false;
+    }
+  }
+
+  commitMemoryEvent(event: MemoryEvent): MemoryEvent | Promise<MemoryEvent> {
+    this.appendMemoryEvent(event);
+    return confirmReviewCommit(event, this.queryMemoryEvents({ event_id: event.event_id, limit: 1 })[0]);
+  }
+
   appendMemoryEvent(event: MemoryEvent): void {
-    if (event.review !== undefined && !validReview(event.review)) throw new Error("Invalid review protocol payload");
+    assertReviewEvent(event);
     if (this.degraded) throw new Error("memory_events append rejected: sqlite store is degraded");
     // Defense-in-depth: appendLedgerEvent already enforces this, but a row
     // must never persist a timestamp the store itself cannot safely compare.
@@ -3815,7 +3861,7 @@ export class VectorStore implements IMemoryStore {
     );
   }
 
-  queryMemoryEvents(filter: MemoryEventFilter): MemoryEvent[] {
+  queryMemoryEvents(filter: MemoryEventFilter, options?: { complete?: boolean }): MemoryEvent[] {
     if (this.degraded) throw new Error("memory_events query rejected: sqlite store is degraded");
     if (filter.record_ids?.length === 0) return [];
     const conds: string[] = [];
@@ -3832,6 +3878,7 @@ export class VectorStore implements IMemoryStore {
     if (filter.source !== undefined)            { conds.push("source = ?");            args.push(filter.source); }
     if (filter.request_id !== undefined)        { conds.push("request_id = ?");        args.push(filter.request_id); }
     if (filter.event_id !== undefined) { conds.push("event_id = ?"); args.push(filter.event_id); }
+    if (filter.operation_id !== undefined) { conds.push("json_extract(NULLIF(review_json, ''), '$.operation_id') = ?"); args.push(filter.operation_id); }
     pushIsoCond(conds, args, "team_id", filter.team_id);
     pushIsoCond(conds, args, "agent_id", filter.agent_id);
     pushIsoCond(conds, args, "user_id", filter.user_id);
@@ -3840,8 +3887,8 @@ export class VectorStore implements IMemoryStore {
     if (filter.until !== undefined)             { conds.push("event_ts <= ?");         args.push(canonEventBound(filter.until)); }
 
     const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")}` : "";
-    const limit = Math.min(Math.max(filter.limit ?? 100, 1), 1000);
-    const offset = Math.max(filter.offset ?? 0, 0);
+    const limit = options?.complete ? MEMORY_EVENT_HISTORY_LIMIT + 1 : Math.min(Math.max(filter.limit ?? 100, 1), 1000);
+    const offset = options?.complete ? 0 : Math.max(filter.offset ?? 0, 0);
 
     const sql = `
       SELECT event_ts, session_key, session_id, origin_session_id, origin_session_key,
@@ -3850,7 +3897,7 @@ export class VectorStore implements IMemoryStore {
              layer, source, request_id, event_id, reason, target_event_id, scope, until_ts, review_json
       FROM memory_events
       ${where}
-      ORDER BY event_ts ${filter.order === "desc" ? "DESC" : "ASC"}, seq ${filter.order === "desc" ? "DESC" : "ASC"}
+      ORDER BY ${filter.order_by === "clear_epoch" ? `json_extract(NULLIF(review_json, ''), '$.guard_epoch') ${filter.order === "desc" ? "DESC" : "ASC"}, ` : ""}event_ts ${filter.order === "desc" ? "DESC" : "ASC"}, seq ${filter.order === "desc" ? "DESC" : "ASC"}
       LIMIT ? OFFSET ?
     `;
     const projectedSql = filter.metadata_only ? sql.replace(/\bcontent\b/, "'' AS content").replace(/\bsnapshot_json\b/, "'' AS snapshot_json").replace(/\breason\b/, "'' AS reason") : sql;
@@ -3883,6 +3930,7 @@ export class VectorStore implements IMemoryStore {
       scope: string;
       until_ts: string;
     }>;
+    if (options?.complete && rows.length > MEMORY_EVENT_HISTORY_LIMIT) throw new Error("Complete review history budget exceeded; narrow scope");
     return rows.map((r) => decodeMemoryEvent({ ...r, until: r.until_ts }, parseSupersedesJson(r.supersedes)));
   }
 

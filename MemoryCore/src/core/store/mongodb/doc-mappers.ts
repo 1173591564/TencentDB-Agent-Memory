@@ -121,6 +121,7 @@ export interface L1Doc {
   review_sources_json?: string;
   review_sources?: string[];
   review_guard_at?: string;
+  review_epoch?: number;
 }
 
 export function l1RecordToDoc(record: MemoryRecord): L1Doc {
@@ -152,6 +153,7 @@ export function l1RecordToDoc(record: MemoryRecord): L1Doc {
     metadata_json: JSON.stringify(record.metadata ?? {}),
     review_sources_json: JSON.stringify(record.review_sources ?? []),
     review_guard_at: record.review_guard_at,
+    review_epoch: record.review_epoch,
   };
 }
 
@@ -179,6 +181,7 @@ export function docToL1RecordRow(doc: L1Doc): L1RecordRow {
     review_status: (doc as { review_status?: string }).review_status as L1RecordRow["review_status"],
     review_sources_json: JSON.stringify([...new Set([...(doc.review_sources_json ? JSON.parse(doc.review_sources_json) as string[] : []), ...(doc.review_sources ?? [])])]),
     review_guard_at: doc.review_guard_at,
+    review_epoch: doc.review_epoch,
   };
 }
 

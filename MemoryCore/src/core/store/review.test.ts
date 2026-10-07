@@ -1,16 +1,19 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VectorStore } from "./sqlite/memory-store.js";
 import { __setMemoryReviewEnabledForTests } from "./visibility.js";
-import { derivedProfileAllowed, profileReviewFence, resolveReviewRows, setReviewStatus, ReviewConflictError } from "./review.js";
+import { resolveReviewRows, setReviewStatus, ReviewConflictError } from "./review.js";
+import { acknowledgeDerivedReview, derivedProfileAllowed, inspectDerivedReview, profileReviewFence } from "./derived-review.js";
 import type { MemoryRecord } from "../record/l1-writer.js";
-import type { MemoryEvent } from "./types.js";
+import type { IMemoryStore, MemoryEvent } from "./types.js";
 import { StorageAdapter, scopeProfileStorageView } from "../storage/adapter.js";
 import { createLocalStorageBackend } from "../storage/factory.js";
 import { appendLedgerEvent, redactLedgerEvents, replayLedgerEvents } from "../record/event-ledger.js";
+import { revertMemory } from "../record/memory-revert.js";
 import { clearChatMemoryContentResilient } from "../../gateway/chat-memory-handlers.js";
 import { migrateReviewLedger, runMigrationCli, type MigrationTargetStore } from "../../../scripts/migrate-sqlite-to-tcvdb/sqlite-to-tcvdb.js";
 
@@ -93,16 +96,78 @@ describe("committed observed-retraction review protocol", () => {
   });
 
   it("an explicit no-op receipt remains a no-op after a later review", () => {
-    store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("noop"), persist_no_op: true });
+    store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("noop") });
     store.setL1ReviewStatus("root", "quarantined", ISO);
-    expect(store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("noop"), persist_no_op: true })?.changed).toBe(false);
+    expect(store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("noop") })?.changed).toBe(false);
     expect(state()).toBe("quarantined");
+  });
+
+  it("one restore identity has one immutable outcome across in-flight duplicate deliveries", async () => {
+    store.setL1ReviewStatus("root", "quarantined", ISO);
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    let firstReady!: () => void;
+    let secondReady!: () => void;
+    const firstGate = new Promise<void>((r) => { releaseFirst = r; });
+    const secondGate = new Promise<void>((r) => { releaseSecond = r; });
+    const prepared = new Promise<void>((r) => { firstReady = r; });
+    const lookedUp = new Promise<void>((r) => { secondReady = r; });
+    const first = {
+      queryMemoryEvents: store.queryMemoryEvents.bind(store),
+      queryL1Records: store.queryL1Records.bind(store),
+      appendMemoryEvent: async (event: MemoryEvent) => { firstReady(); await firstGate; store.appendMemoryEvent(event); },
+      commitMemoryEvent: async (event: MemoryEvent) => { firstReady(); await firstGate; return store.commitMemoryEvent(event); },
+    } as unknown as IMemoryStore;
+    const second = {
+      queryMemoryEvents: store.queryMemoryEvents.bind(store),
+      queryL1Records: async (...args: Parameters<IMemoryStore["queryL1Records"]>) => { secondReady(); await secondGate; return store.queryL1Records(...args); },
+      appendMemoryEvent: store.appendMemoryEvent.bind(store),
+      commitMemoryEvent: (event: MemoryEvent) => store.commitMemoryEvent(event),
+    } as unknown as IMemoryStore;
+    const operation = { operation_id: op("in-flight-restore") };
+    try {
+      const a = setReviewStatus(first, "root", "active", ISO, operation);
+      await prepared;
+      const b = setReviewStatus(second, "root", "active", ISO, operation);
+      await lookedUp;
+      releaseFirst();
+      const committed = await a;
+      expect(state()).toBe("active");
+      releaseSecond();
+      expect(await b).toEqual(committed);
+      expect(state()).toBe("active");
+      expect(store.queryMemoryEvents({ record_id: "root", op: "restored" })).toHaveLength(1);
+    } finally { releaseFirst(); releaseSecond(); }
+  });
+
+  it("a new retract command adds a token even while an observed restore is waiting", async () => {
+    store.setL1ReviewStatus("root", "quarantined", ISO);
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const prepared = new Promise<void>((r) => { ready = r; });
+    const writer = {
+      queryMemoryEvents: store.queryMemoryEvents.bind(store),
+      queryL1Records: store.queryL1Records.bind(store),
+      appendMemoryEvent: async (event: MemoryEvent) => { ready(); await gate; store.appendMemoryEvent(event); },
+      commitMemoryEvent: async (event: MemoryEvent) => { ready(); await gate; return store.commitMemoryEvent(event); },
+    } as unknown as IMemoryStore;
+    try {
+      const restoring = setReviewStatus(writer, "root", "active", ISO, { operation_id: op("observed-restore") });
+      await prepared;
+      const retracted = store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("new-retraction") });
+      release();
+      await restoring;
+      expect(retracted?.changed).toBe(true);
+      expect(state()).toBe("quarantined");
+      expect(all()[0]?.review_tokens).toEqual([op("new-retraction")]);
+    } finally { release(); }
   });
 
   it("restore only cancels observed tokens, regardless of clock ordering", () => {
     const first = store.setL1ReviewStatus("root", "quarantined", ISO)!.event!;
-    const restore: MemoryEvent = { ...first, event_id: "evt-" + "2".repeat(32), event_ts: "2001-01-01T00:00:00.000Z", op: "restored", review: { protocol: 1, observed: [first.event_id!] } };
-    const second: MemoryEvent = { ...first, event_id: "evt-" + "3".repeat(32), event_ts: "2000-01-01T00:00:00.000Z" };
+    const restore: MemoryEvent = { ...first, event_id: "evt-" + "2".repeat(32), event_ts: "2001-01-01T00:00:00.000Z", op: "restored", review: { protocol: 1, observed: [first.review!.operation_id!] } };
+    const second: MemoryEvent = { ...first, event_id: "evt-" + "3".repeat(32), event_ts: "2000-01-01T00:00:00.000Z", review: { protocol: 1 } };
     store.appendMemoryEvent(second);
     store.appendMemoryEvent(restore);
     expect(state()).toBe("quarantined");
@@ -112,7 +177,8 @@ describe("committed observed-retraction review protocol", () => {
   it("duplicate physical deliveries use one logical token and delayed delivery cannot undo restore", () => {
     const first = store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("logical") })!.event!;
     store.setL1ReviewStatus("root", "active", ISO);
-    store.appendMemoryEvent({ ...first, event_id: "evt-" + "4".repeat(32), event_ts: "2099-01-01T00:00:00.000Z" });
+    expect(() => store.appendMemoryEvent({ ...first, event_id: "evt-" + "4".repeat(32) })).toThrow("identity");
+    store.appendMemoryEvent({ ...first, event_ts: "2099-01-01T00:00:00.000Z" });
     expect(state()).toBe("active");
   });
 
@@ -120,23 +186,23 @@ describe("committed observed-retraction review protocol", () => {
     const first = store.setL1ReviewStatus("root", "quarantined", ISO)!.event!;
     const restore = store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("same-restore") })!.event!;
     const second = store.setL1ReviewStatus("root", "quarantined", ISO)!.event!;
-    store.appendMemoryEvent({ ...restore, event_id: "evt-" + "9".repeat(32), review: { ...restore.review!, observed: [first.event_id!, second.event_id!] } });
+    expect(store.commitMemoryEvent({ ...restore, review: { ...restore.review!, observed: [first.review!.operation_id!, second.review!.operation_id!] } })).toEqual(restore);
     expect(state()).toBe("quarantined");
-    expect(all()[0]?.review_tokens).toEqual([second.event_id]);
+    expect(all()[0]?.review_tokens).toEqual([second.review!.operation_id]);
   });
 
   it("a no-op delivery cannot acquire future cancellation through a duplicate restore", () => {
-    const receipt = store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("same-noop"), persist_no_op: true })!.event!;
+    const receipt = store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("same-noop") })!.event!;
     const retract = store.setL1ReviewStatus("root", "quarantined", ISO)!.event!;
-    store.appendMemoryEvent({ ...receipt, event_id: "evt-" + "a".repeat(32), review: { ...receipt.review!, no_op: false, observed: [retract.event_id!] } });
+    expect(store.commitMemoryEvent({ ...receipt, review: { ...receipt.review!, no_op: false, observed: [retract.review!.operation_id!] } })).toEqual(receipt);
     expect(state()).toBe("quarantined");
   });
 
-  it("conflicting concurrent deliveries fail closed instead of silently selecting a body", () => {
+  it("conflicting concurrent commits are rejected without adding conflict facts", () => {
     const first = store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("collision") })!.event!;
-    store.appendMemoryEvent({ ...first, event_id: "evt-" + "5".repeat(32), op: "restored", review: { protocol: 1, operation_id: op("collision"), request_hash: "b".repeat(64), observed: [op("collision")] } });
+    expect(() => store.commitMemoryEvent({ ...first, op: "restored", review: { ...first.review!, request_hash: "b".repeat(64), observed: [op("collision")] } })).toThrow(ReviewConflictError);
     expect(state()).toBe("quarantined");
-    expect(all()[0]?.review_tokens?.some((t) => t.startsWith("conflict:"))).toBe(true);
+    expect(store.queryMemoryEvents({ record_id: "root" })).toHaveLength(1);
     store.setL1ReviewStatus("root", "active", ISO, { operation_id: op("resolved") });
     expect(state()).toBe("active");
   });
@@ -176,6 +242,30 @@ describe("committed observed-retraction review protocol", () => {
     expect(all().some((r) => r.record_id === "refused")).toBe(false);
   });
 
+  it("clear fences a pre-clear generation even when its writer clock is far ahead", async () => {
+    const logger = { info() {}, debug() {}, warn() {}, error() {} };
+    await clearChatMemoryContentResilient({ store, storage, ...ISO, logger });
+    const late = { ...record("fast-clock"), createdAt: "2099-01-01T00:00:00.000Z", updatedAt: "2099-01-01T00:00:00.000Z", review_guard_at: "2099-01-01T00:00:00.000Z", review_epoch: 0 } as MemoryRecord;
+    expect(store.upsertL1(late, undefined)).toBe(false);
+    expect(store.queryL1Records({ ...ISO, recordIds: ["fast-clock"] })).toEqual([]);
+  });
+
+  it("clear receipt retry does not advance its epoch and fresh generations remain usable", () => {
+    const event: MemoryEvent = { event_id: "evt-" + "b".repeat(32), event_ts: "2000-01-01T00:00:00.000Z", session_key: "", session_id: "", team_id: "t1", agent_id: "a1", record_id: "clear", content: "", op: "deleted", source: "api_mutation", scope: "agent", layer: "l1" };
+    const first = store.commitClearFence(event);
+    expect(first.review?.guard_epoch).toBe(1);
+    expect(store.commitClearFence(event)).toEqual(first);
+    expect(store.getClearEpoch(ISO)).toBe(1);
+    expect(store.upsertL1({ ...record("fresh"), review_epoch: 1 }, undefined)).toBe(true);
+    expect(store.queryL1Records(ISO).map((r) => r.record_id)).toEqual(["fresh"]);
+    expect(store.upsertL1({ ...record("root"), review_epoch: 1 }, undefined)).toBe(false);
+    store.close();
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    expect(store.getClearEpoch(ISO)).toBe(1);
+    expect(store.queryL1Records(ISO).map((r) => r.record_id)).toEqual(["fresh"]);
+  });
+
   it("an expected-existing update cannot recreate a concurrently removed row", () => {
     expect(store.upsertL1({ ...record("gone"), expected_existing: true }, undefined)).toBe(false);
     expect(all().some((r) => r.record_id === "gone")).toBe(false);
@@ -189,12 +279,12 @@ describe("committed observed-retraction review protocol", () => {
     let release!: () => void;
     const observed = new Promise<void>((r) => { ready = r; });
     const gate = new Promise<void>((r) => { release = r; });
-    const append = store.appendMemoryEvent.bind(store);
-    vi.spyOn(store, "appendMemoryEvent").mockImplementationOnce(async (event) => { ready(); await gate; append(event); });
+    const commit = store.commitMemoryEvent.bind(store);
+    vi.spyOn(store, "commitMemoryEvent").mockImplementationOnce(async (event) => { ready(); await gate; return commit(event); });
     try {
       const restoring = setReviewStatus(store, "root", "active", ISO);
       await observed;
-      const concurrent = { ...initial, event_id: "evt-" + "8".repeat(32), event_ts: "2000-01-01T00:00:00.000Z" };
+      const concurrent = { ...initial, event_id: "evt-" + "8".repeat(32), event_ts: "2000-01-01T00:00:00.000Z", review: { protocol: 1 as const } };
       peer.appendMemoryEvent(concurrent);
       release();
       await restoring;
@@ -250,7 +340,34 @@ describe("committed observed-retraction review protocol", () => {
       expect(target.queryL1Records(ISO)).toEqual([]);
       target.setL1ReviewStatus("root", "active", ISO);
       expect(target.queryL1Records(ISO).map((r) => r.record_id)).toEqual(["child"]);
-      await expect(migrateReviewLedger(store, { ...target, appendMemoryEvent: undefined } as never)).rejects.toThrow("preserve the review ledger");
+      await expect(migrateReviewLedger(store, { ...target, appendMemoryEvent: undefined } as never)).rejects.toThrow("preserve and verify the review ledger");
+    } finally { target.close(); }
+  });
+
+  it("migration refuses a target that silently keeps different ledger bytes", async () => {
+    store.setL1ReviewStatus("root", "quarantined", ISO, { operation_id: op("migration-verification") });
+    const target = new VectorStore(path.join(dir, "bad-ledger-target.db"), 0);
+    target.init();
+    const append = target.appendMemoryEvent.bind(target);
+    vi.spyOn(target, "appendMemoryEvent").mockImplementation((event) => append({ ...event, content: "different bytes" }));
+    try { await expect(migrateReviewLedger(store, target)).rejects.toThrow("Ledger verification failed"); }
+    finally { target.close(); }
+  });
+
+  it("legacy migration identities retain the original logical suppression token", async () => {
+    const base = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", content: "", source: "review" as const, layer: "l1" as const };
+    store.appendMemoryEvent({ ...base, op: "retracted", event_id: "evt-" + "e".repeat(32) });
+    store.getRawDb().prepare("UPDATE memory_events SET event_id='' WHERE record_id=?").run("root");
+    const old = store.queryMemoryEvents({ record_id: "root" })[0]!;
+    const token = `legacy-event-${createHash("sha256").update(JSON.stringify([old.record_id, old.event_ts, old.op, old.session_key, old.session_id])).digest("hex")}`;
+    store.appendMemoryEvent({ ...base, op: "restored", event_id: "evt-" + "f".repeat(32), review: { protocol: 1, observed: [token] } });
+    const target = new VectorStore(path.join(dir, "legacy-ledger-target.db"), 0);
+    target.init(); target.upsertL1(record("root"), undefined);
+    try {
+      expect(await migrateReviewLedger(store, target)).toBe(2);
+      expect(target.queryL1Records(ISO).map((row) => row.record_id)).toEqual(["root"]);
+      expect(await migrateReviewLedger(store, target)).toBe(2);
+      expect(target.queryMemoryEvents({ record_id: "root" })).toHaveLength(2);
     } finally { target.close(); }
   });
 
@@ -267,6 +384,8 @@ describe("committed observed-retraction review protocol", () => {
         countL0: () => destination.countL0(), countL1: (filter) => destination.countL1(filter),
         upsertL0: destination.upsertL0.bind(destination), upsertL1: destination.upsertL1.bind(destination),
         appendMemoryEvent: destination.appendMemoryEvent.bind(destination),
+        commitMemoryEvent: destination.commitMemoryEvent.bind(destination),
+        queryMemoryEvents: destination.queryMemoryEvents.bind(destination),
       };
     };
     const summary = await runMigrationCli([
@@ -284,6 +403,132 @@ describe("committed observed-retraction review protocol", () => {
       reopened.setL1ReviewStatus("root", "active", ISO);
       expect(reopened.queryL1Records(ISO).map((r) => r.record_id)).toEqual(["child"]);
     } finally { reopened.close(); }
+  });
+
+  it.each(["ledger-only", "unverifiable", "non-atomic"] as const)("migration rejects a %s target before importing content or ledger", async (mode) => {
+    const destination = new VectorStore(path.join(dir, "refused-target.db"), 0);
+    const initialized = destination.init();
+    writeFileSync(path.join(dir, "unused-config.json"), "{}");
+    if (mode === "ledger-only") destination.appendMemoryEvent({ event_ts: "2026-01-01T00:00:00.000Z", session_key: "", session_id: "", team_id: "t1", agent_id: "a1", record_id: "old-clear", content: "", op: "deleted", source: "api_mutation", scope: "agent", layer: "l1" });
+    if (mode === "non-atomic") store.setL1ReviewStatus("root", "quarantined", ISO);
+    const append = vi.spyOn(destination, "appendMemoryEvent");
+    const upsert = vi.spyOn(destination, "upsertL1");
+    const target: MigrationTargetStore = {
+      init: () => initialized, close: () => destination.close(), isDegraded: () => destination.isDegraded(),
+      countL0: () => destination.countL0(), countL1: (filter) => destination.countL1(filter),
+      upsertL0: destination.upsertL0.bind(destination), upsertL1: destination.upsertL1.bind(destination),
+      appendMemoryEvent: destination.appendMemoryEvent.bind(destination),
+      commitMemoryEvent: mode === "non-atomic" ? undefined : destination.commitMemoryEvent.bind(destination),
+      queryMemoryEvents: mode === "unverifiable" ? undefined : destination.queryMemoryEvents.bind(destination),
+    };
+    try {
+      await expect(runMigrationCli([
+        "--plugin-data-dir", dir, "--sqlite-path", path.join(dir, "vectors.db"),
+        "--openclaw-config-path", path.join(dir, "unused-config.json"),
+        "--tcvdb-url", "http://fixture", "--tcvdb-username", "fixture", "--tcvdb-api-key", "fixture",
+        "--tcvdb-database", "fixture", "--tcvdb-embedding-model", "none",
+        "--no-apply-config", "--no-rewrite-manifest", "--yes",
+      ], { createTargetStore: () => target, verifyDelayMs: 0 })).rejects.toThrow(mode === "ledger-only" ? "not empty" : mode === "unverifiable" ? "cannot verify" : "atomic immutable ledger");
+      expect(append).not.toHaveBeenCalled();
+      expect(upsert).not.toHaveBeenCalled();
+    } finally { destination.close(); }
+  });
+
+  it("process exit inside a database workflow cannot commit a partial physical mutation", () => {
+    const dbPath = path.join(dir, "vectors.db");
+    store.close();
+    const storeModule = new URL("./sqlite/memory-store.ts", import.meta.url).href;
+    const script = `import { VectorStore } from ${JSON.stringify(storeModule)};
+      const store = new VectorStore(process.argv[1], 0); store.init();
+      store.executeMemoryTransaction(function* () {
+        yield store.deleteL1("root", { teamId: "t1", userId: "u1", agentId: "a1" });
+        process.exit(17);
+      });`;
+    const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, dbPath], { cwd: process.cwd(), encoding: "utf8" });
+    store = new VectorStore(dbPath, 0);
+    store.init();
+    expect(child.status).toBe(17);
+    expect(store.queryL1Records(ISO).map((row) => row.record_id)).toEqual(["root"]);
+  });
+
+  it("physical revert rolls back rows and receipt together, then retries after reopening the database", async () => {
+    const logger = { info() {}, debug() {}, warn() {}, error() {} };
+    const snapshot = JSON.stringify(all()[0]);
+    store.upsertL1(record("successor", ["root"]), undefined);
+    store.deleteL1("root", ISO);
+    const base = { event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", source: "extraction" as const, layer: "l1" as const };
+    store.appendMemoryEvent({ ...base, record_id: "root", op: "superseded", superseded_by: "successor", snapshot_json: snapshot, content: "fact root" });
+    store.appendMemoryEvent({ ...base, record_id: "successor", op: "updated", supersedes: ["root"], content: "fact successor" });
+    vi.spyOn(store, "appendMemoryEvent").mockImplementationOnce(() => { throw new Error("receipt commit interrupted"); });
+    const options = { operationId: "atomic-revert" };
+    const failed = await revertMemory({ store, recordId: "successor", options, isolation: ISO, logger });
+    expect(failed).toMatchObject({ ok: false });
+    expect(all().map((r) => r.record_id)).toEqual(["successor"]);
+    expect(store.queryMemoryEvents({ op: "reverted" })).toEqual([]);
+    store.close();
+    store = new VectorStore(path.join(dir, "vectors.db"), 0);
+    store.init();
+    const committed = await revertMemory({ store, recordId: "successor", options, isolation: ISO, logger });
+    expect(committed).toMatchObject({ ok: true, restored: ["root"] });
+    expect(all().map((r) => r.record_id)).toEqual(["root"]);
+    expect(await revertMemory({ store, recordId: "successor", options, isolation: ISO, logger })).toEqual(committed);
+    expect(store.queryMemoryEvents({ op: "reverted" })).toHaveLength(1);
+  });
+
+  it("a lost revert COMMIT response without a visible receipt remains commit_unknown", async () => {
+    const logger = { info() {}, debug() {}, warn() {}, error() {} };
+    store.appendMemoryEvent({ event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", content: "fact root", op: "created", source: "extraction", layer: "l1" });
+    const execute = store.executeMemoryTransaction.bind(store);
+    const query = store.queryMemoryEvents.bind(store);
+    let hideReceipt = false;
+    vi.spyOn(store, "queryMemoryEvents").mockImplementation((filter, options) => {
+      if (hideReceipt && filter.operation_id) { hideReceipt = false; return []; }
+      return query(filter, options);
+    });
+    vi.spyOn(store, "executeMemoryTransaction").mockImplementationOnce((program) => {
+      execute(program);
+      hideReceipt = true;
+      throw new Error("lost COMMIT response");
+    });
+    const params = { store, recordId: "root", options: { operationId: "lost-revert-commit" }, isolation: ISO, logger };
+    expect(await revertMemory(params)).toMatchObject({ ok: false, status: 503, commit_unknown: true, operation_id: "lost-revert-commit" });
+    expect(await revertMemory(params)).toMatchObject({ ok: true, operation_id: "lost-revert-commit" });
+    expect(store.queryMemoryEvents({ record_id: "root", op: "reverted" })).toHaveLength(1);
+    expect(all()).toEqual([]);
+  });
+
+  it("revert embedding planning query failure reports an identified failure before mutation", async () => {
+    const logger = { info() {}, debug() {}, warn() {}, error() {} };
+    const embedding = { embed: vi.fn() };
+    vi.spyOn(store, "queryMemoryEvents").mockImplementationOnce(() => { throw new Error("backend unavailable"); });
+    const result = await revertMemory({ store, recordId: "root", options: { operationId: "embedding-plan-failure" }, isolation: ISO, logger, embedding: embedding as never });
+    expect(result).toMatchObject({ ok: false, status: 503, operation_id: "embedding-plan-failure" });
+    expect(embedding.embed).not.toHaveBeenCalled();
+    expect(all().map((r) => r.record_id)).toEqual(["root"]);
+    expect(store.queryMemoryEvents({ op: "reverted" })).toEqual([]);
+  });
+
+  it("complete history is loaded once per graph batch rather than once per audit page", () => {
+    for (let i = 0; i < 1201; i++) store.appendMemoryEvent({ event_ts: "2026-01-01T00:00:00.000Z", session_key: "sk", session_id: "ses", team_id: "t1", user_id: "u1", agent_id: "a1", record_id: "root", content: "", op: "created", source: "extraction", layer: "l1" });
+    store.setL1ReviewStatus("root", "quarantined", ISO);
+    const query = vi.spyOn(store, "queryMemoryEvents");
+    expect(state()).toBe("quarantined");
+    expect(query.mock.calls.filter(([filter, options]) => options?.complete && filter.record_ids?.includes("root"))).toHaveLength(1);
+    expect(store.queryMemoryEvents({ record_id: "root", limit: 1000 })).toHaveLength(1000);
+    expect(store.queryMemoryEvents({ record_id: "root" }, { complete: true })).toHaveLength(1202);
+  });
+
+  it("derived acknowledgement keeps one receipt under concurrent delivery and retry after changed bytes", async () => {
+    store.setL1ReviewStatus("root", "quarantined", ISO);
+    const content = "verified derived bytes";
+    const inspected = await inspectDerivedReview(store, "persona.md", content, ISO);
+    const operation = { operation_id: "derived-receipt", reason: "verified" };
+    const receipts = await Promise.all(Array.from({ length: 8 }, () => acknowledgeDerivedReview(store, "persona.md", content, inspected, ISO, operation)));
+    for (const receipt of receipts) expect(receipt).toEqual(receipts[0]);
+    expect(store.queryMemoryEvents({ layer: "l3", source: "review" })).toHaveLength(1);
+    expect(await acknowledgeDerivedReview(store, "persona.md", "different bytes", inspected, ISO, operation)).toEqual(receipts[0]);
+    expect((await inspectDerivedReview(store, "persona.md", "different bytes", ISO)).blocked).toBe(true);
+    await expect(acknowledgeDerivedReview(store, "persona.md", content, inspected, ISO, { ...operation, reason: "different reason" })).rejects.toThrow(ReviewConflictError);
   });
 
   it("async and sync resolvers produce the same state", async () => {
